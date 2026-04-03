@@ -26,7 +26,7 @@ from loopforge.bootstrap import load_factory
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run or steer the experimentation loop.")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command", required=False)
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--spec", required=True, help="Path to a JSON experiment spec.")
@@ -59,7 +59,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     draft_parser.add_argument("--temperature", type=float, default=0.2)
 
     start_parser = subparsers.add_parser("start")
-    start_parser.add_argument("--message", required=True, help="Initial description of the problem to solve.")
+    start_parser.add_argument("--message", required=False, help="Initial description of the problem to solve.")
     start_parser.add_argument("--repo-root", default=".", help="Repository root to scan when auto-synthesizing.")
     start_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory.")
     start_parser.add_argument("--executor-factory", help="Import path package.module:function_name")
@@ -81,6 +81,68 @@ def build_argument_parser() -> argparse.ArgumentParser:
     interject_parser.add_argument("--author", default="human")
     interject_parser.add_argument("--type", default="note")
     return parser
+
+
+def _prompt_non_empty(prompt: str, *, input_fn=input, print_fn=print) -> str:
+    while True:
+        value = input_fn(prompt).strip()
+        if value:
+            return value
+        print_fn("A problem statement is required.")
+
+
+def run_interactive_start(
+    *,
+    repo_root: Path | str = ".",
+    memory_root: Path | str = ".loopforge",
+    executor_factory: str | None = None,
+    model_profile: str = DEFAULT_MODEL_PROFILE,
+    planner_model: str | None = None,
+    worker_model: str | None = None,
+    reflection_model: str | None = None,
+    review_model: str | None = None,
+    consultation_model: str | None = None,
+    narrator_model: str | None = None,
+    iterations: int | None = None,
+    temperature: float = 0.2,
+    input_fn=input,
+    print_fn=print,
+) -> int:
+    app = Loopforge(
+        executor_factory_path=executor_factory,
+        repo_root=repo_root,
+        memory_root=memory_root,
+        model_profile=model_profile,
+        planner_model=planner_model,
+        worker_model=worker_model,
+        reflection_model=reflection_model,
+        review_model=review_model,
+        consultation_model=consultation_model,
+        narrator_model=narrator_model,
+        temperature=temperature,
+    )
+    user_goal = _prompt_non_empty("What problem are we solving? ", input_fn=input_fn, print_fn=print_fn)
+    answers: dict[str, Any] = {}
+    while True:
+        turn = app.bootstrap(user_goal=user_goal, answers=answers)
+        if turn.human_update:
+            print_fn(turn.human_update)
+        elif turn.assistant_message:
+            print_fn(turn.assistant_message)
+        if turn.access_guide_path:
+            print_fn(f"Access guide written to {turn.access_guide_path}")
+        if turn.ready_to_start:
+            result = app.start(user_goal=user_goal, answers=answers, iterations=iterations)
+            print_fn(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        required_questions = [question for question in turn.proposal.questions if question.required]
+        pending_questions = [question for question in required_questions if question.key not in answers]
+        if not pending_questions:
+            print_fn(json.dumps({"status": "needs_input", "bootstrap": turn.to_dict()}, indent=2, sort_keys=True))
+            return 1
+        for question in pending_questions:
+            answer = _prompt_non_empty(f"{question.prompt} ", input_fn=input_fn, print_fn=print_fn)
+            answers[question.key] = answer
 
 
 def run_from_spec(
@@ -205,6 +267,8 @@ def append_human_intervention(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
+    if args.command is None:
+        return run_interactive_start()
     if args.command == "run":
         results = run_from_spec(
             spec_path=args.spec,
@@ -236,6 +300,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "start":
+        if not args.message:
+            return run_interactive_start(
+                repo_root=args.repo_root,
+                memory_root=args.memory_root,
+                executor_factory=args.executor_factory,
+                model_profile=args.model_profile,
+                planner_model=args.planner_model,
+                worker_model=args.worker_model,
+                reflection_model=args.reflection_model,
+                review_model=args.review_model,
+                consultation_model=args.consultation_model,
+                narrator_model=args.narrator_model,
+                iterations=args.iterations,
+                temperature=args.temperature,
+            )
         app = Loopforge(
             executor_factory_path=args.executor_factory,
             repo_root=args.repo_root,

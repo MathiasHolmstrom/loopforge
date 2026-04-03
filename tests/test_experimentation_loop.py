@@ -30,7 +30,14 @@ from loopforge import (
 )
 from loopforge.auto_adapter import synthesize_auto_adapter
 from loopforge.bootstrap import load_factory
-from loopforge.cli import append_human_intervention, discover_capabilities_for_objective, draft_spec, run_from_spec
+from loopforge.cli import (
+    append_human_intervention,
+    discover_capabilities_for_objective,
+    draft_spec,
+    main,
+    run_from_spec,
+    run_interactive_start,
+)
 
 
 class FakeWorkerBackend:
@@ -154,6 +161,66 @@ def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> N
     assert app.consultation_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
     assert app.access_advisor_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
     assert app.narrator_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
+
+
+def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(monkeypatch) -> None:
+    prompts = []
+    outputs = []
+    answers = iter(["Fix Databricks deploy", "dev workspace"])
+
+    class StubLoopforge:
+        def __init__(self, **kwargs) -> None:
+            self.bootstrap_calls = []
+            self.start_calls = []
+
+        def bootstrap(self, *, user_goal, answers=None):
+            self.bootstrap_calls.append((user_goal, answers))
+            if not answers:
+                return BootstrapTurn(
+                    assistant_message="Need workspace target.",
+                    proposal=ExperimentSpecProposal(
+                        objective=user_goal,
+                        recommended_spec=build_spec(objective=user_goal),
+                        questions=[SpecQuestion(key="workspace", prompt="Which workspace should I target?")],
+                    ),
+                    role_models=bootstrap_module.default_role_models(),
+                    ready_to_start=False,
+                    human_update="Scanning repo and checking access.",
+                )
+            return BootstrapTurn(
+                assistant_message="Ready.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=build_spec(objective=user_goal),
+                    questions=[],
+                ),
+                role_models=bootstrap_module.default_role_models(),
+                ready_to_start=True,
+                human_update="Ready to start.",
+            )
+
+        def start(self, *, user_goal, answers=None, iterations=None):
+            self.start_calls.append((user_goal, answers, iterations))
+            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+
+    monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
+
+    exit_code = run_interactive_start(
+        input_fn=lambda prompt: prompts.append(prompt) or next(answers),
+        print_fn=outputs.append,
+    )
+
+    assert exit_code == 0
+    assert prompts == ["What problem are we solving? ", "Which workspace should I target? "]
+    assert outputs[0] == "Scanning repo and checking access."
+    assert outputs[1] == "Ready to start."
+    assert '"status": "started"' in outputs[2]
+
+
+def test_main_without_args_enters_interactive_mode(monkeypatch) -> None:
+    monkeypatch.setattr("loopforge.cli.run_interactive_start", lambda **kwargs: 7)
+
+    assert main([]) == 7
 
 
 def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_effective_spec(tmp_path) -> None:
