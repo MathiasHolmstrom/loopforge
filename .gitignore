@@ -22,6 +22,19 @@ Thumbs.db
 # Claude Code
 CLAUDE.md
 
-# Loopforge runtime markdown
+# Loopforge runtime / generated artifacts
 .loopforge/agent_markdown/
+.loopforge/generated/
+.loopforge/artifacts/
 .loopforge/*.jsonl
+.loopforge/experiment_spec.json
+experiment_journal.md
+
+# Debug / temp
+.tmp_debug/
+.tmp_pytest/
+tmp*/
+
+# Pilot experiments (specific test runs)
+artifacts/
+experiments/

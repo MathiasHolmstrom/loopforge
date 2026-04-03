@@ -1,0 +1,29 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-push]
+      - id: end-of-file-fixer
+        stages: [pre-push]
+      - id: check-yaml
+        stages: [pre-push]
+      - id: check-toml
+        stages: [pre-push]
+      - id: check-merge-conflict
+        stages: [pre-push]
+      - id: check-added-large-files
+        args: [--maxkb=500]
+        stages: [pre-push]
+      - id: debug-statements
+        stages: [pre-push]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        args: [--fix, --exit-non-zero-on-fix]
+        stages: [pre-push]
+      - id: ruff-format
+        args: [--check]
+        stages: [pre-push]
