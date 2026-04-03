@@ -580,8 +580,31 @@ def discover_capabilities_for_objective(
     from loopforge.auto_adapter import scan_repo
 
     scan_result = scan_repo(Path(repo_root))
+    shell_family = "windows_cmd" if os.name == "nt" else "posix_sh"
+    execution_shell = "cmd.exe" if os.name == "nt" else "/bin/sh"
+    platform_facts = {
+        "host_platform": sys.platform,
+        "os_name": os.name,
+        "execution_shell": execution_shell,
+        "shell_family": shell_family,
+        "python_executable": sys.executable,
+        "repo_root": str(Path(repo_root).resolve()),
+    }
     if executor_factory_path is None:
         context = build_repo_scan_context(repo_root)
+        context = replace(
+            context,
+            environment_facts={**context.environment_facts, **platform_facts},
+            notes=[
+                (
+                    "Runtime platform: Windows commands run through cmd.exe. "
+                    "Avoid Unix tools like head/grep/find -maxdepth/ls -la; prefer Python scripts or cmd-compatible commands."
+                    if os.name == "nt"
+                    else "Runtime platform: shell commands run through /bin/sh. Prefer portable repo-local commands."
+                ),
+                *context.notes,
+            ],
+        )
         return probe_data_assets(context, Path(repo_root))
     adapter_setup = load_adapter_setup(
         factory_path=executor_factory_path,
@@ -607,6 +630,19 @@ def discover_capabilities_for_objective(
         column_notes.append(f"  {file_path}: {', '.join(cols)}")
     if column_notes:
         context = replace(context, notes=[*context.notes, *column_notes])
+    context = replace(
+        context,
+        environment_facts={**context.environment_facts, **platform_facts},
+        notes=[
+            (
+                "Runtime platform: Windows commands run through cmd.exe. "
+                "Avoid Unix tools like head/grep/find -maxdepth/ls -la; prefer Python scripts or cmd-compatible commands."
+                if os.name == "nt"
+                else "Runtime platform: shell commands run through /bin/sh. Prefer portable repo-local commands."
+            ),
+            *context.notes,
+        ],
+    )
     return context
 
 
@@ -663,11 +699,62 @@ def run_preflight_checks(
 
     if executor_factory_path is None or capability_context.environment_facts.get("autonomous_execution_supported") is False:
         if executor_factory_path is None and capability_context.environment_facts.get("autonomous_execution_supported") is not False:
+            repo_root_raw = capability_context.environment_facts.get("repo_root")
+            repo_root_path = Path(repo_root_raw) if isinstance(repo_root_raw, str) and repo_root_raw.strip() else Path.cwd()
+            python_executable = capability_context.environment_facts.get("python_executable", sys.executable)
+            try:
+                probe = subprocess.run(
+                    [str(python_executable), "-c", "import os,sys;print('loopforge_execution_probe_ok');print(os.getcwd());print(sys.executable)"],
+                    cwd=repo_root_path,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+            except Exception as exc:
+                checks.append(
+                    PreflightCheck(
+                        name="generic_agentic_execution_probe",
+                        status="failed",
+                        detail=(
+                            "Loopforge could not verify that the generic autonomous executor can run Python from the repo root: "
+                            f"{exc}"
+                        ),
+                        scope="execution",
+                    )
+                )
+                return checks
+            if probe.returncode != 0 or "loopforge_execution_probe_ok" not in probe.stdout:
+                failure_summary = (probe.stderr or probe.stdout or f"Exit code {probe.returncode}.").strip()
+                checks.append(
+                    PreflightCheck(
+                        name="generic_agentic_execution_probe",
+                        status="failed",
+                        detail=(
+                            "Loopforge could not verify the generic autonomous execution lane from the repo root. "
+                            f"Probe command failed: {failure_summary}"
+                        ),
+                        scope="execution",
+                    )
+                )
+                return checks
             checks.append(
                 PreflightCheck(
                     name="generic_agentic_execution",
                     status="passed",
                     detail="No repo-specific runner was found, so Loopforge will use the generic autonomous executor.",
+                    required=False,
+                    scope="execution",
+                )
+            )
+            checks.append(
+                PreflightCheck(
+                    name="generic_agentic_execution_probe",
+                    status="passed",
+                    detail=(
+                        "Verified the generic autonomous execution lane by running Python from the repo root "
+                        f"with {python_executable}."
+                    ),
                     required=False,
                     scope="execution",
                 )
@@ -823,14 +910,109 @@ def should_prepare_access_guide(
     capability_context: CapabilityContext,
     preflight_checks: list[PreflightCheck],
 ) -> bool:
+    import re
+
     if capability_context.available_data_assets:
         return True
-    access_tokens = ("permission", "auth", "credential", "token", "env", "secret", "databricks", "warehouse")
     if any(check.status != "passed" for check in preflight_checks):
         return True
     joined_notes = " ".join(capability_context.notes).lower()
     joined_env = str(capability_context.environment_facts).lower()
-    return any(token in joined_notes or token in joined_env for token in access_tokens)
+    access_patterns = (
+        r"\bpermission(s)?\b",
+        r"\bauth\b",
+        r"\bauthentication\b",
+        r"\bcredential(s)?\b",
+        r"\btoken(s)?\b",
+        r"\benv\b",
+        r"\benvironment variable(s)?\b",
+        r"\bsecret(s)?\b",
+        r"\bdatabricks\b",
+        r"\bwarehouse\b",
+    )
+    haystack = f"{joined_notes}\n{joined_env}"
+    return any(re.search(pattern, haystack) for pattern in access_patterns)
+
+
+def build_execution_runbook(
+    *,
+    repo_root: Path,
+    capability_context: CapabilityContext,
+    turn: BootstrapTurn,
+    preflight_checks: list[PreflightCheck],
+) -> str:
+    env = capability_context.environment_facts
+    shell_name = str(env.get("execution_shell", "unknown"))
+    python_executable = str(env.get("python_executable", sys.executable))
+    runner_kind = str(env.get("runner_kind", "unknown"))
+    probe_check = next((check for check in preflight_checks if check.name == "generic_agentic_execution_probe"), None)
+    lines = [
+        "# Execution Runbook",
+        "",
+        "## Environment",
+        f"- Repo root: {repo_root.resolve()}",
+        f"- Execution shell for shell steps: {shell_name}",
+        f"- Python executable: {python_executable}",
+        f"- Runner kind: {runner_kind}",
+        "",
+    ]
+    if probe_check is not None:
+        lines.extend(
+            [
+                "## Verified Execution Lane",
+                f"- Bootstrap verification: {probe_check.status}",
+                f"- Detail: {probe_check.detail}",
+                f"- Preferred command shape: \"{python_executable}\" path\\to\\script.py",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+        "## Ground Rules",
+        "- Treat this file as the execution handoff from bootstrap. Prefer these instructions over rediscovering obvious repo mechanics.",
+        "- Bootstrap has already verified the execution lane above. Reuse that verified repo root and Python executable instead of inventing new activation commands, shell setup, or extra cd chains.",
+        "- Aim for one end-to-end iteration that writes/runs code and prints metrics, not a long chain of disconnected inspection-only retries.",
+        "- Fix one blocker at a time. Do not redesign the whole plan when a single command or import fails.",
+        "- If you want to run a repo-local script that does not exist yet, create it first with a write step, then run it.",
+        ]
+    )
+    if env.get("shell_family") == "windows_cmd":
+        lines.extend(
+            [
+                "- Shell commands run through cmd.exe on Windows. Do not use Unix tools like `head`, `grep`, `find -maxdepth`, or `ls -la`.",
+                "- Prefer `write_file` + `\"<python_executable>\" script.py`, or short cmd-compatible commands. Python-native inspection is usually the safest choice.",
+            ]
+        )
+    else:
+        lines.append("- Shell commands should stay portable and repo-local. Prefer Python-native inspection when shell portability is uncertain.")
+
+    lines.extend(
+        [
+            "",
+            "## Immediate Objective",
+            f"- Goal: {turn.proposal.recommended_spec.objective}",
+            f"- Primary metric: {turn.proposal.recommended_spec.primary_metric.name} ({turn.proposal.recommended_spec.primary_metric.goal})",
+        ]
+    )
+    if capability_context.available_data_assets:
+        lines.append("")
+        lines.append("## Known Data Assets")
+        for asset in capability_context.available_data_assets[:10]:
+            lines.append(f"- {asset}")
+    if turn.proposal.notes:
+        lines.append("")
+        lines.append("## Planner Notes")
+        for note in turn.proposal.notes[:12]:
+            lines.append(f"- {note}")
+    lines.extend(
+        [
+            "",
+            "## First Iteration Guidance",
+            "- Reuse the experiment guide and discovered repo paths to build the smallest runnable script that loads data, computes the configured metrics, and prints them clearly.",
+            "- If repo APIs are still uncertain, do one bounded inspection step first, then immediately write and run the experiment script in the same iteration whenever possible.",
+        ]
+    )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 
@@ -947,7 +1129,7 @@ class Loopforge:
             model=self.role_models.narrator, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.narrator),
         )
         self.execution_fix_backend = LiteLLMExecutionFixBackend(
-            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
+            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
         )
 
     def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
@@ -1214,6 +1396,19 @@ class Loopforge:
             missing_requirements=missing_requirements,
             access_guide_path=access_guide_path,
         )
+        try:
+            self.progress_fn("execution_runbook", "Writing execution runbook...")
+            runbook_text = build_execution_runbook(
+                repo_root=self.repo_root,
+                capability_context=capability_context,
+                turn=resolved_turn,
+                preflight_checks=preflight_checks,
+            )
+            self.memory_root.mkdir(parents=True, exist_ok=True)
+            runbook_path = self.memory_root / "execution_runbook.md"
+            runbook_path.write_text(runbook_text, encoding="utf-8")
+        except Exception:
+            pass
         # Write experiment guide when ready (or close to ready)
         if ready_to_start or not [r for r in missing_requirements if r.startswith("answer:")]:
             try:
@@ -1231,8 +1426,12 @@ class Loopforge:
             human_update = self.narrator_backend.summarize_bootstrap(resolved_turn, capability_context)
         except Exception:
             human_update = resolved_turn.assistant_message
-        if access_guide_path is not None:
-            human_update = f"{human_update}\nAccess guide: {access_guide_path}"
+        if resolved_turn.access_guide_path:
+            human_update = (
+                f"{human_update}\n\nAccess guide: {resolved_turn.access_guide_path}"
+                if human_update
+                else f"Access guide: {resolved_turn.access_guide_path}"
+            )
         return replace(resolved_turn, human_update=human_update)
 
     @staticmethod

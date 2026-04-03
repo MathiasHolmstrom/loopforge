@@ -1,1 +1,1 @@
-Build a LoL player kills prediction model using the spforge framework. Target: kills capped at 10, ordinal classes 0-10, outputting multiclass probabilities. Use the LoL subsample dataset (12,432 rows) with player ratings, team ratings, and rolling features. Evaluate with ordinal loss on time-based cross-validation.
+Build a LoL player kills prediction model using spforge's player rating system with kills capped at 10 (11 ordinal classes 0-10), outputting multiclass probabilities evaluated primarily on Ranked Probability Score.

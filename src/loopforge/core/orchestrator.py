@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Protocol
 
 from loopforge.core.backends import NarrationBackend, ReflectionBackend, ReviewBackend, WorkerBackend
@@ -54,6 +55,7 @@ class RoutingExperimentExecutor:
         generic_autonomous = (
             snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
             or snapshot.effective_spec.metadata.get("execution_backend_kind") == "generic_agentic"
+            or snapshot.effective_spec.metadata.get("execution_mode") == "autonomous_after_bootstrap"
         )
         if candidate.execution_steps and self.plan_executor is not None:
             return self.plan_executor.execute(candidate, snapshot)
@@ -146,6 +148,21 @@ class ExperimentOrchestrator:
 
     def run_iteration(self) -> IterationCycleResult:
         snapshot = self._load_snapshot()
+        generic_autonomous = self._is_generic_autonomous(snapshot)
+        max_continuations = int(
+            snapshot.effective_spec.stop_conditions.get(
+                "max_metricless_continuations",
+                8 if generic_autonomous else 5,
+            )
+        )
+        max_same_iteration_repairs = int(
+            snapshot.effective_spec.stop_conditions.get(
+                "max_same_iteration_repairs",
+                8 if generic_autonomous else 0,
+            )
+        )
+        intra_iteration_attempts: list[dict[str, object]] = []
+        pending_success_outcome: ExperimentOutcome | None = None
 
         # ── Worker proposes ──
         worker_tag = f"[{self.role_models.worker}] " if self.role_models else ""
@@ -153,16 +170,125 @@ class ExperimentOrchestrator:
         candidate = self.worker_backend.propose_next_experiment(snapshot)
         self.progress_fn("worker_detail", self._format_candidate(candidate))
 
-        # ── Execute ──
-        if candidate.execution_steps:
-            self.progress_fn("executor_run", "Executing autonomous agent plan...")
-        else:
-            self.progress_fn("executor_run", f"Executing {candidate.action_type}...")
-        try:
-            outcome = self.executor.execute(candidate, snapshot)
-        except Exception as exc:
-            outcome = self._build_failure_outcome(exc)
-        self.progress_fn("executor_detail", self._format_outcome(outcome, snapshot.effective_spec))
+        outcome: ExperimentOutcome | None = None
+        metricless_continuations = 0
+        repair_round = 0
+        while True:
+            if candidate.execution_steps:
+                self.progress_fn("executor_run", "Executing autonomous agent plan...")
+            else:
+                self.progress_fn("executor_run", f"Executing {candidate.action_type}...")
+            try:
+                outcome = self.executor.execute(candidate, snapshot)
+            except Exception as exc:
+                outcome = self._build_failure_outcome(exc)
+            if pending_success_outcome is not None and outcome.status == "success":
+                outcome = self._merge_outcomes(pending_success_outcome, outcome)
+                pending_success_outcome = None
+            intra_iteration_attempts.append(
+                {
+                    "attempt_number": len(intra_iteration_attempts) + 1,
+                    "candidate": candidate.to_dict(),
+                    "outcome": outcome.to_dict(),
+                }
+            )
+            outcome = self._attach_intra_iteration_attempts(outcome, intra_iteration_attempts)
+            self.progress_fn("executor_detail", self._format_outcome(outcome, snapshot.effective_spec))
+
+            if outcome.status == "success" and self._outcome_has_metrics(outcome, snapshot.effective_spec):
+                break
+
+            if outcome.status == "success":
+                if metricless_continuations >= max_continuations:
+                    if generic_autonomous:
+                        outcome = self._block_metricless_iteration(
+                            outcome,
+                            intra_iteration_attempts,
+                            max_continuations,
+                        )
+                    break
+                self.progress_fn(
+                    f"continue_{metricless_continuations}",
+                    "No metrics produced — asking agent to continue the same iteration "
+                    f"({metricless_continuations + 1}/{max_continuations})...",
+                )
+                try:
+                    continuation_candidate = self.worker_backend.continue_experiment(
+                        self._make_inflight_snapshot(snapshot, candidate, outcome),
+                        candidate,
+                        outcome,
+                    )
+                except Exception as exc:
+                    self.progress_fn(
+                        f"continue_{metricless_continuations}_error",
+                        f"Continuation planning failed internally: {exc}. Proceeding with the current outcome.",
+                    )
+                    if generic_autonomous:
+                        outcome = self._block_metricless_iteration(
+                            outcome,
+                            intra_iteration_attempts,
+                            metricless_continuations,
+                        )
+                    break
+                self.progress_fn(
+                    f"continue_{metricless_continuations}_detail",
+                    self._format_candidate(continuation_candidate),
+                )
+                pending_success_outcome = outcome
+                candidate = continuation_candidate
+                metricless_continuations += 1
+                continue
+
+            if (
+                generic_autonomous
+                and outcome.status == "recoverable_failure"
+                and repair_round < max_same_iteration_repairs
+            ):
+                self.progress_fn(
+                    f"repair_{repair_round}",
+                    "Recoverable failure did not produce a successful experiment — asking worker to repair "
+                    f"within the same iteration ({repair_round + 1}/{max_same_iteration_repairs})...",
+                )
+                try:
+                    repaired_candidate = self.worker_backend.propose_next_experiment(
+                        self._make_inflight_snapshot(snapshot, candidate, outcome),
+                    )
+                except Exception as exc:
+                    self.progress_fn(
+                        f"repair_{repair_round}_error",
+                        f"Same-iteration repair planning failed internally: {exc}.",
+                    )
+                    outcome = self._block_repair_exhaustion(
+                        outcome,
+                        intra_iteration_attempts,
+                        repair_round,
+                        max_same_iteration_repairs,
+                    )
+                    break
+                self.progress_fn(
+                    f"repair_{repair_round}_detail",
+                    self._format_candidate(repaired_candidate),
+                )
+                candidate = repaired_candidate
+                repair_round += 1
+                continue
+
+            if generic_autonomous and outcome.status == "recoverable_failure":
+                outcome = self._block_repair_exhaustion(
+                    outcome,
+                    intra_iteration_attempts,
+                    repair_round,
+                    max_same_iteration_repairs,
+                )
+            break
+
+        if outcome is None:
+            outcome = ExperimentOutcome(
+                status="blocked",
+                notes=["Iteration ended without executing a candidate."],
+                failure_type="MissingIterationOutcome",
+                failure_summary="The orchestrator finished the iteration without an execution outcome.",
+            )
 
         # ── Reflect ──
         reflect_tag = f"[{self.role_models.reflection}] " if self.role_models else ""
@@ -270,35 +396,41 @@ class ExperimentOrchestrator:
     @staticmethod
     def _format_candidate(candidate: ExperimentCandidate) -> str:
         lines = [
-            f"  Action     : {candidate.action_type} ({candidate.change_type})",
             f"  Hypothesis : {candidate.hypothesis}",
         ]
         if candidate.instructions:
             instr = candidate.instructions
-            if len(instr) > 300:
-                instr = instr[:300] + "..."
+            if len(instr) > 400:
+                instr = instr[:400] + "..."
             lines.append(f"  Plan       : {instr}")
-        helper_consult = candidate.metadata.get("helper_consultation") or candidate.metadata.get("ops_consultation")
-        if isinstance(helper_consult, dict):
-            focus = str(helper_consult.get("focus", "")).strip()
-            guidance = str(helper_consult.get("guidance", "")).strip()
-            if focus:
-                lines.append(f"  Helper     : {focus}")
-            if guidance:
-                if len(guidance) > 220:
-                    guidance = guidance[:220] + "..."
-                lines.append(f"               {guidance}")
         if candidate.execution_steps:
-            lines.append(f"  Steps      : {len(candidate.execution_steps)} execution step(s)")
-            for step in candidate.execution_steps[:5]:
-                if step.kind == "shell":
-                    lines.append(f"    $ {step.command}")
-                elif step.kind in ("write_file", "append_file"):
-                    lines.append(f"    {step.kind} -> {step.path}")
+            # Summarize steps at a high level — don't dump raw commands
+            step_summaries = []
+            for step in candidate.execution_steps:
+                if step.rationale:
+                    step_summaries.append(step.rationale)
+                elif step.kind in ("write_file", "append_file") and step.path:
+                    step_summaries.append(f"create {step.path}")
+                elif step.kind == "shell":
+                    # Show a brief description, not the full command
+                    cmd = step.command
+                    if "python -c" in cmd:
+                        step_summaries.append("run inline Python inspection")
+                    elif "python " in cmd and ".py" in cmd:
+                        import re
+                        script_match = re.search(r'python\s+(\S+\.py)', cmd)
+                        step_summaries.append(f"run {script_match.group(1)}" if script_match else "run Python script")
+                    elif cmd:
+                        short = cmd[:80] + "..." if len(cmd) > 80 else cmd
+                        step_summaries.append(short)
+            if step_summaries:
+                lines.append(f"  Steps      : {' → '.join(step_summaries[:5])}")
         return "\n".join(lines)
 
     @staticmethod
     def _format_outcome(outcome: ExperimentOutcome, spec: ExperimentSpec) -> str:
+        lines = []
+        # Metrics first — this is what the user cares about most
         metrics_parts = []
         resolved = outcome.resolved_metric_results(spec)
         for name, result in resolved.items():
@@ -306,16 +438,23 @@ class ExperimentOrchestrator:
                 metrics_parts.append(f"{name} = {result.value:.4g}")
         if not metrics_parts and outcome.primary_metric_value is not None:
             metrics_parts.append(f"primary = {outcome.primary_metric_value:.4g}")
-        lines = [f"  Status     : {outcome.status}"]
         if metrics_parts:
             lines.append(f"  Metrics    : {' | '.join(metrics_parts)}")
-        if outcome.failure_summary:
-            lines.append(f"  Failure    : {outcome.failure_summary}")
-        if outcome.notes:
-            for note in outcome.notes[:3]:
-                lines.append(f"  Note       : {note}")
-        if outcome.artifacts:
-            lines.append(f"  Artifacts  : {', '.join(outcome.artifacts[:5])}")
+        elif outcome.status == "success":
+            lines.append(f"  Result     : completed successfully (no metrics reported)")
+        # Failure info
+        if outcome.status != "success":
+            summary = outcome.failure_summary or "execution failed"
+            if len(summary) > 200:
+                summary = summary[:200] + "..."
+            lines.append(f"  Issue      : {summary}")
+            if outcome.recovery_actions:
+                lines.append(f"  Next       : {outcome.recovery_actions[0]}")
+        # Key notes (skip noise)
+        for note in outcome.notes[:2]:
+            if len(note) > 150:
+                note = note[:150] + "..."
+            lines.append(f"  Note       : {note}")
         return "\n".join(lines)
 
     @staticmethod
@@ -331,12 +470,118 @@ class ExperimentOrchestrator:
             for risk in reflection.risks[:3]:
                 lines.append(f"    Risk     : {risk}")
         if reflection.recommended_next_action:
-            lines.append(f"  Next       : {reflection.recommended_next_action}")
+            next_action = reflection.recommended_next_action
+            if isinstance(next_action, dict):
+                # Extract human-readable parts from the dict
+                action_type = next_action.get("action_type", "")
+                reason = next_action.get("reason", next_action.get("hypothesis", ""))
+                if reason:
+                    lines.append(f"  Next       : {action_type} — {reason}" if action_type else f"  Next       : {reason}")
+                elif action_type:
+                    lines.append(f"  Next       : {action_type}")
+            elif isinstance(next_action, str):
+                lines.append(f"  Next       : {next_action}")
         return "\n".join(lines)
 
     @staticmethod
     def _format_review(review: ReviewDecision) -> str:
         return f"  Decision   : {review.status} — {review.reason}"
+
+    @staticmethod
+    def _is_generic_autonomous(snapshot: MemorySnapshot) -> bool:
+        return (
+            snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
+            or snapshot.effective_spec.metadata.get("execution_backend_kind") == "generic_agentic"
+            or snapshot.effective_spec.metadata.get("execution_mode") == "autonomous_after_bootstrap"
+        )
+
+    @staticmethod
+    def _attach_intra_iteration_attempts(
+        outcome: ExperimentOutcome,
+        attempts: list[dict[str, object]],
+    ) -> ExperimentOutcome:
+        return replace(
+            outcome,
+            execution_details={
+                **outcome.execution_details,
+                "intra_iteration_attempts": list(attempts),
+            },
+        )
+
+    def _make_inflight_snapshot(
+        self,
+        snapshot: MemorySnapshot,
+        candidate: ExperimentCandidate,
+        outcome: ExperimentOutcome,
+    ) -> MemorySnapshot:
+        synthetic_record = IterationRecord(
+            iteration_id=snapshot.next_iteration_id,
+            parent_iteration_id=snapshot.latest_summary.iteration_id if snapshot.latest_summary is not None else None,
+            candidate=candidate,
+            outcome=outcome,
+            reflection=ReflectionSummary(
+                assessment="In-flight same-iteration state. Use the concrete failure or missing-metrics outcome to repair the current iteration.",
+            ),
+            review=ReviewDecision(
+                status="accepted",
+                reason="Synthetic same-iteration record for worker repair context.",
+                should_update_memory=False,
+            ),
+        )
+        return replace(snapshot, recent_records=[*snapshot.recent_records, synthetic_record])
+
+    def _block_metricless_iteration(
+        self,
+        outcome: ExperimentOutcome,
+        attempts: list[dict[str, object]],
+        continuation_count: int,
+    ) -> ExperimentOutcome:
+        blocked = replace(
+            outcome,
+            status="blocked",
+            recoverable=False,
+            failure_type="MetriclessIterationExhausted",
+            failure_summary=(
+                "Generic autonomous mode exhausted same-iteration continuations without producing the configured "
+                "primary metric."
+            ),
+            recovery_actions=[
+                "Inspect the recorded same-iteration attempts and fix the metric reporting or evaluation path before retrying.",
+            ],
+            notes=[
+                *outcome.notes,
+                "Loopforge refused to advance to the next iteration because no successful metric-producing experiment was completed.",
+                f"Same-iteration continuations attempted: {continuation_count}.",
+            ],
+        )
+        return self._attach_intra_iteration_attempts(blocked, attempts)
+
+    def _block_repair_exhaustion(
+        self,
+        outcome: ExperimentOutcome,
+        attempts: list[dict[str, object]],
+        repair_round: int,
+        max_same_iteration_repairs: int,
+    ) -> ExperimentOutcome:
+        blocked = replace(
+            outcome,
+            status="blocked",
+            recoverable=False,
+            failure_type="IterationRepairBudgetExceeded",
+            failure_summary=(
+                "Generic autonomous mode exhausted same-iteration repair attempts before producing a successful "
+                "experiment."
+            ),
+            recovery_actions=[
+                "Inspect the recorded same-iteration attempts and the latest execution failure before retrying.",
+            ],
+            notes=[
+                *outcome.notes,
+                "Loopforge refused to advance to the next iteration because the current iteration never reached a successful experiment.",
+                f"Same-iteration worker repairs attempted: {repair_round}/{max_same_iteration_repairs}.",
+            ],
+        )
+        return self._attach_intra_iteration_attempts(blocked, attempts)
 
     def _load_snapshot(self) -> MemorySnapshot:
         preview_snapshot = self.memory_store.load_snapshot(
@@ -437,6 +682,29 @@ class ExperimentOrchestrator:
             if metric.resolve_passed(result) is not True:
                 failures.append(metric.name)
         return failures
+
+    @staticmethod
+    def _outcome_has_metrics(outcome: ExperimentOutcome, spec: ExperimentSpec) -> bool:
+        resolved = outcome.resolved_metric_results(spec)
+        primary = resolved.get(spec.primary_metric.name)
+        return primary is not None and primary.value is not None
+
+    @staticmethod
+    def _merge_outcomes(base: ExperimentOutcome, continuation: ExperimentOutcome) -> ExperimentOutcome:
+        """Merge a continuation outcome into the base, preferring the continuation's metrics."""
+        merged_metrics = dict(base.metric_results)
+        merged_metrics.update(continuation.metric_results)
+        return replace(
+            continuation,
+            metric_results=merged_metrics,
+            notes=[*base.notes, *continuation.notes],
+            artifacts=[*base.artifacts, *continuation.artifacts],
+            next_ideas=continuation.next_ideas or base.next_ideas,
+            execution_details={
+                "base_details": base.execution_details,
+                "continuation_details": continuation.execution_details,
+            },
+        )
 
     @staticmethod
     def _build_failure_outcome(exc: Exception) -> ExperimentOutcome:

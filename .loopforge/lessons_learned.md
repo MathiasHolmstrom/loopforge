@@ -1,1 +1,25 @@
+- Executed 2 step(s) successfully.
+- Captured metric output from execution stdout.
+- The main thing learned is operational: the scorer constructors require exact arguments from the inspected signatures, specifically num_classes for RankedProbabilityScorer and classes for OrdinalLossScorer.
+- A simple chronological history-mixture baseline is sufficient to generate valid 11-class probability outputs and score them with spforge scorers on the LoL data.
+- The data pipeline is workable with existing columns only: kills_capped is derived from kills, validation is a chronological 70/30 split after sorting by date/game/team/player, and predictions can be stored as a list column kills_probs.
+- The current baseline appears to overpredict kills overall, as shown by MeanBiasScorer = 0.3975, so calibration or stronger shrinkage toward low-kill outcomes is a promising next direction.
+- The heavy validation mass at class 10 reflects capping, so modeling the upper tail explicitly is important; naive smoothing may be allocating too much probability mass into mid/high kills for ordinary rows.
+- The failure sequence was useful evidence: import-path issues were solved by bootstrapping repo root into sys.path, and shell quoting issues were avoided by writing repo-local scripts instead of multiline python -c commands.
 - Executed 3 step(s) successfully.
+- Position-aware shrinkage plus context-sensitive low-kill calibration materially improves ordinal probability quality for capped kills.
+- Explicit handling of the capped 10+ tail helped rather than hurt, despite the large validation mass at class 10.
+- The previous baseline's positive MeanBiasScorer correctly signaled overprediction; the new model reversed that bias and reduced absolute bias substantially, but now leans toward underprediction.
+- The available data pipeline is sufficient for this family of sequential empirical models using only existing columns: kills_capped from kills, chronological sorting by date/game/team/player, and prediction-time context from position, result, gamelength, teamkills, champion, player, and league.
+- Because all three reported metrics improved on the same split, this is strong evidence that the change improved the predictive distribution rather than merely gaming one metric.
+- Replacing the fixed low-kill tilt with EV-shift calibration and recency reduced underprediction materially, so the previous negative bias was genuinely caused by over-aggressive low-kill correction.
+- That bias repair came at a cost to the full ordinal probability distribution: both RankedProbabilityScorer and OrdinalLossScorer worsened, so the new calibration was too broad or too strong.
+- The best-known model remains the prior empirical-Bayes variant with RankedProbabilityScorer 0.09336367967923478, OrdinalLossScorer 0.34066417845090596, and MeanBiasScorer -0.2310423904389003.
+- The useful next direction is not to abandon calibration, but to apply it more narrowly—likely as a smaller global/post-hoc correction or only in slices with strongest negative bias—rather than changing the whole distribution row-by-row.
+- The existing data pipeline remains sufficient: all metrics were computed from kills_capped derived from kills, with predictions in kills_probs on the same chronological 70/30 validation split using existing columns only.
+- Narrow post-hoc calibration learned on training slices is better than broad global EV shifting for this problem.
+- The empirical-Bayes base structure remains strong; the winning move was to preserve it and only adjust biased contexts selectively.
+- Applying calibration only to sufficiently large and sufficiently biased slices appears to avoid the RPS degradation seen in the broader calibration attempt.
+- The model still underpredicts on average because MeanBiasScorer remains negative and mean predicted kills (3.6585) is below mean actual kills (3.8855), but the underprediction is slightly less severe than the prior best.
+- The printed top adjustments suggest high-kill winning bot/mid contexts are still important correction zones, so residual bias is not uniform across contexts.
+- The existing data pipeline is fully adequate for this line of work: kills_capped is derived from kills, slices are derived from existing position/result/teamkills/gamelength columns, and all metrics are computed from kills_probs on the same validation split.

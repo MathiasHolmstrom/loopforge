@@ -1,206 +1,217 @@
+# Experiment Guide: LoL Player Kills Prediction (RPS-Optimized)
 
+## Objective
+Build a multiclass model predicting player kills (capped at 10, so 11 ordinal classes 0–10) using spforge's player rating system. Evaluate primarily on Ranked Probability Score (minimize). Secondary guardrails: OrdinalLossScorer, MeanBiasScorer.
 
-# Experiment Guide: LoL Player Kills Prediction (Ordinal Multiclass)
+---
 
-## 1. Objective
+## 1. Data Loading
 
-Build a model predicting player kills (capped at 10) as ordinal classes 0–10, outputting 11-class probabilities. Minimize `OrdinalLossScorer` on time-based cross-validation. Monitor `MeanBiasScorer` as guardrail.
+**File:** `examples/lol/data/subsample_lol_data.parquet` (12,432 rows, 16 columns)
 
-## 2. Data Loading
-
-```python
-# Primary data loader
-from examples.lol.data.utils import get_sub_sample_lol_data
-```
-
-**Data file:** `examples/lol/data/subsample_lol_data.parquet` — 12,432 rows, 16 columns.
-
-Read the loader function first to understand what preprocessing it does. If it just returns raw data, load directly:
+**Loader utility:** `examples/lol/data/utils.py` → `get_sub_sample_lol_data()` — inspect this first to see what it returns (likely a pandas or polars DataFrame).
 
 ```python
+# Fallback direct load:
 import pandas as pd
 df = pd.read_parquet("examples/lol/data/subsample_lol_data.parquet")
 ```
 
-## 3. Schema — Key Columns
+## 2. Schema — Key Columns
 
-| Column | Type | Description |
+| Column | Type | Meaning |
 |---|---|---|
-| `gameid` | str | Unique game identifier (use for CV grouping) |
-| `date` | str | Datetime string, e.g. `"2023-01-10 19:20:51"` — parse to datetime for time-based splits |
-| `teamname` | str | Team name — use as `team_id` equivalent |
-| `playername` | str | Player name — use as `player_id` equivalent |
-| `league` | str | League/competition |
-| `position` | str | Player position: top/jng/mid/bot/sup |
+| `gameid` | str | Unique match identifier |
+| `date` | str | Match datetime string (e.g. `"2023-01-10 19:20:51"`) |
+| `teamname` | str | Team name — use as `team_id` |
+| `playername` | str | Player name — use as `player_id` |
+| `position` | str | One of `top`, `jng`, `mid`, `bot`, `sup` |
+| `kills` | int64 | **TARGET** — raw kill count |
+| `deaths` | int64 | Available feature |
+| `assists` | int64 | Available feature |
 | `result` | int64 | Win (1) / Loss (0) |
 | `gamelength` | int64 | Game length in seconds |
-| `totalgold` | int64 | Player's total gold |
-| `teamkills` | int64 | Team's total kills |
-| `teamdeaths` | int64 | Team's total deaths |
-| `damagetochampions` | int64 | Player damage to champions |
+| `teamkills` | int64 | Total team kills |
+| `teamdeaths` | int64 | Total team deaths |
+| `totalgold` | int64 | Player gold |
+| `damagetochampions` | int64 | Player damage |
 | `champion` | str | Champion played |
-| `kills` | int64 | **TARGET** — player kills |
-| `assists` | int64 | Player assists |
-| `deaths` | int64 | Player deaths |
+| `league` | str | League/competition |
 
-## 4. Target Variable
+## 3. Target Variable
 
 ```python
-# Cap kills at 10, creating ordinal classes 0-10
-df["kills_capped"] = df["kills"].clip(upper=10).astype(int)
+MAX_KILLS = 10
+df["kills_capped"] = df["kills"].clip(upper=MAX_KILLS)
+# This gives 11 ordinal classes: 0, 1, 2, ..., 10
 ```
 
-This gives 11 classes (0, 1, 2, ..., 10). The model must output a list/array of 11 probabilities per row.
+The model must output a probability vector of length 11 for each row.
 
-## 5. Existing Baseline to Study
+## 4. Existing Experiment to Study First
 
-**Read first:** `experiments/lol_naive_ordinal_baseline.py` — this contains the `main()` function that likely demonstrates the full pipeline pattern including:
-- How `ColumnNames` / data structures are configured
-- How the `AutoPipeline` is set up for ordinal prediction
-- How ratings, features, and estimators are composed
+**Read `experiments/lol_kills_rps_experiment.py` carefully.** It already contains:
+- `normalize_probs(probs)` — normalizes probability arrays to sum to 1
+- `counts_to_probs(counts)` — converts count arrays to probability distributions
+- `_ranked_probability_score(y_true, probs)` — standalone RPS computation
+- `_ordinal_loss(y_true, probs)` — standalone ordinal loss computation
+- `main()` — the full pipeline entry point
 
-Also read:
-- `spforge/autopipeline.py` — the `AutoPipeline` class (or similar) that orchestrates ratings → features → estimator
-- `spforge/data_structures.py` — `ColumnNames` or similar config objects
-- `examples/lol/data/utils.py` — the `get_sub_sample_lol_data()` function
+**This is your starting template.** Understand its pipeline, then improve it.
+
+## 5. spforge Rating System
+
+The repo implements player/team rating systems. Key modules:
+
+- **`spforge/data_structures.py`** — `ColumnNames` dataclass that maps semantic roles to column names. Inspect to find fields like `match_id`, `team_id`, `player_id`, `start_date`, `performance`, etc.
+- **`spforge/ratings/`** — Player rating generator. Look at `tests/ratings/test_player_rating_generator.py` for usage patterns.
+- **`spforge/autopipeline.py`** — `AutoPipeline` or similar high-level API. Inspect for convenience wrappers.
+- **`spforge/cross_validator/cross_validator.py`** — Time-based cross-validation. Uses `__match_num` and `is_validation` columns.
+- **`spforge/feature_generator/`** — Rolling window, lag, rolling mean features.
+
+### Column mapping for spforge:
+```python
+# You'll need to create a ColumnNames-like mapping:
+# match_id -> "gameid"
+# start_date -> "date" (parse to datetime first)
+# team_id -> "teamname"
+# player_id -> "playername"
+# performance -> "kills_capped" (or a normalized version)
+```
 
 ## 6. Feature Engineering
 
-Use the spforge framework's built-in feature generators. Key features to create:
-
-### 6a. Player Ratings
-Use `PlayerRatingGenerator` from `spforge/ratings/` to generate Elo-style player ratings. The framework tracks player skill over time. Key config:
-- `player_id` column: `playername`
-- `team_id` column: `teamname`  
-- Performance column: likely `kills_capped` or a normalized version
-- The rating system needs a `match_id` (`gameid`) and `start_date` (parsed `date`)
-
-### 6b. Team Ratings
-Use `TeamRatingGenerator` — aggregates player ratings to team level. Produces columns like `team_rating_projected`, `opponent_rating_projected`, `rating_difference_projected`.
-
-### 6c. Rolling Features
-Use feature generators from `spforge/feature_generator/`:
-- `RollingMeanWindow` — rolling averages of kills, assists, deaths, etc.
-- `Lag` — lagged values of performance stats
-- `RollingMeanDays` — time-weighted rolling means
-
-Example pattern (inspect the NBA examples for exact API):
+### Must-create derived columns:
 ```python
-from spforge.feature_generator import RollingMeanWindow, Lag
+# Parse date
+df["start_date"] = pd.to_datetime(df["date"])
+
+# Sort chronologically (required by spforge)
+df = df.sort_values("start_date").reset_index(drop=True)
+
+# Position is critical — one-hot or use as categorical feature
+# Kill share within team
+df["kill_share"] = df["kills"] / df["teamkills"].clip(lower=1)
 ```
 
-### 6d. Derived Columns to Create Before Pipeline
+### Features to use with spforge feature generators:
+- **Rolling window** on `kills_capped` per player (e.g., last 5/10/20 games)
+- **Rolling window** on `kill_share` per player
+- **Player ratings** from `PlayerRatingGenerator`
+- **Position** as categorical (strongly influences kill distribution)
+- **`gamelength`** — longer games → more kills
+- **`result`** — winners tend to have more kills
 
-```python
-df["date"] = pd.to_datetime(df["date"])
-df["start_date"] = df["date"].dt.strftime("%Y-%m-%d")  # or keep as datetime, check what framework expects
-df["kills_capped"] = df["kills"].clip(upper=10).astype(int)
-# May need opponent team — each gameid has 2 teams with 5 players each
-# Construct team_id_opponent by mapping gameid → both teams → pick the other one
+### spforge feature generators to reuse:
+- `spforge.feature_generator.RollingMeanWindow` — rolling averages
+- `spforge.feature_generator.Lag` — lagged values
+- Look at `examples/nba/feature_engineering_example.py` for patterns
+
+## 7. Metrics — How They Work
+
+### Primary: RankedProbabilityScorer
+**Location:** `spforge/scorer/_score.py` → class `RankedProbabilityScorer`
+
+RPS measures calibration of cumulative probability distributions. For each row with true class `k` and predicted probabilities `[p0, p1, ..., p10]`:
 ```
+RPS = (1/K) * sum_{i=0}^{K-1} (CDF_pred(i) - CDF_true(i))^2
+```
+where `CDF_true(i) = 1 if i >= k, else 0`. Lower is better.
 
-**Important:** The framework likely expects an opponent team column. Build it:
+The scorer expects a DataFrame with:
+- A target column (integer class label)
+- A prediction column containing list/array of 11 probabilities
+
+### Guardrail: OrdinalLossScorer
+**Location:** `spforge/scorer/_score.py` → class `OrdinalLossScorer`
+
+Cross-entropy loss adapted for ordinal outcomes. Also expects list-column of probabilities.
+
+### Guardrail: MeanBiasScorer
+**Location:** `spforge/scorer/_score.py` → class `MeanBiasScorer`
+
+When given probability predictions, computes expected value = `sum(i * p_i)` and measures `mean(expected - actual)`. Checks systematic over/under-prediction.
+
+### Scorer instantiation pattern (inspect test files for exact API):
 ```python
-# Each game has exactly 2 teams
-game_teams = df.groupby("gameid")["teamname"].apply(lambda x: list(x.unique())).to_dict()
-df["team_id_opponent"] = df.apply(
-    lambda row: [t for t in game_teams[row["gameid"]] if t != row["teamname"]][0], axis=1
+from spforge.scorer import RankedProbabilityScorer, OrdinalLossScorer, MeanBiasScorer
+
+rps_scorer = RankedProbabilityScorer(
+    target_column="kills_capped",
+    prediction_column="kills_probs",  # column containing list of 11 floats
 )
+score = rps_scorer.score(result_df)
 ```
 
-## 7. Cross-Validation Strategy
+Check `tests/scorer/test_score.py` for exact constructor signatures (especially `pred_column`, `target_column`, `validation_column`, `labels` params).
 
-**Time-based CV** — split by date to prevent future leakage. Use `spforge/cross_validator/cross_validator.py`:
+## 8. Cross-Validation / Splits
+
+**Use time-based splitting** to prevent leakage (games are chronological):
 
 ```python
-from spforge.cross_validator import CrossValidator  # check exact import
+from spforge.cross_validator import CrossValidator  # inspect actual class name
+
+# The CV likely splits on match number or date
+# Key: group by gameid so all players from same game are in same fold
 ```
 
-The cross-validator likely uses a `date_column` and `match_id_column` to create expanding-window or rolling-window time splits. It marks rows with `is_validation` column.
+Alternatively, do a simple temporal split:
+```python
+# Use last ~20-30% of data chronologically as validation
+df = df.sort_values("start_date")
+n = len(df)
+df["is_validation"] = 0
+df.loc[df.index[int(n * 0.7):], "is_validation"] = 1
+```
 
-Key parameters to set:
-- `date_column`: the parsed date column name
-- `match_id_column`: `"gameid"`
-- Number of folds / validation window size — inspect the CV class
+**Critical:** Never leak future game data into training features. All rolling/lag features must be computed on past data only. spforge handles this if you use its pipeline correctly.
 
-**Grouping:** Ensure all rows from the same `gameid` are in the same fold (no leakage of same-game info).
+## 9. Model Approach
 
-## 8. Model / Estimator
-
-The framework wraps LightGBM for multiclass. For ordinal multiclass with 11 classes:
-
+### Approach A: LightGBM multiclass (baseline)
 ```python
 import lightgbm as lgb
 
-lgbm_params = {
-    "objective": "multiclass",
-    "num_class": 11,
-    "metric": "multi_logloss",
-    "verbosity": -1,
-    "n_estimators": 300,
-    "learning_rate": 0.05,
-    "num_leaves": 31,
-    "max_depth": -1,
-    "min_child_samples": 20,
-}
+# objective="multiclass", num_class=11
+# Features: player rating, rolling kills, position, gamelength, etc.
+# Output: 11-class probabilities directly
 ```
 
-The framework likely has its own estimator wrapper — check `spforge/autopipeline.py` and `spforge/estimator/` for how to configure multiclass prediction that outputs probability arrays.
+### Approach B: spforge AutoPipeline (preferred)
+Inspect `spforge/autopipeline.py` for the high-level API. It likely chains:
+1. Rating generation
+2. Feature engineering
+3. LightGBM estimation
+4. Cross-validation
 
-## 9. Scoring / Metrics
+Look at `tests/end_to_end/test_nba_player_points.py` for a complete end-to-end pattern with player-level predictions.
 
-### Primary: OrdinalLossScorer
-Located in `spforge/scorer/_score.py`. Read this class carefully.
+### Approach C: Negative Binomial distribution
+`spforge/distributions/_negative_binomial_estimator.py` — kills are count data, so a negative binomial could work. Convert continuous distribution to discrete probabilities for classes 0–10.
+
+## 10. Output Format
+
+The final prediction column must contain a list/array of 11 floats (probabilities for classes 0–10) per row, summing to 1.0:
 
 ```python
-from spforge.scorer import OrdinalLossScorer
-
-scorer = OrdinalLossScorer(
-    target_column="kills_capped",
-    prediction_column="kills_capped_pred",  # column containing list of 11 probabilities
-    # Check constructor for other required params
-)
+# Example row: [0.05, 0.15, 0.25, 0.20, 0.15, 0.10, 0.05, 0.03, 0.01, 0.005, 0.005]
 ```
 
-**How it works:** Ordinal loss penalizes predicted probability mass proportional to its distance from the true class. For true class `k`, it computes a weighted sum of probabilities assigned to each class `j`, weighted by `|j - k|`. Lower is better.
+## 11. Execution Steps
 
-### Guardrail: MeanBiasScorer
-```python
-from spforge.scorer import MeanBiasScorer
+1. **Read** `experiments/lol_kills_rps_experiment.py` end-to-end
+2. **Read** `spforge/scorer/_score.py` to understand RankedProbabilityScorer API
+3. **Read** `spforge/data_structures.py` for ColumnNames
+4. **Read** one end-to-end test (e.g., `tests/end_to_end/test_nba_player_points.py`)
+5. **Run** the existing experiment: `python experiments/lol_kills_rps_experiment.py` to get baseline scores
+6. **Iterate** on features, rating params, model hyperparameters to minimize RPS
+7. **Check** OrdinalLossScorer and MeanBiasScorer as guardrails after each change
 
-bias_scorer = MeanBiasScorer(
-    target_column="kills_capped",
-    prediction_column="kills_capped_pred",  # accepts probability lists; computes expected value
-)
-```
+## 12. Key Pitfalls
 
-**How it works:** Computes `mean(predicted - actual)`. For probability predictions, it first converts to expected value (sum of class_label × probability). Target: close to 0.
-
-## 10. Step-by-Step Execution Plan
-
-1. **Read existing code:**
-   - `cat experiments/lol_naive_ordinal_baseline.py`
-   - `cat examples/lol/data/utils.py`
-   - `cat spforge/data_structures.py` (for ColumnNames)
-   - `cat spforge/autopipeline.py` (for pipeline API)
-   - `cat spforge/scorer/_score.py` (for OrdinalLossScorer signature)
-   - `cat spforge/cross_validator/cross_validator.py`
-
-2. **Create experiment script** at `experiments/lol_kills_ordinal.py` based on the baseline, modifying:
-   - Target: `kills_capped` (kills clipped to 10)
-   - Num classes: 11
-   - Features: player ratings + team ratings + rolling features on kills/assists/deaths/damage
-   - CV: time-based
-   - Scorer: OrdinalLossScorer + MeanBiasScorer
-
-3. **Run baseline** — get initial OrdinalLoss score.
-
-4. **Iterate** — tune features, LightGBM hyperparameters, rating parameters, rolling window sizes.
-
-## 11. Key Things to Watch
-
-- **Prediction format:** OrdinalLossScorer expects a column containing lists/arrays of length 11 (one probability per class 0–10). Ensure the pipeline outputs this format.
-- **Data sorting:** The framework requires data sorted by date. Call `validate_sorting` or sort explicitly: `df = df.sort_values("date")`.
-- **10 players per game:** Each `gameid` has 10 rows (5 per team). Features like `teamkills` are shared within a team — don't accidentally leak the target through team-level stats. Use only lagged/rolling versions.
-- **Feature leakage:** `totalgold`, `damagetochampions`, `teamkills`, `assists`, `deaths` are all same-game outcomes. They CANNOT be used as raw features. Only use rolling/lagged historical versions, or exclude them and rely on ratings + position + champion.
-- **Position encoding:** `position` (top/jng/mid/bot/sup) is a strong predictor of kill distribution — include it as a categorical feature.
+- **Probability normalization:** Always ensure probabilities sum to 1.0 per row. Use `normalize_probs()` from the experiment file.
+- **Class count mismatch:** Scorer expects exactly 11 probabilities (classes 0–10). If LightGBM sees fewer classes in training data, pad missing classes with 0.
+- **Sorting:** spforge requires data sorted by date. Call `validate_sorting()` or sort manually.
+- **Position conditioning:** Position is the single strongest predictor of kill distribution shape. Consider separate models per position or use it as a key feature.
+- **Small data:** Only 12,432 rows. Avoid overly complex models. Regularize LightGBM (low `num_leaves`, high `min_child_samples`, `lambda_l1`/`lambda_l2`).

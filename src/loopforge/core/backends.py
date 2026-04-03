@@ -303,6 +303,7 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
         "name": "guided_observation",
         "allowed_actions": allowed_actions,
         "generic_autonomous": generic_autonomous,
+        "must_finish_current_iteration_with_metrics_or_block": generic_autonomous,
         "recent_failures": [
             {
                 "iteration_id": record.iteration_id,
@@ -320,9 +321,27 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
     }
 
 
+def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
+    env = snapshot.capability_context.environment_facts
+    markdown_by_path = {item.path: item.content for item in snapshot.markdown_memory}
+    return {
+        "repo_root": env.get("repo_root"),
+        "execution_shell": env.get("execution_shell"),
+        "shell_family": env.get("shell_family"),
+        "python_executable": env.get("python_executable"),
+        "execution_backend_kind": env.get("execution_backend_kind"),
+        "verified_execution_lane": bool(env.get("python_executable")) and bool(env.get("repo_root")),
+        "must_reuse_verified_lane": True,
+        "available_bootstrap_handoff_files": sorted(markdown_by_path),
+        "execution_runbook": markdown_by_path.get("execution_runbook.md"),
+        "experiment_guide": markdown_by_path.get("experiment_guide.md"),
+    }
+
+
 class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
         iteration_policy = build_iteration_policy(snapshot)
+        execution_handoff = build_execution_handoff(snapshot)
         payload = self._complete_json(
             system_prompt=(
                 "You are a fresh worker agent in an experimentation loop. "
@@ -332,21 +351,29 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "After bootstrap, execution is autonomous: do not wait for more user input during normal experimentation. "
                 "Keep iterating until the configured stop condition, a true execution blocker, or a safety boundary is reached. "
                 "Treat recoverable execution failures as normal iteration evidence. If the latest record failed, use it to decide the next fix/retry step. "
-                "Do not make random changes. Base each step on observed evidence from the repo, data probe, memory, and latest outcomes. "
-                "Prefer the narrowest next step that either reduces uncertainty or addresses a concrete observed issue. "
-                "Do not infer facts that are unknown. If the repo context is incomplete, use an action that gathers the missing evidence first. "
-                "If you propose a change action, explain which observation or result justifies it and keep the modification narrow. "
-                "When the execution mode is generic autonomous, treat action_type as a lightweight label only. The real work should be expressed in bounded execution_steps. "
-                "In generic autonomous mode, prefer execution_steps whenever the next step requires inspection, dependency installation, code edits, test runs, or retries. "
+                "EACH ITERATION SHOULD AIM TO PRODUCE METRICS. An iteration is a full experiment cycle, not a single step. "
+                "Combine inspection, code writing, and execution into ONE iteration's execution_steps. "
+                "For example, a good iteration might: (1) read one key file to understand the API, (2) write a script that loads data/trains/evaluates, (3) run the script. "
+                "All three happen in the same iteration. Do NOT spend an entire iteration just reading files. "
+                "The only exception is the very first iteration when the repo is completely unknown — one initial inspection is acceptable. "
+                "After that, every iteration must write and run code that produces measurable results. "
+                "If markdown_memory contains `execution_runbook.md` or `experiment_guide.md`, treat them as the bootstrap handoff for how to run the repo and what to build first. "
+                "Do not ignore that handoff and rediscover the same execution mechanics from scratch unless a concrete execution failure proves the handoff is wrong or incomplete. "
+                "If the runbook says bootstrap already verified a repo root, Python executable, or command shape, reuse that verified lane instead of inventing activation commands, environment setup, or extra cd chains. "
                 "When recovering from a prior failure, your first step must directly address the specific failure_summary and recovery_actions from the latest record. "
                 "Do not repeat the same failing command unchanged. If you want to run a new repo-local script, create it in an earlier write_file step first. "
-                "When useful, include bounded execution_steps with concrete shell commands or safe repo file writes the runtime can run directly. "
-                "Return one bounded next experiment.\n\n"
+                "In generic autonomous mode, action_type is a lightweight label. The real work is in execution_steps. "
+                "In generic autonomous mode, an iteration is not complete until it produces the configured primary metric or hits a true non-recoverable blocker. "
+                "Do not return a bare action label without concrete execution_steps. "
+                "Read capability_context.environment_facts before you emit commands. Commands must match the actual execution shell. "
+                "If execution_shell is cmd.exe, do not use Unix tools like head, grep, find -maxdepth, or ls -la. Prefer Python-native scripts or cmd-compatible commands. "
+                "Return one bounded experiment that aims to produce metric results.\n\n"
                 + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
+                "execution_handoff": execution_handoff,
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
                 "recent_records": [record.to_dict() for record in snapshot.recent_records],
                 "recent_summaries": [summary.to_dict() for summary in snapshot.recent_summaries],
@@ -355,9 +382,81 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
                 "iteration_policy": iteration_policy,
                 "next_iteration_id": snapshot.next_iteration_id,
+                "instructions": {
+                    "return_fields": [
+                        "hypothesis",
+                        "action_type",
+                        "change_type",
+                        "instructions",
+                        "execution_steps",
+                        "config_patch",
+                        "metadata",
+                    ],
+                    "generic_autonomous_rules": [
+                        "execution_steps are required for generic autonomous execution.",
+                        "Reuse execution_handoff instead of inventing new activation or cd logic.",
+                        "If a repo-local script does not exist yet, add a write_file step before running it.",
+                    ],
+                },
             },
         )
         payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=iteration_policy)
+        return ExperimentCandidate(
+            hypothesis=payload["hypothesis"],
+            action_type=payload["action_type"],
+            change_type=payload["change_type"],
+            instructions=payload["instructions"],
+            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
+            config_patch=payload.get("config_patch", {}),
+            metadata=payload.get("metadata", {}),
+        )
+
+    def continue_experiment(
+        self,
+        snapshot: MemorySnapshot,
+        previous_candidate: ExperimentCandidate,
+        previous_outcome: ExperimentOutcome,
+    ) -> ExperimentCandidate:
+        """Ask the worker to extend an iteration that succeeded but produced no metrics."""
+        execution_handoff = build_execution_handoff(snapshot)
+        payload = self._complete_json(
+            system_prompt=(
+                "You are continuing an experiment iteration that succeeded but did NOT produce metrics. "
+                "The previous steps completed (inspection, setup, etc.) but no model was trained or evaluated. "
+                "You MUST now produce execution_steps that build on what was already done and: "
+                "1. Write a script that trains/runs a model using the APIs and data you already inspected. "
+                "2. Evaluate against the configured primary metric and guardrail metrics. "
+                "3. Print the metric results to stdout so the runtime can capture them. "
+                "Do NOT re-inspect files or re-read APIs. Use what you already learned from markdown_memory, especially `execution_runbook.md` and `experiment_guide.md`. "
+                "Reuse the verified execution lane from the runbook instead of inventing new shell setup or activation steps unless a concrete failure proved the runbook wrong. "
+                "Commands must match capability_context.environment_facts.execution_shell. "
+                "If execution_shell is cmd.exe, do not emit Unix tools like head, grep, find -maxdepth, or ls -la. "
+                "Return JSON with: hypothesis, action_type, change_type, instructions, execution_steps."
+            ),
+            payload={
+                "effective_spec": snapshot.effective_spec.to_dict(),
+                "capability_context": snapshot.capability_context.to_dict(),
+                "execution_handoff": execution_handoff,
+                "previous_hypothesis": previous_candidate.hypothesis,
+                "previous_instructions": previous_candidate.instructions,
+                "previous_outcome_notes": previous_outcome.notes,
+                "previous_step_results": previous_outcome.execution_details.get("step_results", []),
+                "instructions": {
+                    "return_fields": [
+                        "hypothesis",
+                        "action_type",
+                        "change_type",
+                        "instructions",
+                        "execution_steps",
+                    ],
+                    "generic_autonomous_rules": [
+                        "execution_steps are required.",
+                        "Reuse execution_handoff instead of inventing new activation or cd logic.",
+                    ],
+                },
+            },
+        )
+        payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=build_iteration_policy(snapshot))
         return ExperimentCandidate(
             hypothesis=payload["hypothesis"],
             action_type=payload["action_type"],
@@ -460,23 +559,39 @@ class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
         failure_summary: str,
         step_results: list[dict[str, Any]],
     ) -> list[ExecutionStep]:
+        failed_step_result = step_results[-1] if step_results else {}
         payload = self._complete_json(
             system_prompt=(
-                "You are fixing a failed execution plan. A previous attempt to run the execution steps failed. "
-                "You are given the original hypothesis and instructions, the steps that were attempted, "
-                "which step failed and why. Return a revised list of execution_steps that fixes the problem. "
-                "Common fixes: create missing scripts with write_file before running them, install missing "
-                "dependencies, fix import paths, adjust commands for the platform. "
-                "Do NOT change the hypothesis or objective — only fix the execution steps. "
-                "Return JSON with a single field: execution_steps (array of step objects)."
+                "You are the execution-repair helper for a coding agent. A previous execution plan failed. "
+                "Read the exact failing command, stdout/stderr, and prior steps, then produce a materially revised "
+                "execution_steps plan that directly fixes the failure. Think like a pragmatic senior engineer: "
+                "preserve successful earlier steps when still useful, replace brittle steps when necessary, and do not "
+                "repeat the same failing command unchanged unless an earlier step now changes its preconditions. "
+                "Common fixes include: correcting cwd/import paths, creating a missing script before running it, "
+                "rewriting a fragile inline python command into write_file + shell steps, installing/importing the "
+                "right dependency, or adjusting the command for the current platform. "
+                "Fix ONE concrete blocker at a time: directly address the first failing step, keep the rest of the plan as stable as possible, "
+                "and avoid redesigning the whole iteration unless the failure proves the whole plan is wrong. "
+                "Do NOT change the experiment objective or hypothesis. Only repair the execution plan. "
+                "Return JSON with exactly these fields: repair_summary (string) and execution_steps (array of step objects)."
             ),
             payload={
                 "hypothesis": candidate.hypothesis,
                 "instructions": candidate.instructions,
-                "original_steps": [step.to_dict() for step in candidate.execution_steps],
+                "candidate_metadata": candidate.metadata,
+                "current_steps": [step.to_dict() for step in candidate.execution_steps],
                 "failed_step_index": failed_step_index,
                 "failure_summary": failure_summary,
+                "failed_step_result": failed_step_result,
                 "step_results_so_far": step_results,
+                "instructions_for_repair": {
+                    "requirements": [
+                        "Directly address the concrete failure shown in failure_summary and failed_step_result.",
+                        "Return a revised plan, not commentary alone.",
+                        "If a python -c command is failing because it is too brittle, prefer write_file plus a normal python script invocation.",
+                        "If earlier steps already succeeded and remain necessary, keep them or explain their replacement in repair_summary.",
+                    ]
+                },
             },
         )
         raw_steps = payload.get("execution_steps", [])
@@ -523,6 +638,13 @@ CONSULTATION_TRIGGER_TOKENS = (
 
 
 def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
+    markdown_paths = {item.path for item in snapshot.markdown_memory}
+    if (
+        snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
+        and "execution_runbook.md" in markdown_paths
+    ):
+        return False
+    # Only trigger for genuine ops/infra topics — not generic data science work
     search_space = [
         snapshot.effective_spec.objective,
         " ".join(snapshot.effective_spec.allowed_actions),
@@ -530,17 +652,9 @@ def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
         " ".join(snapshot.capability_context.available_data_assets),
         json.dumps(snapshot.capability_context.environment_facts, sort_keys=True),
         json.dumps(snapshot.effective_spec.metadata, sort_keys=True),
-        " ".join(item.content for item in snapshot.markdown_memory),
     ]
     haystack = " ".join(part.lower() for part in search_space if part)
-    if any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS):
-        return True
-    recent_failures = [record for record in snapshot.recent_records if record.outcome.status == "recoverable_failure"]
-    if not recent_failures:
-        return False
-    if snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic":
-        return True
-    return len(recent_failures) >= 2
+    return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
 
 
 def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation) -> MemorySnapshot:
@@ -592,7 +706,8 @@ class ConsultingWorkerBackend:
                     guidance=f"Consultation backend failed: {exc}",
                     should_consult=False,
                 )
-            self.progress_fn("helper_consult_detail", self._format_consultation(consultation))
+            if consultation.should_consult and consultation.guidance.strip() and "unavailable" not in consultation.guidance.lower() and "no concrete guidance" not in consultation.guidance.lower():
+                self.progress_fn("helper_consult_detail", self._format_consultation(consultation))
             if consultation.should_consult:
                 delegated_snapshot = _inject_consultation(snapshot, consultation)
         candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
@@ -602,6 +717,14 @@ class ConsultingWorkerBackend:
         merged_metadata["ops_consultation"] = consultation.to_dict()
         merged_metadata["helper_consultation"] = consultation.to_dict()
         return replace(candidate, metadata=merged_metadata)
+
+    def continue_experiment(
+        self,
+        snapshot: MemorySnapshot,
+        previous_candidate: ExperimentCandidate,
+        previous_outcome: ExperimentOutcome,
+    ) -> ExperimentCandidate:
+        return self.worker_backend.continue_experiment(snapshot, previous_candidate, previous_outcome)
 
     @staticmethod
     def _format_consultation(consultation: OpsConsultation) -> str:
@@ -1036,6 +1159,83 @@ class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
 
 
 class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
+    @staticmethod
+    def _coerce_string_list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return [stripped] if stripped else []
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    @staticmethod
+    def _coerce_recommended_next_action(value: Any) -> str | None:
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        if isinstance(value, Mapping):
+            for key in ("action_type", "recommended_next_action", "next_action", "action", "name"):
+                nested = value.get(key)
+                if isinstance(nested, str) and nested.strip():
+                    return nested.strip()
+            candidate = value.get("candidate")
+            if isinstance(candidate, Mapping):
+                action_type = candidate.get("action_type")
+                if isinstance(action_type, str) and action_type.strip():
+                    return action_type.strip()
+            reason = value.get("reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason.strip()
+        return None
+
+    @classmethod
+    def _normalise_reflection_payload(
+        cls,
+        payload: Any,
+        *,
+        outcome: ExperimentOutcome,
+    ) -> dict[str, Any]:
+        raw_payload = payload if isinstance(payload, Mapping) else {}
+        nested = raw_payload.get("reflection")
+        if isinstance(nested, Mapping):
+            reflection_payload: dict[str, Any] = {**dict(raw_payload), **dict(nested)}
+        else:
+            reflection_payload = dict(raw_payload)
+
+        assessment = None
+        for key in ("assessment", "summary", "analysis", "reflection", "message", "text"):
+            value = reflection_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                assessment = value.strip()
+                break
+
+        lessons = cls._coerce_string_list(reflection_payload.get("lessons"))
+        risks = cls._coerce_string_list(reflection_payload.get("risks"))
+        recommended_next_action = cls._coerce_recommended_next_action(
+            reflection_payload.get("recommended_next_action")
+            or reflection_payload.get("next_action")
+        )
+
+        if assessment is None:
+            if lessons:
+                assessment = lessons[0]
+            elif risks:
+                assessment = risks[0]
+            elif recommended_next_action is not None:
+                assessment = (
+                    f"The iteration {outcome.status.replace('_', ' ')}. "
+                    f"Suggested next action: {recommended_next_action}."
+                )
+            else:
+                assessment = "[fallback] Reflection agent did not provide an assessment."
+
+        return {
+            "assessment": assessment,
+            "lessons": lessons,
+            "risks": risks,
+            "recommended_next_action": recommended_next_action,
+        }
+
     def reflect(
         self,
         snapshot: MemorySnapshot,
@@ -1060,10 +1260,16 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
                 "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
                 "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "instructions": {
+                    "return_fields": ["assessment", "lessons", "risks", "recommended_next_action"],
+                    "assessment_requirements": [
+                        "assessment is required and must be a non-empty string",
+                        "recommended_next_action must be a short action label string, not an object",
+                    ],
+                },
             },
         )
-        if not isinstance(payload.get("assessment"), str) or not payload.get("assessment", "").strip():
-            payload["assessment"] = "[fallback] Reflection agent did not provide an assessment."
+        payload = self._normalise_reflection_payload(payload, outcome=outcome)
         return ReflectionSummary(
             assessment=payload["assessment"],
             lessons=payload.get("lessons", []),
@@ -1112,6 +1318,20 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
 
 
 class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
+    @staticmethod
+    def _coerce_message(payload: Any, *, fallback: str) -> str:
+        if isinstance(payload, Mapping):
+            for key in ("message", "summary", "narration", "text", "assistant_message"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            for value in payload.values():
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        elif isinstance(payload, str) and payload.strip():
+            return payload.strip()
+        return fallback
+
     def summarize_bootstrap(
         self,
         turn: BootstrapTurn,
@@ -1142,7 +1362,10 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                 },
             },
         )
-        return payload["message"]
+        return self._coerce_message(
+            payload,
+            fallback=turn.assistant_message or "Bootstrap planning updated.",
+        )
 
     def answer_question(
         self,
@@ -1251,4 +1474,8 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                 },
             },
         )
-        return payload["message"]
+        fallback = (
+            f"Iteration {snapshot.next_iteration_id} completed with review status {review.status}. "
+            f"Outcome: {outcome.status}."
+        )
+        return self._coerce_message(payload, fallback=fallback)
