@@ -9,6 +9,7 @@ MetricGoal = Literal["maximize", "minimize"]
 IterationResult = Literal["improved", "regressed", "inconclusive"]
 ReviewStatus = Literal["accepted", "rejected", "pending_human"]
 HumanInterventionType = Literal["note", "override", "hypothesis"]
+PreflightStatus = Literal["passed", "warning", "failed"]
 
 
 @dataclass(frozen=True)
@@ -164,6 +165,8 @@ class CapabilityContext:
 class AdapterSetup:
     handlers: dict[str, Any]
     capability_provider: Callable[[ExperimentSpec], CapabilityContext] | None = None
+    discovery_provider: Callable[[str], CapabilityContext] | None = None
+    preflight_provider: Callable[[ExperimentSpec, CapabilityContext], list["PreflightCheck"]] | None = None
 
 
 @dataclass(frozen=True)
@@ -395,6 +398,126 @@ class IterationRecord:
 class IterationCycleResult:
     record: IterationRecord
     accepted_summary: IterationSummary | None
+
+
+@dataclass(frozen=True)
+class SpecQuestion:
+    key: str
+    prompt: str
+    rationale: str = ""
+    required: bool = True
+    suggested_answer: str | None = None
+    options: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "SpecQuestion":
+        return cls(
+            key=payload["key"],
+            prompt=payload["prompt"],
+            rationale=payload.get("rationale", ""),
+            required=payload.get("required", True),
+            suggested_answer=payload.get("suggested_answer"),
+            options=payload.get("options", []),
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentSpecProposal:
+    objective: str
+    recommended_spec: ExperimentSpec
+    questions: list[SpecQuestion] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "objective": self.objective,
+            "recommended_spec": self.recommended_spec.to_dict(),
+            "questions": [question.to_dict() for question in self.questions],
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ExperimentSpecProposal":
+        return cls(
+            objective=payload["objective"],
+            recommended_spec=ExperimentSpec.from_dict(payload["recommended_spec"]),
+            questions=[SpecQuestion.from_dict(item) for item in payload.get("questions", [])],
+            notes=payload.get("notes", []),
+        )
+
+
+@dataclass(frozen=True)
+class RoleModelConfig:
+    planner: str
+    worker: str
+    reflection: str
+    review: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RoleModelConfig":
+        return cls(
+            planner=payload["planner"],
+            worker=payload["worker"],
+            reflection=payload["reflection"],
+            review=payload["review"],
+        )
+
+
+@dataclass(frozen=True)
+class PreflightCheck:
+    name: str
+    status: PreflightStatus
+    detail: str
+    required: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "PreflightCheck":
+        return cls(
+            name=payload["name"],
+            status=payload["status"],
+            detail=payload["detail"],
+            required=payload.get("required", True),
+        )
+
+
+@dataclass(frozen=True)
+class BootstrapTurn:
+    assistant_message: str
+    proposal: ExperimentSpecProposal
+    role_models: RoleModelConfig
+    preflight_checks: list[PreflightCheck] = field(default_factory=list)
+    ready_to_start: bool = False
+    missing_requirements: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "assistant_message": self.assistant_message,
+            "proposal": self.proposal.to_dict(),
+            "role_models": self.role_models.to_dict(),
+            "preflight_checks": [item.to_dict() for item in self.preflight_checks],
+            "ready_to_start": self.ready_to_start,
+            "missing_requirements": self.missing_requirements,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "BootstrapTurn":
+        return cls(
+            assistant_message=payload["assistant_message"],
+            proposal=ExperimentSpecProposal.from_dict(payload["proposal"]),
+            role_models=RoleModelConfig.from_dict(payload["role_models"]),
+            preflight_checks=[PreflightCheck.from_dict(item) for item in payload.get("preflight_checks", [])],
+            ready_to_start=payload.get("ready_to_start", False),
+            missing_requirements=payload.get("missing_requirements", []),
+        )
 
 
 @dataclass(frozen=True)

@@ -5,20 +5,28 @@ from pathlib import Path
 
 from loopforge import (
     AdapterSetup,
+    BootstrapTurn,
     CapabilityContext,
     ExperimentCandidate,
     ExperimentOrchestrator,
     ExperimentOutcome,
     ExperimentSpec,
+    ExperimentSpecProposal,
     FileMemoryStore,
+    Loopforge,
     MetricResult,
     MetricSpec,
+    PreflightCheck,
     PrimaryMetric,
     ReflectionSummary,
+    RoleModelConfig,
     ReviewDecision,
     RoutingExperimentExecutor,
+    SpecQuestion,
 )
-from loopforge.cli import append_human_intervention, run_from_spec
+from loopforge.auto_adapter import synthesize_auto_adapter
+from loopforge.bootstrap import load_factory
+from loopforge.cli import append_human_intervention, discover_capabilities_for_objective, draft_spec, run_from_spec
 
 
 class FakeWorkerBackend:
@@ -265,9 +273,10 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
             ),
         )
 
-    monkeypatch.setattr("loopforge.cli.LiteLLMWorkerBackend", StubWorker)
-    monkeypatch.setattr("loopforge.cli.LiteLLMReflectionBackend", StubReflection)
-    monkeypatch.setattr("loopforge.cli.LiteLLMReviewBackend", StubReview)
+    monkeypatch.setattr("loopforge.bootstrap.LiteLLMWorkerBackend", StubWorker)
+    monkeypatch.setattr("loopforge.bootstrap.LiteLLMReflectionBackend", StubReflection)
+    monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
     monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
 
     results = run_from_spec(
@@ -279,6 +288,327 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
 
     assert results[0]["accepted_summary"]["hypothesis"] == "Baseline"
     assert results[0]["record"]["review"]["status"] == "accepted"
+
+
+def test_discover_capabilities_for_objective_prefers_discovery_provider(tmp_path, monkeypatch) -> None:
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={},
+            capability_provider=lambda effective_spec: CapabilityContext(
+                available_metrics={"fallback_metric": {"scorer_ref": "metrics.fallback"}}
+            ),
+            discovery_provider=lambda objective: CapabilityContext(
+                available_metrics={"precision_floor": {"scorer_ref": "metrics.precision_floor"}},
+                notes=[f"objective={objective}"],
+            ),
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+
+    context = discover_capabilities_for_objective(
+        objective="Keep precision high.",
+        memory_root=tmp_path / "memory",
+        executor_factory_path="fake.module:factory",
+    )
+
+    assert context.available_metrics["precision_floor"]["scorer_ref"] == "metrics.precision_floor"
+    assert context.notes == ["objective=Keep precision high."]
+
+
+def test_draft_spec_returns_metric_questions_and_recommended_spec(tmp_path, monkeypatch) -> None:
+    class StubSpecBackend:
+        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None) -> None:
+            self.model = model
+
+        def propose_spec(self, objective, capability_context, user_preferences=None):
+            assert capability_context.available_metrics["recall_at_p90"]["scorer_ref"] == "metrics.recall_at_p90"
+            assert user_preferences == {"custom_primary_scorer": "metrics.recall_at_p90"}
+            return ExperimentSpecProposal(
+                objective=objective,
+                recommended_spec=ExperimentSpec(
+                    objective=objective,
+                    primary_metric=PrimaryMetric(
+                        name="recall_at_p90",
+                        goal="maximize",
+                        scorer_ref="metrics.recall_at_p90",
+                    ),
+                    secondary_metrics=[
+                        MetricSpec(
+                            name="log_loss",
+                            goal="minimize",
+                            scorer_ref="metrics.log_loss_cv",
+                        )
+                    ],
+                    guardrail_metrics=[
+                        MetricSpec(
+                            name="precision_floor",
+                            goal="maximize",
+                            scorer_ref="metrics.precision_floor",
+                            constraints={"min_value": 0.9},
+                        )
+                    ],
+                    allowed_actions=["baseline", "train"],
+                    metadata={"planner": "stub"},
+                ),
+                questions=[
+                    SpecQuestion(
+                        key="primary_metric_confirmation",
+                        prompt="Should recall_at_p90 remain the primary metric?",
+                        suggested_answer="yes",
+                        options=["yes", "no"],
+                    )
+                ],
+                notes=["Discovered scorer metrics.recall_at_p90 from the host codebase."],
+            )
+
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={},
+            discovery_provider=lambda objective: CapabilityContext(
+                available_actions={"baseline": "Run baseline", "train": "Train model"},
+                available_metrics={
+                    "recall_at_p90": {"scorer_ref": "metrics.recall_at_p90"},
+                    "log_loss": {"scorer_ref": "metrics.log_loss_cv"},
+                    "precision_floor": {"scorer_ref": "metrics.precision_floor"},
+                },
+            ),
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+    monkeypatch.setattr("loopforge.cli.LiteLLMSpecBackend", StubSpecBackend)
+
+    proposal = draft_spec(
+        objective="Improve fraud recall without breaking precision.",
+        memory_root=tmp_path / "memory",
+        executor_factory_path="fake.module:factory",
+        planner_model="openai/gpt-5.4",
+        preferences={"custom_primary_scorer": "metrics.recall_at_p90"},
+    )
+
+    assert proposal.recommended_spec.primary_metric.name == "recall_at_p90"
+    assert proposal.recommended_spec.guardrail_metrics[0].name == "precision_floor"
+    assert proposal.questions[0].key == "primary_metric_confirmation"
+    assert proposal.notes == ["Discovered scorer metrics.recall_at_p90 from the host codebase."]
+
+
+def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, monkeypatch) -> None:
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+            assert capability_context.available_metrics["fraud_recall"]["scorer_ref"] == "metrics.fraud_recall"
+            assert role_models.worker == "openai/gpt-5.4"
+            return BootstrapTurn(
+                assistant_message="I need one more confirmation before starting.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(
+                            name="fraud_recall",
+                            goal="maximize",
+                            scorer_ref="metrics.fraud_recall",
+                        ),
+                        allowed_actions=["train"],
+                    ),
+                    questions=[
+                        SpecQuestion(
+                            key="positive_label_definition",
+                            prompt="Which label definition should the scorer use?",
+                        )
+                    ],
+                    notes=["Bootstrap discovered a candidate fraud recall scorer."],
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={},
+            discovery_provider=lambda objective: CapabilityContext(
+                available_metrics={"fraud_recall": {"scorer_ref": "metrics.fraud_recall"}},
+                available_data_assets=["fraud_training_set"],
+            ),
+            preflight_provider=lambda effective_spec, capability_context: [
+                PreflightCheck(
+                    name="warehouse_permissions",
+                    status="failed",
+                    detail="Missing SELECT on analytics.fraud_training_set.",
+                )
+            ],
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+
+    app = Loopforge(
+        executor_factory_path="fake.module:factory",
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+    )
+
+    turn = app.bootstrap(user_goal="Improve fraud detection recall.")
+
+    assert turn.ready_to_start is False
+    assert turn.missing_requirements == [
+        "answer:positive_label_definition",
+        "preflight:warehouse_permissions",
+    ]
+    assert turn.preflight_checks[0].name == "memory_root_access"
+    assert turn.preflight_checks[1].name == "warehouse_permissions"
+
+
+def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path, monkeypatch) -> None:
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+            assert answer_history == {"positive_label_definition": "chargeback_60d"}
+            return BootstrapTurn(
+                assistant_message="Configuration is specific enough to start.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        allowed_actions=["baseline"],
+                        stop_conditions={"max_iterations": 1},
+                    ),
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    class StubWorker:
+        def propose_next_experiment(self, snapshot):
+            return ExperimentCandidate(
+                hypothesis="Baseline",
+                action_type="baseline",
+                change_type="baseline",
+                instructions="Run the baseline.",
+            )
+
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.55)])},
+            capability_provider=lambda effective_spec: CapabilityContext(
+                available_actions={"baseline": "Run baseline"},
+                available_data_assets=["fraud_training_set"],
+            ),
+            discovery_provider=lambda objective: CapabilityContext(
+                available_actions={"baseline": "Run baseline"},
+                available_data_assets=["fraud_training_set"],
+            ),
+            preflight_provider=lambda effective_spec, capability_context: [
+                PreflightCheck(
+                    name="warehouse_permissions",
+                    status="passed",
+                    detail="Confirmed data access.",
+                )
+            ],
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+
+    app = Loopforge(
+        executor_factory_path="fake.module:factory",
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        worker_backend=StubWorker(),
+        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
+        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+    )
+
+    result = app.start(
+        user_goal="Improve fraud detection recall.",
+        answers={"positive_label_definition": "chargeback_60d"},
+    )
+
+    assert result["status"] == "started"
+    assert result["bootstrap"]["role_models"] == RoleModelConfig(
+        planner="openai/gpt-5.4",
+        worker="openai/gpt-5.4",
+        reflection="openai/gpt-5.4",
+        review="openai/gpt-5.4",
+    ).to_dict()
+    assert result["results"][0]["accepted_summary"]["primary_metric_value"] == 0.55
+
+
+def test_synthesize_auto_adapter_creates_loadable_reusable_factory(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "fraud_metrics.py").write_text(
+        "def fraud_recall_score(y_true, y_pred):\n    return 0.0\n",
+        encoding="utf-8",
+    )
+    (repo_root / "trainer.py").write_text(
+        "def train_model(config):\n    return config\n",
+        encoding="utf-8",
+    )
+    (repo_root / "fraud_data_loader.py").write_text(
+        "def load_dataset(name):\n    return name\n",
+        encoding="utf-8",
+    )
+
+    factory_path = synthesize_auto_adapter(
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        objective="Improve fraud recall.",
+    )
+    build_adapter = load_factory(factory_path)
+    adapter_setup = build_adapter(
+        build_spec(allowed_actions=["train_model"]),
+        tmp_path / "memory",
+    )
+    capability_context = adapter_setup.discovery_provider("Improve fraud recall.")
+
+    assert "fraud_recall_score" in capability_context.available_metrics
+    assert capability_context.available_actions["train_model"] == "trainer.py"
+    assert "fraud_data_loader.py" in capability_context.available_data_assets
+    assert Path(factory_path.rsplit(":", maxsplit=1)[0]).exists()
+
+
+def test_loopforge_bootstrap_auto_synthesizes_adapter_when_missing(tmp_path) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "credit_metrics.py").write_text(
+        "def precision_guardrail_metric():\n    return 0.0\n",
+        encoding="utf-8",
+    )
+    (repo_root / "evaluate_pipeline.py").write_text(
+        "def evaluate_model():\n    return 0.0\n",
+        encoding="utf-8",
+    )
+
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+            assert capability_context.environment_facts["adapter_kind"] == "auto_generated_scaffold"
+            assert "precision_guardrail_metric" in capability_context.available_metrics
+            return BootstrapTurn(
+                assistant_message="Scaffold generated from repo inspection.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(
+                            name="precision_guardrail_metric",
+                            goal="maximize",
+                        ),
+                        allowed_actions=["evaluate_model"],
+                    ),
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    app = Loopforge(
+        executor_factory_path=None,
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+    )
+
+    turn = app.bootstrap(user_goal="Protect approval precision.")
+
+    assert app.executor_factory_path is not None
+    assert turn.ready_to_start is False
+    assert "preflight:auto_adapter_scaffold" in turn.missing_requirements
 
 
 def test_metric_results_and_guardrails_drive_summary_classification(tmp_path) -> None:

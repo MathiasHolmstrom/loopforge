@@ -5,16 +5,41 @@ from collections.abc import Mapping
 from typing import Any, Protocol
 
 from loopforge.core.types import (
+    BootstrapTurn,
+    CapabilityContext,
     ExperimentCandidate,
+    ExperimentSpec,
+    ExperimentSpecProposal,
     ExperimentOutcome,
     MemorySnapshot,
+    RoleModelConfig,
     ReflectionSummary,
     ReviewDecision,
+    SpecQuestion,
 )
 
 
 class WorkerBackend(Protocol):
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate: ...
+
+
+class SpecBackend(Protocol):
+    def propose_spec(
+        self,
+        objective: str,
+        capability_context: CapabilityContext,
+        user_preferences: dict[str, Any] | None = None,
+    ) -> ExperimentSpecProposal: ...
+
+
+class BootstrapBackend(Protocol):
+    def propose_bootstrap_turn(
+        self,
+        user_goal: str,
+        capability_context: CapabilityContext,
+        answer_history: dict[str, Any] | None = None,
+        role_models: RoleModelConfig | None = None,
+    ) -> BootstrapTurn: ...
 
 
 class ReflectionBackend(Protocol):
@@ -103,7 +128,8 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a fresh worker agent in an experimentation loop. "
                 "Use only the provided effective spec, accepted memory, and human interventions. "
-                "Return one bounded next experiment."
+                "Respect the configured primary metric, secondary metrics, and guardrail metrics, "
+                "including any scorer_ref or metric constraints. Return one bounded next experiment."
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
@@ -125,6 +151,114 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         )
 
 
+class LiteLLMSpecBackend(_LiteLLMJsonBackend):
+    def propose_spec(
+        self,
+        objective: str,
+        capability_context: CapabilityContext,
+        user_preferences: dict[str, Any] | None = None,
+    ) -> ExperimentSpecProposal:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are planning an experimentation spec before the loop starts. "
+                "Use the available metrics discovered in the capability context when possible. "
+                "Recommend one primary metric, useful secondary metrics, and strict guardrail metrics. "
+                "If the user may need to confirm a calculation choice, surface that as a question. "
+                "Return JSON with objective, recommended_spec, questions, and notes."
+            ),
+            payload={
+                "objective": objective,
+                "capability_context": capability_context.to_dict(),
+                "user_preferences": user_preferences or {},
+                "instructions": {
+                    "recommended_spec_must_include": [
+                        "objective",
+                        "primary_metric",
+                        "secondary_metrics",
+                        "guardrail_metrics",
+                        "allowed_actions",
+                        "constraints",
+                        "search_space",
+                        "stop_conditions",
+                        "metadata",
+                    ],
+                    "question_fields": [
+                        "key",
+                        "prompt",
+                        "rationale",
+                        "required",
+                        "suggested_answer",
+                        "options",
+                    ],
+                },
+            },
+        )
+        return ExperimentSpecProposal(
+            objective=payload["objective"],
+            recommended_spec=ExperimentSpec.from_dict(payload["recommended_spec"]),
+            questions=[SpecQuestion.from_dict(item) for item in payload.get("questions", [])],
+            notes=payload.get("notes", []),
+        )
+
+
+class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
+    def propose_bootstrap_turn(
+        self,
+        user_goal: str,
+        capability_context: CapabilityContext,
+        answer_history: dict[str, Any] | None = None,
+        role_models: RoleModelConfig | None = None,
+    ) -> BootstrapTurn:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are the initial clarifying agent for an experimentation runtime. "
+                "Read the user's goal, inspect the discovered repo capabilities, and align on the problem framing. "
+                "Ask only the highest-value remaining questions, recommend a concrete experiment spec, "
+                "and set ready_to_start=true only when the spec is specific enough to begin execution."
+            ),
+            payload={
+                "user_goal": user_goal,
+                "capability_context": capability_context.to_dict(),
+                "answer_history": answer_history or {},
+                "role_models": role_models.to_dict() if role_models is not None else None,
+                "instructions": {
+                    "return_fields": [
+                        "assistant_message",
+                        "proposal",
+                        "role_models",
+                        "ready_to_start",
+                    ],
+                    "proposal_fields": [
+                        "objective",
+                        "recommended_spec",
+                        "questions",
+                        "notes",
+                    ],
+                    "question_fields": [
+                        "key",
+                        "prompt",
+                        "rationale",
+                        "required",
+                        "suggested_answer",
+                        "options",
+                    ],
+                    "behavior": [
+                        "Prefer discovered codebase metrics when available.",
+                        "If the user already implied a metric calculation, reflect that in scorer_ref, params, or constraints.",
+                        "Use guardrail metrics for non-negotiable regressions.",
+                        "Keep required questions minimal and concrete.",
+                    ],
+                },
+            },
+        )
+        return BootstrapTurn(
+            assistant_message=payload["assistant_message"],
+            proposal=ExperimentSpecProposal.from_dict(payload["proposal"]),
+            role_models=RoleModelConfig.from_dict(payload["role_models"]),
+            ready_to_start=payload.get("ready_to_start", False),
+        )
+
+
 class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
     def reflect(
         self,
@@ -135,7 +269,8 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
         payload = self._complete_json(
             system_prompt=(
                 "You are a fresh reflection agent. Assess whether the experiment result is meaningful, "
-                "what was learned, and what action type should be considered next."
+                "what was learned, whether primary or guardrail metrics moved in the intended direction, "
+                "and what action type should be considered next."
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
@@ -165,7 +300,8 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
         payload = self._complete_json(
             system_prompt=(
                 "You are a fresh review agent. Decide whether this iteration should enter accepted memory. "
-                "Use status accepted, rejected, or pending_human."
+                "Use status accepted, rejected, or pending_human. Consider guardrail violations and "
+                "whether the reported metric results match the configured scoring contract."
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
