@@ -27,6 +27,7 @@ from loopforge.core.types import (
     StreamFn,
     _noop_progress,
 )
+from loopforge.core.runtime import is_generic_autonomous
 
 
 DATA_SCIENCE_METRICS_REASONING = (
@@ -279,9 +280,7 @@ class _LiteLLMJsonBackend:
 
 def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
     allowed_actions = list(snapshot.effective_spec.allowed_actions)
-    generic_autonomous = (
-        snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
-    )
+    generic_autonomous = is_generic_autonomous(snapshot=snapshot)
     forced_next_action = snapshot.effective_spec.metadata.get("force_next_action")
     if forced_next_action not in allowed_actions:
         forced_next_action = None
@@ -321,9 +320,19 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
     }
 
 
+def _markdown_content_by_name(snapshot: MemorySnapshot, filename: str) -> str | None:
+    for item in snapshot.markdown_memory:
+        if item.path == filename or item.path.endswith(f"/{filename}"):
+            return item.content
+    return None
+
+
+def _has_markdown_name(snapshot: MemorySnapshot, filename: str) -> bool:
+    return _markdown_content_by_name(snapshot, filename) is not None
+
+
 def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
     env = snapshot.capability_context.environment_facts
-    markdown_by_path = {item.path: item.content for item in snapshot.markdown_memory}
     return {
         "repo_root": env.get("repo_root"),
         "execution_shell": env.get("execution_shell"),
@@ -332,13 +341,25 @@ def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
         "execution_backend_kind": env.get("execution_backend_kind"),
         "verified_execution_lane": bool(env.get("python_executable")) and bool(env.get("repo_root")),
         "must_reuse_verified_lane": True,
-        "available_bootstrap_handoff_files": sorted(markdown_by_path),
-        "execution_runbook": markdown_by_path.get("execution_runbook.md"),
-        "experiment_guide": markdown_by_path.get("experiment_guide.md"),
+        "available_bootstrap_handoff_files": sorted(item.path for item in snapshot.markdown_memory),
+        "execution_runbook": _markdown_content_by_name(snapshot, "execution_runbook.md"),
+        "experiment_guide": _markdown_content_by_name(snapshot, "experiment_guide.md"),
     }
 
 
 class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
+    @staticmethod
+    def _candidate_from_payload(payload: dict[str, Any]) -> ExperimentCandidate:
+        return ExperimentCandidate(
+            hypothesis=payload["hypothesis"],
+            action_type=payload["action_type"],
+            change_type=payload["change_type"],
+            instructions=payload["instructions"],
+            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
+            config_patch=payload.get("config_patch", {}),
+            metadata=payload.get("metadata", {}),
+        )
+
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
         iteration_policy = build_iteration_policy(snapshot)
         execution_handoff = build_execution_handoff(snapshot)
@@ -401,15 +422,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
             },
         )
         payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=iteration_policy)
-        return ExperimentCandidate(
-            hypothesis=payload["hypothesis"],
-            action_type=payload["action_type"],
-            change_type=payload["change_type"],
-            instructions=payload["instructions"],
-            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
-            config_patch=payload.get("config_patch", {}),
-            metadata=payload.get("metadata", {}),
-        )
+        return self._candidate_from_payload(payload)
 
     def continue_experiment(
         self,
@@ -457,15 +470,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
             },
         )
         payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=build_iteration_policy(snapshot))
-        return ExperimentCandidate(
-            hypothesis=payload["hypothesis"],
-            action_type=payload["action_type"],
-            change_type=payload["change_type"],
-            instructions=payload["instructions"],
-            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
-            config_patch=payload.get("config_patch", {}),
-            metadata=payload.get("metadata", {}),
-        )
+        return self._candidate_from_payload(payload)
 
     @staticmethod
     def _normalise_candidate_payload(
@@ -638,10 +643,9 @@ CONSULTATION_TRIGGER_TOKENS = (
 
 
 def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
-    markdown_paths = {item.path for item in snapshot.markdown_memory}
     if (
         snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
-        and "execution_runbook.md" in markdown_paths
+        and _has_markdown_name(snapshot, "execution_runbook.md")
     ):
         return False
     # Only trigger for genuine ops/infra topics — not generic data science work
@@ -903,6 +907,8 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                 "It must expose real handlers, a discovery_provider or capability_provider, and a preflight_provider. "
                 "Do not generate placeholders or NotImplementedError stubs. "
                 "Do not intentionally block in preflight. Build the best runnable baseline path you can from the repo. "
+                "If request.bootstrap_answers contains high-level user hints about the data source or execution environment, "
+                "use them to resolve the integration details yourself rather than asking for exact internal paths. "
                 "Prefer baseline/eda/slice_analysis/targeted_tune actions over raw helper function names."
             ),
             payload={

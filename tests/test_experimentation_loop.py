@@ -1639,8 +1639,13 @@ def test_cli_interjection_appends_human_note_and_changes_future_effective_spec(t
 def test_file_memory_store_loads_markdown_memory_and_experiment_journal(tmp_path) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
-    (tmp_path / "loop" / "ops_access_guide.md").write_text("# Access\nUse the approved workspace.\n", encoding="utf-8")
-    (tmp_path / "loop" / "execution_runbook.md").write_text("# Runbook\nUse Python scripts.\n", encoding="utf-8")
+    (tmp_path / "loop" / "agent_markdown").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "loop" / "agent_markdown" / "ops_access_guide.md").write_text(
+        "# Access\nUse the approved workspace.\n", encoding="utf-8"
+    )
+    (tmp_path / "loop" / "agent_markdown" / "execution_runbook.md").write_text(
+        "# Runbook\nUse Python scripts.\n", encoding="utf-8"
+    )
     store.append_accepted_summary(
         IterationSummary(
             iteration_id=1,
@@ -1666,11 +1671,23 @@ def test_file_memory_store_loads_markdown_memory_and_experiment_journal(tmp_path
     snapshot = store.load_snapshot()
     markdown_by_path = {note.path: note.content for note in snapshot.markdown_memory}
 
+    assert "agent_markdown/ops_access_guide.md" in markdown_by_path
+    assert "agent_markdown/execution_runbook.md" in markdown_by_path
+    assert "agent_markdown/experiment_journal.md" in markdown_by_path
+    assert "## Iteration 1: Baseline" in markdown_by_path["agent_markdown/experiment_journal.md"]
+    assert "Do not repeat: Rerun the broken config." in markdown_by_path["agent_markdown/experiment_journal.md"]
+
+
+def test_file_memory_store_still_reads_legacy_root_markdown_memory(tmp_path) -> None:
+    store = FileMemoryStore(tmp_path / "loop")
+    store.initialize(build_spec())
+    (tmp_path / "loop" / "ops_access_guide.md").write_text("# Access\nLegacy location.\n", encoding="utf-8")
+
+    snapshot = store.load_snapshot()
+    markdown_by_path = {note.path: note.content for note in snapshot.markdown_memory}
+
     assert "ops_access_guide.md" in markdown_by_path
-    assert "execution_runbook.md" in markdown_by_path
-    assert "experiment_journal.md" in markdown_by_path
-    assert "## Iteration 1: Baseline" in markdown_by_path["experiment_journal.md"]
-    assert "Do not repeat: Rerun the broken config." in markdown_by_path["experiment_journal.md"]
+    assert markdown_by_path["ops_access_guide.md"].startswith("# Access")
 
 
 def test_worker_backend_sends_markdown_memory_to_completion() -> None:
@@ -1767,7 +1784,10 @@ def test_worker_payload_carries_autonomous_execution_mode() -> None:
 def test_loopforge_bootstrap_passes_existing_markdown_memory(tmp_path, monkeypatch) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
-    (tmp_path / "loop" / "ops_access_guide.md").write_text("# Access\nUse the dev workspace.\n", encoding="utf-8")
+    (tmp_path / "loop" / "agent_markdown").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "loop" / "agent_markdown" / "ops_access_guide.md").write_text(
+        "# Access\nUse the dev workspace.\n", encoding="utf-8"
+    )
 
     captured = {}
 
@@ -1868,7 +1888,6 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
 
     results = run_from_spec(
         spec_path=spec_path,
@@ -1946,8 +1965,7 @@ def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, 
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.core.agentic_execution.GenericExecutionPlanExecutor", CapturingPlanExecutor)
+    monkeypatch.setattr("loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor)
 
     run_from_spec(
         spec_path=spec_path,
@@ -2024,8 +2042,7 @@ def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_pat
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.core.agentic_execution.GenericExecutionPlanExecutor", CapturingPlanExecutor)
+    monkeypatch.setattr("loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor)
 
     run_from_spec(
         spec_path=spec_path,
@@ -2122,7 +2139,6 @@ def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_execut
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
 
     exit_code = main(
         [
@@ -2166,7 +2182,6 @@ def test_run_from_spec_blocks_invalid_metric_goal_before_execution(tmp_path, mon
         )
 
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
 
     try:
         run_from_spec(
@@ -2607,7 +2622,7 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
     assert "bootstrap:Improve fraud detection recall." in turn.human_update
     assert "Access guide:" in turn.human_update
     assert Path(turn.access_guide_path).read_text(encoding="utf-8").startswith("# Access Guide")
-    runbook_path = tmp_path / "memory" / "execution_runbook.md"
+    runbook_path = tmp_path / "memory" / "agent_markdown" / "execution_runbook.md"
     assert runbook_path.exists()
     assert "Execution Runbook" in runbook_path.read_text(encoding="utf-8")
     assert len(access_advisor.calls) == 1
@@ -3740,6 +3755,162 @@ def test_validate_runner_factory_accepts_dict_preflight_checks(tmp_path, monkeyp
     assert validation.preflight_checks[0].name == "authored_runner_ready"
 
 
+def test_bootstrap_injects_high_level_execution_guidance_question_for_unresolved_remote_data(tmp_path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+            return BootstrapTurn(
+                assistant_message="I found the likely repo entrypoints.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        allowed_actions=["baseline"],
+                    ),
+                    questions=[],
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "discover_capabilities_for_objective",
+        lambda **kwargs: CapabilityContext(
+            available_data_assets=["s3://team-bucket/training/latest.parquet"],
+            available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+            environment_facts={
+                "repo_root": str(repo_root.resolve()),
+                "python_executable": sys.executable,
+            },
+            notes=["The pipeline may load data from S3 or Databricks depending on the environment."],
+        ),
+    )
+
+    app = Loopforge(
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        narrator_backend=FakeNarrationBackend(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
+        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+    )
+    monkeypatch.setattr(
+        app,
+        "_author_runner",
+        lambda user_goal, capability_context, answers=None: bootstrap_module.ExecutionBackendResolution(
+            kind="planning_only",
+            reason="Runner authoring still needs one execution hint.",
+        ),
+    )
+
+    turn = app.bootstrap(user_goal="Improve ranking quality.")
+
+    assert turn.ready_to_start is False
+    assert any(question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY for question in turn.proposal.questions)
+    assert "answer:execution_strategy_hint" in turn.missing_requirements
+    assert "preflight:execution_strategy_unresolved" in turn.missing_requirements
+    assert any(check.name == "execution_strategy_unresolved" for check in turn.preflight_checks)
+
+
+def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_path, monkeypatch) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+            return BootstrapTurn(
+                assistant_message="Ready to run.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        allowed_actions=["baseline"],
+                    ),
+                    questions=[],
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    def fake_discover(*, executor_factory_path, **kwargs):
+        if executor_factory_path:
+            return CapabilityContext(
+                available_actions={"baseline": "authored baseline"},
+                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                environment_facts={
+                    "repo_root": str(repo_root.resolve()),
+                    "python_executable": sys.executable,
+                    "runner_kind": "authored",
+                },
+                notes=["Authored runner resolved the execution path."],
+            )
+        return CapabilityContext(
+            available_data_assets=["s3://team-bucket/training/latest.parquet"],
+            available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+            environment_facts={
+                "repo_root": str(repo_root.resolve()),
+                "python_executable": sys.executable,
+            },
+            notes=["The training data is stored remotely."],
+        )
+
+    def fake_adapter_setup(*, factory_path, spec, memory_root):
+        return AdapterSetup(
+            handlers={},
+            discovery_provider=lambda objective: CapabilityContext(
+                available_actions={"baseline": "authored baseline"},
+                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                environment_facts={"runner_kind": "authored"},
+            ),
+            capability_provider=lambda effective_spec: CapabilityContext(
+                available_actions={"baseline": "authored baseline"},
+                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                environment_facts={"runner_kind": "authored"},
+            ),
+            preflight_provider=lambda effective_spec, capability_context: [
+                PreflightCheck(name="authored_runner_ready", status="passed", detail="Runner validated.")
+            ],
+        )
+
+    monkeypatch.setattr(bootstrap_module, "discover_capabilities_for_objective", fake_discover)
+    monkeypatch.setattr(bootstrap_module, "load_adapter_setup", fake_adapter_setup)
+
+    app = Loopforge(
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        narrator_backend=FakeNarrationBackend(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
+        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+    )
+
+    def fake_author_runner(user_goal, capability_context, answers=None):
+        assert answers == {bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."}
+        return bootstrap_module.ExecutionBackendResolution(
+            kind="supported",
+            factory_path="generated.runner:build_adapter",
+        )
+
+    monkeypatch.setattr(app, "_author_runner", fake_author_runner)
+
+    turn = app.bootstrap(
+        user_goal="Improve ranking quality.",
+        answers={bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."},
+    )
+
+    assert turn.ready_to_start is True
+    assert not any(question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY for question in turn.proposal.questions)
+    assert not any(check.status == "failed" for check in turn.preflight_checks)
+    assert any(check.name == "authored_runner_ready" for check in turn.preflight_checks)
+
+
 def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -4114,6 +4285,39 @@ def test_routing_executor_treats_unbound_generic_action_as_recoverable_failure(t
 
     assert outcome.status == "recoverable_failure"
     assert outcome.failure_type == "UnboundActionProposal"
+
+
+def test_routing_executor_uses_metadata_only_autonomous_mode_for_unbound_actions(tmp_path) -> None:
+    spec = build_spec(
+        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"],
+        metadata={"execution_mode": "autonomous_after_bootstrap"},
+    )
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=CapabilityContext(),
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=1,
+    )
+    candidate = ExperimentCandidate(
+        hypothesis="Try a generic repair label without steps.",
+        action_type="unknown_generic_action",
+        change_type="repair",
+        instructions="Repair the last failure.",
+    )
+
+    executor = RoutingExperimentExecutor(handlers={})
+
+    outcome = executor.execute(candidate, snapshot)
+
+    assert outcome.status == "recoverable_failure"
+    assert outcome.failure_type == "UnboundActionProposal"
     assert "execution_steps" in outcome.failure_summary
 
 
@@ -4360,6 +4564,50 @@ def test_build_iteration_policy_prefers_fix_failure_for_generic_recoverable_fail
 
     policy = build_iteration_policy(snapshot)
 
+    assert policy["recommended_next_action"] == "fix_failure"
+
+
+def test_build_iteration_policy_treats_metadata_only_autonomous_mode_as_generic() -> None:
+    spec = build_spec(
+        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"],
+        metadata={"execution_mode": "autonomous_after_bootstrap"},
+    )
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=CapabilityContext(),
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[
+            IterationRecord(
+                iteration_id=1,
+                parent_iteration_id=None,
+                candidate=ExperimentCandidate(
+                    hypothesis="Run a temp script.",
+                    action_type="inspect_repo",
+                    change_type="inspect",
+                    instructions="Inspect.",
+                ),
+                outcome=ExperimentOutcome(
+                    status="recoverable_failure",
+                    failure_type="MissingScriptFile",
+                    failure_summary="tmp script missing",
+                    recoverable=True,
+                ),
+                reflection=ReflectionSummary(assessment="Need a fix."),
+                review=ReviewDecision(status="accepted", reason="ok"),
+            )
+        ],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=2,
+    )
+
+    policy = build_iteration_policy(snapshot)
+
+    assert policy["generic_autonomous"] is True
     assert policy["recommended_next_action"] == "fix_failure"
 
 

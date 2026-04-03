@@ -21,20 +21,30 @@ class FileMemoryStore:
     def __init__(self, root: Path | str) -> None:
         self.root = Path(root)
         self._artifacts_dir = self.root / "artifacts"
-        self._objective_path = self.root / "objective.md"
+        self._agent_markdown_dir = self.root / "agent_markdown"
+        self._objective_path = self._agent_markdown_dir / "objective.md"
         self._spec_path = self.root / "experiment_spec.json"
         self._best_result_path = self.root / "best_result.json"
         self._records_path = self.root / "iteration_records.jsonl"
         self._summaries_path = self.root / "iteration_summaries.jsonl"
         self._updates_path = self.root / "agent_updates.jsonl"
         self._human_notes_path = self.root / "human_notes.jsonl"
-        self._lessons_path = self.root / "lessons_learned.md"
-        self._experiment_journal_path = self.root / "experiment_journal.md"
+        self._lessons_path = self._agent_markdown_dir / "lessons_learned.md"
+        self._experiment_journal_path = self._agent_markdown_dir / "experiment_journal.md"
         self._artifact_index_path = self._artifacts_dir / "index.json"
+        self._legacy_markdown_paths = {
+            "objective": self.root / "objective.md",
+            "lessons": self.root / "lessons_learned.md",
+            "journal": self.root / "experiment_journal.md",
+            "ops_access_guide": self.root / "ops_access_guide.md",
+            "execution_runbook": self.root / "execution_runbook.md",
+            "experiment_guide": self.root / "experiment_guide.md",
+        }
 
     def initialize(self, spec: ExperimentSpec, *, reset_state: bool = False) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self._agent_markdown_dir.mkdir(parents=True, exist_ok=True)
         self._objective_path.write_text(spec.objective.strip() + "\n", encoding="utf-8")
         self._spec_path.write_text(json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
         for path, default_contents in [
@@ -65,7 +75,7 @@ class FileMemoryStore:
         summaries = self._read_summaries()
         human_interventions = self._read_human_interventions()
         effective_spec = apply_human_interventions(spec, human_interventions)
-        lessons = self._lessons_path.read_text(encoding="utf-8") if self._lessons_path.exists() else ""
+        lessons = self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"])
         return MemorySnapshot(
             spec=spec,
             effective_spec=effective_spec,
@@ -84,8 +94,9 @@ class FileMemoryStore:
         summaries = self._read_summaries()
         best_summary = self._read_best_summary()
         human_interventions = self._read_human_interventions()
-        lessons = self._lessons_path.read_text(encoding="utf-8") if self._lessons_path.exists() else ""
-        objective = self._objective_path.read_text(encoding="utf-8").strip() if self._objective_path.exists() else None
+        lessons = self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"])
+        objective_text = self._read_markdown_text(self._objective_path, self._legacy_markdown_paths["objective"])
+        objective = objective_text.strip() if objective_text else None
         return {
             "previous_objective": objective,
             "best_summary": best_summary.to_dict() if best_summary is not None else None,
@@ -107,6 +118,9 @@ class FileMemoryStore:
                 self._experiment_journal_path,
                 self._artifact_index_path,
                 self._best_result_path,
+                self._legacy_markdown_paths["objective"],
+                self._legacy_markdown_paths["lessons"],
+                self._legacy_markdown_paths["journal"],
             )
         )
 
@@ -176,12 +190,20 @@ class FileMemoryStore:
             return None
         return IterationSummary.from_dict(json.loads(self._best_result_path.read_text(encoding="utf-8")))
 
+    @staticmethod
+    def _read_markdown_text(primary_path: Path, legacy_path: Path | None = None) -> str:
+        if primary_path.exists():
+            return primary_path.read_text(encoding="utf-8")
+        if legacy_path is not None and legacy_path.exists():
+            return legacy_path.read_text(encoding="utf-8")
+        return ""
+
     def _append_lessons(self, lessons: list[str]) -> None:
         if not lessons:
             return
         existing_lessons = [
             line[2:].strip()
-            for line in self._lessons_path.read_text(encoding="utf-8").splitlines()
+            for line in self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"]).splitlines()
             if line.startswith("- ")
         ]
         merged_lessons = list(existing_lessons)
@@ -208,8 +230,23 @@ class FileMemoryStore:
         if not self.root.exists():
             return []
         notes: list[MarkdownMemoryNote] = []
-        for path in sorted(self.root.glob("*.md")):
+        seen_paths: set[str] = set()
+        for path in sorted(self._agent_markdown_dir.rglob("*.md")) if self._agent_markdown_dir.exists() else []:
             if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            rel_path = str(path.relative_to(self.root)).replace("\\", "/")
+            seen_paths.add(path.name)
+            notes.append(
+                MarkdownMemoryNote(
+                    path=rel_path,
+                    content=content,
+                )
+            )
+        for path in sorted(self.root.glob("*.md")):
+            if not path.is_file() or path.name in seen_paths:
                 continue
             content = path.read_text(encoding="utf-8").strip()
             if not content:

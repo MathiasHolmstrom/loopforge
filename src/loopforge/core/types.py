@@ -438,6 +438,7 @@ class RunnerAuthoringRequest:
     build_symbol: str = "build_adapter"
     attempt_number: int = 1
     previous_errors: list[str] = field(default_factory=list)
+    bootstrap_answers: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -452,6 +453,7 @@ class RunnerAuthoringRequest:
             build_symbol=payload.get("build_symbol", "build_adapter"),
             attempt_number=payload.get("attempt_number", 1),
             previous_errors=payload.get("previous_errors", []),
+            bootstrap_answers=payload.get("bootstrap_answers", {}),
         )
 
 

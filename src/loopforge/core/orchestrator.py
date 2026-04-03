@@ -7,6 +7,7 @@ from typing import Protocol
 
 from loopforge.core.backends import NarrationBackend, ReflectionBackend, ReviewBackend, WorkerBackend
 from loopforge.core.memory import FileMemoryStore
+from loopforge.core.runtime import is_generic_autonomous
 from loopforge.core.types import (
     AgentUpdate,
     CapabilityContext,
@@ -52,11 +53,7 @@ class RoutingExperimentExecutor:
         self.recovery_handler = recovery_handler
 
     def execute(self, candidate: ExperimentCandidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
-        generic_autonomous = (
-            snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
-            or snapshot.effective_spec.metadata.get("execution_backend_kind") == "generic_agentic"
-            or snapshot.effective_spec.metadata.get("execution_mode") == "autonomous_after_bootstrap"
-        )
+        generic_autonomous = is_generic_autonomous(snapshot=snapshot)
         if candidate.execution_steps and self.plan_executor is not None:
             return self.plan_executor.execute(candidate, snapshot)
         if candidate.action_type not in snapshot.effective_spec.allowed_actions:
@@ -152,7 +149,7 @@ class ExperimentOrchestrator:
         max_continuations = int(
             snapshot.effective_spec.stop_conditions.get(
                 "max_metricless_continuations",
-                8 if generic_autonomous else 5,
+                12 if generic_autonomous else 5,
             )
         )
         max_same_iteration_repairs = int(
@@ -489,11 +486,7 @@ class ExperimentOrchestrator:
 
     @staticmethod
     def _is_generic_autonomous(snapshot: MemorySnapshot) -> bool:
-        return (
-            snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
-            or snapshot.effective_spec.metadata.get("execution_backend_kind") == "generic_agentic"
-            or snapshot.effective_spec.metadata.get("execution_mode") == "autonomous_after_bootstrap"
-        )
+        return is_generic_autonomous(snapshot=snapshot)
 
     @staticmethod
     def _attach_intra_iteration_attempts(

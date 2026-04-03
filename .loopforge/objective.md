@@ -1,1 +1,0 @@
-Build a LoL player kills prediction model using spforge's player rating system with kills capped at 10 (11 ordinal classes 0-10), outputting multiclass probabilities evaluated primarily on Ranked Probability Score.

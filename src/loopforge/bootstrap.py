@@ -63,6 +63,20 @@ GENERIC_AUTONOMOUS_ACTIONS = [
     "run_experiment",
     "fix_failure",
 ]
+EXECUTION_GUIDANCE_QUESTION_KEY = "execution_strategy_hint"
+REMOTE_EXECUTION_HINT_TOKENS = (
+    "s3",
+    "dbfs",
+    "databricks",
+    "jdbc",
+    "snowflake",
+    "warehouse",
+    "catalog",
+    "spark",
+    "delta",
+    "table",
+    "bucket",
+)
 
 MODEL_PROFILES: dict[str, dict[str, str]] = {
     "all_codex": {
@@ -158,6 +172,14 @@ class ExecutionBackendResolution:
     kind: ExecutionBackendKind
     factory_path: str | None = None
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class RuntimeBinding:
+    executor_factory_path: str | None
+    handlers: dict[str, Any]
+    capability_provider: Any
+    capability_context: CapabilityContext
 
 
 def _slugify_runner_name(value: str) -> str:
@@ -309,6 +331,21 @@ def build_bootstrap_spec(objective: str) -> ExperimentSpec:
         primary_metric=PrimaryMetric(name="primary_metric", goal="maximize"),
         allowed_actions=[],
     )
+
+
+def cycle_results_to_payload(results: list[Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "record": cycle_result.record.to_dict(),
+            "accepted_summary": (
+                cycle_result.accepted_summary.to_dict()
+                if cycle_result.accepted_summary is not None
+                else None
+            ),
+            "human_update": cycle_result.human_update,
+        }
+        for cycle_result in results
+    ]
 
 
 def default_role_models(
@@ -697,6 +734,21 @@ def run_preflight_checks(
             )
         )
 
+    guidance_required = capability_context.environment_facts.get("execution_guidance_required")
+    if guidance_required:
+        checks.append(
+            PreflightCheck(
+                name="execution_strategy_unresolved",
+                status="failed",
+                detail=str(
+                    capability_context.environment_facts.get("execution_guidance_detail")
+                    or "Loopforge still needs one high-level hint about how to reach the real data or execution backend."
+                ),
+                scope="bootstrap",
+            )
+        )
+        return checks
+
     if executor_factory_path is None or capability_context.environment_facts.get("autonomous_execution_supported") is False:
         if executor_factory_path is None and capability_context.environment_facts.get("autonomous_execution_supported") is not False:
             repo_root_raw = capability_context.environment_facts.get("repo_root")
@@ -805,6 +857,128 @@ def run_preflight_checks(
             )
         )
     return checks
+
+
+def _non_local_data_assets(capability_context: CapabilityContext) -> list[str]:
+    return [
+        asset
+        for asset in capability_context.available_data_assets
+        if isinstance(asset, str) and asset.strip() and not _looks_like_local_asset_path(asset)
+    ]
+
+
+def _summarise_bootstrap_answers(answers: dict[str, Any] | None) -> str:
+    if not isinstance(answers, dict):
+        return ""
+    parts: list[str] = []
+    for key, value in answers.items():
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            rendered = ", ".join(str(item) for item in value if str(item).strip())
+        else:
+            rendered = str(value).strip()
+        if rendered:
+            parts.append(f"{key}={rendered}")
+    return "\n".join(parts)
+
+
+def _detect_execution_guidance_gap(
+    *,
+    user_goal: str,
+    capability_context: CapabilityContext,
+    answers: dict[str, Any] | None,
+) -> str | None:
+    if isinstance(answers, dict):
+        hint = answers.get(EXECUTION_GUIDANCE_QUESTION_KEY)
+        if hint not in (None, ""):
+            return None
+    answer_text = _summarise_bootstrap_answers(answers).lower()
+    if answer_text and any(token in answer_text for token in REMOTE_EXECUTION_HINT_TOKENS):
+        return None
+
+    remote_assets = _non_local_data_assets(capability_context)
+    env_blob = json.dumps(capability_context.environment_facts, sort_keys=True).lower()
+    notes_blob = " ".join(capability_context.notes).lower()
+    goal_blob = user_goal.lower()
+    matched_tokens = [
+        token
+        for token in REMOTE_EXECUTION_HINT_TOKENS
+        if token in env_blob or token in notes_blob or token in goal_blob
+    ]
+    matched_tokens = list(dict.fromkeys(matched_tokens))
+    if not remote_assets and not matched_tokens:
+        return None
+
+    evidence: list[str] = []
+    if remote_assets:
+        preview = ", ".join(remote_assets[:2])
+        if len(remote_assets) > 2:
+            preview += f", and {len(remote_assets) - 2} more"
+        evidence.append(f"non-local data assets were detected ({preview})")
+    if matched_tokens:
+        token_preview = ", ".join(matched_tokens[:4])
+        evidence.append(f"the repo/objective points at an external backend ({token_preview})")
+    joined_evidence = " and ".join(evidence)
+    return (
+        "Loopforge inferred most of the repo structure, but it cannot yet verify the real execution lane because "
+        f"{joined_evidence}. Provide one high-level hint about whether the baseline should run through local Python "
+        "code or through the remote platform the repo points at. A short directional answer is enough; exact paths "
+        "or internal module names are not required."
+    )
+
+
+def _build_execution_guidance_question(
+    *,
+    capability_context: CapabilityContext,
+    detail: str,
+) -> SpecQuestion:
+    remote_assets = _non_local_data_assets(capability_context)
+    backend_examples: list[str] = []
+    for asset in remote_assets[:2]:
+        if isinstance(asset, str) and asset.strip():
+            backend_examples.append(asset.strip())
+    if not backend_examples:
+        for token in REMOTE_EXECUTION_HINT_TOKENS:
+            haystack = " ".join(capability_context.notes).lower() + "\n" + json.dumps(
+                capability_context.environment_facts,
+                sort_keys=True,
+            ).lower()
+            if token in haystack:
+                backend_examples.append(token)
+        backend_examples = backend_examples[:2]
+    prompt = (
+        "What high-level execution direction should Loopforge use to reach the real data/runtime? "
+        "A short answer is enough, for example 'use the repo's local Python loader against S3' or "
+        "'run the baseline through Databricks'."
+    )
+    if backend_examples:
+        prompt += f" I detected: {', '.join(backend_examples)}."
+    return SpecQuestion(
+        key=EXECUTION_GUIDANCE_QUESTION_KEY,
+        prompt=prompt,
+        rationale=detail,
+        required=True,
+    )
+
+
+def _ensure_execution_guidance_question(
+    *,
+    questions: list[SpecQuestion],
+    capability_context: CapabilityContext,
+    answers: dict[str, Any] | None,
+    detail: str | None,
+) -> list[SpecQuestion]:
+    if detail is None:
+        return questions
+    if isinstance(answers, dict) and any(value not in (None, "") for value in answers.values()):
+        if any(question.required for question in questions):
+            return questions
+    if any(question.key == EXECUTION_GUIDANCE_QUESTION_KEY for question in questions):
+        return questions
+    if any(question.required for question in questions):
+        return questions
+    return [*questions, _build_execution_guidance_question(capability_context=capability_context, detail=detail)]
 
 
 def missing_requirements_from_bootstrap(
@@ -1150,6 +1324,77 @@ class Loopforge:
     def resolve_executor_factory_path(self, objective: str) -> str | None:
         return self.resolve_execution_backend(objective).factory_path
 
+    def _fallback_capability_provider(self, _effective_spec: ExperimentSpec) -> CapabilityContext:
+        return self._cached_capability_context or CapabilityContext()
+
+    def resolve_runtime_binding(
+        self,
+        *,
+        spec: ExperimentSpec,
+        objective: str,
+        executor_factory_path: str | None = None,
+    ) -> RuntimeBinding:
+        resolved_factory_path = executor_factory_path
+        if resolved_factory_path is None:
+            resolved_factory_path = self.resolve_executor_factory_path(objective)
+        if resolved_factory_path is None:
+            capability_context = self._fallback_capability_provider(spec)
+            return RuntimeBinding(
+                executor_factory_path=None,
+                handlers={},
+                capability_provider=self._fallback_capability_provider,
+                capability_context=capability_context,
+            )
+
+        adapter_result = load_factory(resolved_factory_path)(spec=spec, memory_root=self.memory_root)
+        if isinstance(adapter_result, AdapterSetup):
+            handlers = adapter_result.handlers
+            capability_provider = adapter_result.capability_provider
+        else:
+            handlers = adapter_result
+            capability_provider = None
+        capability_context = capability_provider(spec) if capability_provider is not None else CapabilityContext()
+        return RuntimeBinding(
+            executor_factory_path=resolved_factory_path,
+            handlers=handlers,
+            capability_provider=capability_provider,
+            capability_context=capability_context,
+        )
+
+    def build_orchestrator(
+        self,
+        *,
+        spec: ExperimentSpec,
+        objective: str,
+        memory_store: FileMemoryStore | None = None,
+        executor_factory_path: str | None = None,
+    ) -> tuple[ExperimentOrchestrator, RuntimeBinding]:
+        runtime = self.resolve_runtime_binding(
+            spec=spec,
+            objective=objective,
+            executor_factory_path=executor_factory_path,
+        )
+        orchestrator = ExperimentOrchestrator(
+            memory_store=memory_store or FileMemoryStore(self.memory_root),
+            worker_backend=self.worker_backend,
+            executor=RoutingExperimentExecutor(
+                handlers=runtime.handlers,
+                plan_executor=GenericExecutionPlanExecutor(
+                    repo_root=self.repo_root,
+                    fix_backend=self.execution_fix_backend,
+                    progress_fn=self.progress_fn,
+                ),
+                recovery_handler=self._make_execution_recovery_handler(),
+            ),
+            reflection_backend=self.reflection_backend,
+            review_backend=self.review_backend,
+            narrator_backend=self.narrator_backend,
+            capability_provider=runtime.capability_provider,
+            progress_fn=self.progress_fn,
+            role_models=self.role_models,
+        )
+        return orchestrator, runtime
+
     def _load_cached_authored_runner(self, objective: str) -> ExecutionBackendResolution | None:
         runner_path, manifest_path = _authored_runner_paths(self.memory_root, self.repo_root)
         if not runner_path.exists() or not manifest_path.exists():
@@ -1177,7 +1422,12 @@ class Loopforge:
         self.executor_factory_path = f"{runner_path}:build_adapter"
         return ExecutionBackendResolution(kind="supported", factory_path=self.executor_factory_path)
 
-    def _author_runner(self, user_goal: str, capability_context: CapabilityContext) -> ExecutionBackendResolution:
+    def _author_runner(
+        self,
+        user_goal: str,
+        capability_context: CapabilityContext,
+        answers: dict[str, Any] | None = None,
+    ) -> ExecutionBackendResolution:
         cached = self._load_cached_authored_runner(user_goal)
         if cached is not None:
             return cached
@@ -1197,6 +1447,7 @@ class Loopforge:
                     target_module_path=str(runner_path),
                     attempt_number=attempt_number,
                     previous_errors=list(previous_errors),
+                    bootstrap_answers=dict(answers or {}),
                 )
                 try:
                     authored = self.runner_authoring_backend.author_runner(request)
@@ -1276,7 +1527,36 @@ class Loopforge:
             )
             self._cached_capability_key = capability_key
         capability_context = self._cached_capability_context
-        if resolution.kind == "planning_only" and resolution.reason:
+        if resolution.kind == "planning_only" and self.explicit_executor_factory_path is None:
+            self.progress_fn("author_runner", "Authoring repo-specific runner from discovered context...")
+            authored_resolution = self._author_runner(
+                user_goal,
+                capability_context,
+                answers=answers,
+            )
+            if authored_resolution.kind == "supported":
+                resolution = authored_resolution
+                executor_factory_path = authored_resolution.factory_path
+                capability_context = discover_capabilities_for_objective(
+                    objective=user_goal,
+                    memory_root=self.memory_root,
+                    executor_factory_path=executor_factory_path,
+                    repo_root=self.repo_root,
+                )
+                capability_key = (str(self.repo_root.resolve()), executor_factory_path, user_goal.strip())
+                self._cached_capability_context = capability_context
+                self._cached_capability_key = capability_key
+            elif authored_resolution.reason:
+                self._cached_authoring_failure_reason = authored_resolution.reason
+                resolution = authored_resolution
+        guidance_gap_detail = None
+        if resolution.kind == "planning_only":
+            guidance_gap_detail = _detect_execution_guidance_gap(
+                user_goal=user_goal,
+                capability_context=capability_context,
+                answers=answers,
+            )
+        if resolution.kind == "planning_only" and resolution.reason and guidance_gap_detail is None:
             merged_actions = dict(capability_context.available_actions)
             for action in GENERIC_AUTONOMOUS_ACTIONS:
                 merged_actions.setdefault(action, "generic_autonomous_executor")
@@ -1294,6 +1574,22 @@ class Loopforge:
                 notes=[
                     resolution.reason,
                     "Generic autonomous execution is available after bootstrap. The worker can inspect the repo, edit files, run commands, and recover from ordinary failures without a repo-specific runner.",
+                    *capability_context.notes,
+                ],
+            )
+            self._cached_capability_context = capability_context
+        elif resolution.kind == "planning_only" and guidance_gap_detail is not None:
+            capability_context = replace(
+                capability_context,
+                environment_facts={
+                    **capability_context.environment_facts,
+                    "execution_resolution_reason": resolution.reason,
+                    "execution_guidance_required": True,
+                    "execution_guidance_detail": guidance_gap_detail,
+                    "autonomous_execution_supported": False,
+                },
+                notes=[
+                    guidance_gap_detail,
                     *capability_context.notes,
                 ],
             )
@@ -1328,7 +1624,12 @@ class Loopforge:
                         ),
                     },
                 ),
-                questions=refine_bootstrap_questions(turn.proposal.questions, answers=answers),
+                questions=_ensure_execution_guidance_question(
+                    questions=refine_bootstrap_questions(turn.proposal.questions, answers=answers),
+                    capability_context=capability_context,
+                    answers=answers,
+                    detail=guidance_gap_detail,
+                ),
             ),
         )
         # Auto-fix incomplete metrics — the agent often describes metrics in prose but
@@ -1383,8 +1684,9 @@ class Loopforge:
                     capability_context=capability_context,
                     preflight_checks=preflight_checks,
                 )
-                self.memory_root.mkdir(parents=True, exist_ok=True)
-                guide_path = self.memory_root / "ops_access_guide.md"
+                agent_markdown_dir = self.memory_root / "agent_markdown"
+                agent_markdown_dir.mkdir(parents=True, exist_ok=True)
+                guide_path = agent_markdown_dir / "ops_access_guide.md"
                 guide_path.write_text(access_guide.markdown.rstrip() + "\n", encoding="utf-8")
                 access_guide_path = str(guide_path)
             except Exception:
@@ -1404,8 +1706,9 @@ class Loopforge:
                 turn=resolved_turn,
                 preflight_checks=preflight_checks,
             )
-            self.memory_root.mkdir(parents=True, exist_ok=True)
-            runbook_path = self.memory_root / "execution_runbook.md"
+            agent_markdown_dir = self.memory_root / "agent_markdown"
+            agent_markdown_dir.mkdir(parents=True, exist_ok=True)
+            runbook_path = agent_markdown_dir / "execution_runbook.md"
             runbook_path.write_text(runbook_text, encoding="utf-8")
         except Exception:
             pass
@@ -1416,8 +1719,9 @@ class Loopforge:
                 guide_text = self.bootstrap_backend.build_experiment_guide(
                     resolved_turn, capability_context, answers,
                 )
-                self.memory_root.mkdir(parents=True, exist_ok=True)
-                guide_path = self.memory_root / "experiment_guide.md"
+                agent_markdown_dir = self.memory_root / "agent_markdown"
+                agent_markdown_dir.mkdir(parents=True, exist_ok=True)
+                guide_path = agent_markdown_dir / "experiment_guide.md"
                 guide_path.write_text(guide_text.rstrip() + "\n", encoding="utf-8")
             except Exception:
                 pass
@@ -1619,36 +1923,10 @@ class Loopforge:
             else:
                 if stored_spec.to_dict() != spec.to_dict():
                     reset_state = True
-        executor_factory_path = self.resolve_executor_factory_path(user_goal)
-        if executor_factory_path is None:
-            handlers = {}
-            capability_provider = lambda effective_spec: self._cached_capability_context or CapabilityContext()
-        else:
-            adapter_result = load_factory(executor_factory_path)(spec=spec, memory_root=self.memory_root)
-            if isinstance(adapter_result, AdapterSetup):
-                handlers = adapter_result.handlers
-                capability_provider = adapter_result.capability_provider
-            else:
-                handlers = adapter_result
-                capability_provider = None
-        orchestrator = ExperimentOrchestrator(
+        orchestrator, _runtime = self.build_orchestrator(
+            spec=spec,
+            objective=user_goal,
             memory_store=memory_store,
-            worker_backend=self.worker_backend,
-            executor=RoutingExperimentExecutor(
-                handlers=handlers,
-                plan_executor=GenericExecutionPlanExecutor(
-                    repo_root=self.repo_root,
-                    fix_backend=self.execution_fix_backend,
-                    progress_fn=self.progress_fn,
-                ),
-                recovery_handler=self._make_execution_recovery_handler(),
-            ),
-            reflection_backend=self.reflection_backend,
-            review_backend=self.review_backend,
-            narrator_backend=self.narrator_backend,
-            capability_provider=capability_provider,
-            progress_fn=self.progress_fn,
-            role_models=self.role_models,
         )
         orchestrator.initialize(spec=spec, reset_state=reset_state)
         try:
@@ -1670,18 +1948,7 @@ class Loopforge:
             return {
                 "status": "blocked",
                 "bootstrap": bootstrap_turn.to_dict(),
-                "results": [
-                    {
-                        "record": cycle_result.record.to_dict(),
-                        "accepted_summary": (
-                            cycle_result.accepted_summary.to_dict()
-                            if cycle_result.accepted_summary is not None
-                            else None
-                        ),
-                        "human_update": cycle_result.human_update,
-                    }
-                    for cycle_result in results
-                ],
+                "results": cycle_results_to_payload(results),
                 "error": {
                     "type": blocked_outcome.failure_type or "ExecutionBlocked",
                     "message": summarise_runtime_exception(
@@ -1693,16 +1960,5 @@ class Loopforge:
         return {
             "status": "started",
             "bootstrap": bootstrap_turn.to_dict(),
-            "results": [
-                {
-                    "record": cycle_result.record.to_dict(),
-                    "accepted_summary": (
-                        cycle_result.accepted_summary.to_dict()
-                        if cycle_result.accepted_summary is not None
-                        else None
-                    ),
-                    "human_update": cycle_result.human_update,
-                }
-                for cycle_result in results
-            ],
+            "results": cycle_results_to_payload(results),
         }

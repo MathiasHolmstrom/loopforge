@@ -23,6 +23,7 @@ from loopforge.core.backends import (
 )
 from loopforge.core.memory import FileMemoryStore
 from loopforge.core.orchestrator import ActionExecutor, ExperimentOrchestrator, RoutingExperimentExecutor
+from loopforge.core.runtime import is_generic_autonomous
 from loopforge.core.types import (
     AdapterSetup,
     AccessGuide,
@@ -82,6 +83,7 @@ __all__ = [
     "FileMemoryStore",
     "GenericExecutionPlanExecutor",
     "HumanIntervention",
+    "is_generic_autonomous",
     "IterationCycleResult",
     "IterationRecord",
     "IterationSummary",

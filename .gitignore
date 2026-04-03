@@ -21,3 +21,7 @@ Thumbs.db
 
 # Claude Code
 CLAUDE.md
+
+# Loopforge runtime markdown
+.loopforge/agent_markdown/
+.loopforge/*.jsonl

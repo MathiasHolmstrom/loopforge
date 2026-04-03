@@ -12,12 +12,12 @@ from loopforge.bootstrap import (
     DEFAULT_OPENAI_MODEL,
     Loopforge,
     apply_answers_to_bootstrap_turn,
+    cycle_results_to_payload,
     discover_capabilities_for_objective,
     default_role_models,
     run_preflight_checks,
 )
 from loopforge.core import (
-    AdapterSetup,
     CapabilityContext,
     ExperimentInterrupted,
     ExperimentSpec,
@@ -26,9 +26,6 @@ from loopforge.core import (
     HumanIntervention,
     LiteLLMSpecBackend,
 )
-from loopforge.bootstrap import load_factory
-
-
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run or steer the experimentation loop.")
     subparsers = parser.add_subparsers(dest="command", required=False)
@@ -684,39 +681,15 @@ def run_from_spec(
         temperature=temperature,
     )
     memory_store = FileMemoryStore(memory_root)
-    adapter_result = load_factory(executor_factory_path)(spec=spec, memory_root=Path(memory_root))
-    if isinstance(adapter_result, AdapterSetup):
-        handlers = adapter_result.handlers
-        capability_provider = adapter_result.capability_provider
-    else:
-        handlers = adapter_result
-        capability_provider = None
-    from loopforge.core import ExperimentOrchestrator, RoutingExperimentExecutor
-    from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
-
-    orchestrator = ExperimentOrchestrator(
+    orchestrator, runtime = app.build_orchestrator(
+        spec=spec,
+        objective=spec.objective,
         memory_store=memory_store,
-        worker_backend=app.worker_backend,
-        executor=RoutingExperimentExecutor(
-            handlers=handlers,
-            plan_executor=GenericExecutionPlanExecutor(
-                repo_root=app.repo_root,
-                fix_backend=app.execution_fix_backend,
-                progress_fn=app.progress_fn,
-            ),
-            recovery_handler=app._make_execution_recovery_handler(),
-        ),
-        reflection_backend=app.reflection_backend,
-        review_backend=app.review_backend,
-        narrator_backend=app.narrator_backend,
-        capability_provider=capability_provider,
-        progress_fn=app.progress_fn,
-        role_models=app.role_models,
+        executor_factory_path=executor_factory_path,
     )
-    capability_context = capability_provider(spec) if capability_provider is not None else CapabilityContext()
     preflight_checks = run_preflight_checks(
         spec=spec,
-        capability_context=capability_context,
+        capability_context=runtime.capability_context,
         memory_root=memory_root,
         executor_factory_path=executor_factory_path,
     )
@@ -724,16 +697,7 @@ def run_from_spec(
     if blocking_checks:
         raise ValueError("; ".join(blocking_checks))
     orchestrator.initialize(spec=spec, reset_state=True)
-    return [
-        {
-            "record": cycle_result.record.to_dict(),
-            "accepted_summary": (
-                cycle_result.accepted_summary.to_dict() if cycle_result.accepted_summary is not None else None
-            ),
-            "human_update": cycle_result.human_update,
-        }
-        for cycle_result in orchestrator.run(iterations=iterations)
-    ]
+    return cycle_results_to_payload(orchestrator.run(iterations=iterations))
 
 def draft_spec(
     *,
