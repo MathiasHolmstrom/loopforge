@@ -126,6 +126,19 @@ class FakeAccessAdvisorBackend:
         )
 
 
+class RaisingNarrationBackend:
+    def summarize_bootstrap(self, turn, capability_context):
+        raise RuntimeError("invalid bearer token")
+
+    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        raise RuntimeError("invalid bearer token")
+
+
+class RaisingAccessAdvisorBackend:
+    def build_access_guide(self, user_goal, capability_context, preflight_checks):
+        raise RuntimeError("invalid bearer token")
+
+
 def build_spec(**overrides) -> ExperimentSpec:
     payload = {
         "objective": "Improve pass outcome validation loss.",
@@ -221,6 +234,133 @@ def test_main_without_args_enters_interactive_mode(monkeypatch) -> None:
     monkeypatch.setattr("loopforge.cli.run_interactive_start", lambda **kwargs: 7)
 
     assert main([]) == 7
+
+
+def test_bootstrap_backend_tolerates_missing_recommended_spec_objective() -> None:
+    backend = bootstrap_module.LiteLLMBootstrapBackend(
+        model="openai/gpt-5.4",
+        completion_fn=lambda **kwargs: {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "assistant_message": "I found enough context to continue.",
+                                "proposal": {
+                                    "objective": "Improve NBA points model.",
+                                    "recommended_spec": {
+                                        "primary_metric": {"name": "mae", "goal": "minimize"},
+                                        "allowed_actions": ["baseline"],
+                                    },
+                                },
+                                "role_models": bootstrap_module.default_role_models().to_dict(),
+                                "ready_to_start": False,
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    )
+
+    turn = backend.propose_bootstrap_turn(
+        user_goal="Improve NBA points model.",
+        capability_context=CapabilityContext(),
+        role_models=bootstrap_module.default_role_models(),
+    )
+
+    assert turn.proposal.recommended_spec.objective == "Improve NBA points model."
+    assert turn.proposal.recommended_spec.allowed_actions == ["baseline"]
+
+
+def test_bootstrap_backend_tolerates_incomplete_metric_payloads() -> None:
+    backend = bootstrap_module.LiteLLMBootstrapBackend(
+        model="openai/gpt-5.4",
+        completion_fn=lambda **kwargs: {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "assistant_message": "I found enough context to continue.",
+                                "proposal": {
+                                    "recommended_spec": {
+                                        "primary_metric": {},
+                                        "secondary_metrics": [{}],
+                                        "guardrail_metrics": [{}],
+                                        "allowed_actions": [],
+                                    },
+                                },
+                                "role_models": bootstrap_module.default_role_models().to_dict(),
+                                "ready_to_start": False,
+                            }
+                        )
+                    }
+                }
+            ]
+        },
+    )
+
+    turn = backend.propose_bootstrap_turn(
+        user_goal="Improve NBA points model.",
+        capability_context=CapabilityContext(),
+        role_models=bootstrap_module.default_role_models(),
+    )
+
+    assert turn.proposal.recommended_spec.primary_metric.name == "primary_metric"
+    assert turn.proposal.recommended_spec.secondary_metrics[0].name == "secondary_metric_1"
+    assert turn.proposal.recommended_spec.guardrail_metrics[0].name == "guardrail_metric_1"
+
+
+def test_bootstrap_survives_helper_backend_failures(tmp_path, monkeypatch) -> None:
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+            return BootstrapTurn(
+                assistant_message="Bootstrap completed.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        allowed_actions=["train"],
+                    ),
+                ),
+                role_models=role_models,
+                ready_to_start=False,
+            )
+
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={},
+            discovery_provider=lambda objective: CapabilityContext(
+                available_data_assets=["fraud_training_set"],
+            ),
+            preflight_provider=lambda effective_spec, capability_context: [
+                PreflightCheck(
+                    name="warehouse_permissions",
+                    status="failed",
+                    detail="Missing SELECT on analytics.fraud_training_set.",
+                )
+            ],
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+
+    app = Loopforge(
+        executor_factory_path="fake.module:factory",
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        access_advisor_backend=RaisingAccessAdvisorBackend(),
+        narrator_backend=RaisingNarrationBackend(),
+    )
+
+    turn = app.bootstrap(user_goal="Improve fraud detection recall.")
+
+    assert turn.assistant_message == "Bootstrap completed."
+    assert turn.human_update is not None
+    assert "Bootstrap completed." in turn.human_update
+    assert "Access guide generation failed: invalid bearer token" in turn.human_update
+    assert "Narration backend failed: invalid bearer token" in turn.human_update
 
 
 def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_effective_spec(tmp_path) -> None:

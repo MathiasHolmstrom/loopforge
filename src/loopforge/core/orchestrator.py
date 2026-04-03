@@ -90,14 +90,20 @@ class ExperimentOrchestrator:
                 self.memory_store.write_best_summary(accepted_summary)
         human_update = None
         if self.narrator_backend is not None:
-            human_update = self.narrator_backend.summarize_iteration(
-                snapshot=snapshot,
-                candidate=candidate,
-                outcome=outcome,
-                reflection=reflection,
-                review=review,
-                accepted_summary=accepted_summary,
-            )
+            try:
+                human_update = self.narrator_backend.summarize_iteration(
+                    snapshot=snapshot,
+                    candidate=candidate,
+                    outcome=outcome,
+                    reflection=reflection,
+                    review=review,
+                    accepted_summary=accepted_summary,
+                )
+            except Exception as exc:
+                human_update = (
+                    f"Iteration {record.iteration_id} completed with review status {review.status}. "
+                    f"Narration backend failed: {exc}"
+                )
             self.memory_store.append_agent_update(
                 AgentUpdate(
                     stage="iteration",

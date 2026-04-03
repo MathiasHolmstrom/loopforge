@@ -260,7 +260,14 @@ class ConsultingWorkerBackend:
         consultation = None
         delegated_snapshot = snapshot
         if self.consultation_backend is not None and should_request_ops_consult(snapshot):
-            consultation = self.consultation_backend.consult(snapshot)
+            try:
+                consultation = self.consultation_backend.consult(snapshot)
+            except Exception as exc:
+                consultation = OpsConsultation(
+                    focus="ops consultation unavailable",
+                    guidance=f"Consultation backend failed: {exc}",
+                    should_consult=False,
+                )
             if consultation.should_consult:
                 delegated_snapshot = _inject_consultation(snapshot, consultation)
         candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
@@ -371,12 +378,82 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                 },
             },
         )
+        proposal_payload = self._normalise_bootstrap_proposal(payload.get("proposal"), user_goal=user_goal)
+        resolved_role_models = role_models or RoleModelConfig(
+            planner=self.model,
+            worker=self.model,
+            reflection=self.model,
+            review=self.model,
+            consultation=self.model,
+            narrator=self.model,
+        )
         return BootstrapTurn(
-            assistant_message=payload["assistant_message"],
-            proposal=ExperimentSpecProposal.from_dict(payload["proposal"]),
-            role_models=RoleModelConfig.from_dict(payload["role_models"]),
+            assistant_message=payload.get(
+                "assistant_message",
+                "I scanned the repo and prepared an initial bootstrap proposal.",
+            ),
+            proposal=ExperimentSpecProposal.from_dict(proposal_payload),
+            role_models=RoleModelConfig.from_dict(payload.get("role_models", resolved_role_models.to_dict())),
             ready_to_start=payload.get("ready_to_start", False),
         )
+
+    @staticmethod
+    def _normalise_bootstrap_proposal(
+        payload: dict[str, Any] | None,
+        *,
+        user_goal: str,
+    ) -> dict[str, Any]:
+        proposal_payload = dict(payload or {})
+        proposal_payload.setdefault("objective", user_goal)
+        recommended_spec = dict(proposal_payload.get("recommended_spec", {}))
+        recommended_spec.setdefault("objective", proposal_payload["objective"])
+        recommended_spec["primary_metric"] = LiteLLMBootstrapBackend._normalise_metric_payload(
+            recommended_spec.get("primary_metric"),
+            default_name="primary_metric",
+            default_goal="maximize",
+        )
+        recommended_spec["secondary_metrics"] = [
+            LiteLLMBootstrapBackend._normalise_metric_payload(
+                metric_payload,
+                default_name=f"secondary_metric_{index + 1}",
+                default_goal="maximize",
+            )
+            for index, metric_payload in enumerate(recommended_spec.get("secondary_metrics", []))
+        ]
+        recommended_spec["guardrail_metrics"] = [
+            LiteLLMBootstrapBackend._normalise_metric_payload(
+                metric_payload,
+                default_name=f"guardrail_metric_{index + 1}",
+                default_goal="maximize",
+            )
+            for index, metric_payload in enumerate(recommended_spec.get("guardrail_metrics", []))
+        ]
+        recommended_spec.setdefault("allowed_actions", [])
+        recommended_spec.setdefault("constraints", {})
+        recommended_spec.setdefault("search_space", {})
+        recommended_spec.setdefault("stop_conditions", {})
+        recommended_spec.setdefault("metadata", {})
+        proposal_payload["recommended_spec"] = recommended_spec
+        proposal_payload.setdefault("questions", [])
+        proposal_payload.setdefault("notes", [])
+        return proposal_payload
+
+    @staticmethod
+    def _normalise_metric_payload(
+        payload: dict[str, Any] | None,
+        *,
+        default_name: str,
+        default_goal: str,
+    ) -> dict[str, Any]:
+        metric_payload = dict(payload or {})
+        metric_payload.setdefault("name", default_name)
+        metric_payload.setdefault("goal", default_goal)
+        metric_payload.setdefault("params", {})
+        metric_payload.setdefault("aggregation", "scalar")
+        metric_payload.setdefault("slice_by", [])
+        metric_payload.setdefault("comparator", "value")
+        metric_payload.setdefault("constraints", {})
+        return metric_payload
 
 
 class LiteLLMConsultationBackend(_LiteLLMJsonBackend):

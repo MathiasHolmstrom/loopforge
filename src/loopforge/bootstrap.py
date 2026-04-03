@@ -353,19 +353,23 @@ class Loopforge:
         )
         ready_to_start = turn.ready_to_start and not missing_requirements
         access_guide_path = None
+        helper_notes: list[str] = []
         if should_prepare_access_guide(
             capability_context=capability_context,
             preflight_checks=preflight_checks,
         ):
-            access_guide = self.access_advisor_backend.build_access_guide(
-                user_goal=user_goal,
-                capability_context=capability_context,
-                preflight_checks=preflight_checks,
-            )
-            self.memory_root.mkdir(parents=True, exist_ok=True)
-            guide_path = self.memory_root / "ops_access_guide.md"
-            guide_path.write_text(access_guide.markdown.rstrip() + "\n", encoding="utf-8")
-            access_guide_path = str(guide_path)
+            try:
+                access_guide = self.access_advisor_backend.build_access_guide(
+                    user_goal=user_goal,
+                    capability_context=capability_context,
+                    preflight_checks=preflight_checks,
+                )
+                self.memory_root.mkdir(parents=True, exist_ok=True)
+                guide_path = self.memory_root / "ops_access_guide.md"
+                guide_path.write_text(access_guide.markdown.rstrip() + "\n", encoding="utf-8")
+                access_guide_path = str(guide_path)
+            except Exception as exc:
+                helper_notes.append(f"Access guide generation failed: {exc}")
         resolved_turn = replace(
             turn,
             preflight_checks=preflight_checks,
@@ -373,9 +377,15 @@ class Loopforge:
             missing_requirements=missing_requirements,
             access_guide_path=access_guide_path,
         )
-        human_update = self.narrator_backend.summarize_bootstrap(resolved_turn, capability_context)
+        try:
+            human_update = self.narrator_backend.summarize_bootstrap(resolved_turn, capability_context)
+        except Exception as exc:
+            human_update = resolved_turn.assistant_message
+            helper_notes.append(f"Narration backend failed: {exc}")
         if access_guide_path is not None:
             human_update = f"{human_update}\nAccess guide: {access_guide_path}"
+        if helper_notes:
+            human_update = "\n".join([human_update, *helper_notes]) if human_update else "\n".join(helper_notes)
         return replace(resolved_turn, human_update=human_update)
 
     def start(
