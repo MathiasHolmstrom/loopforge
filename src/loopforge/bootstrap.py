@@ -483,9 +483,21 @@ def _probe_rows_note(schema: DataAssetSchema) -> str:
     return "row count unknown"
 
 
-def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
+def _probe_data_asset(
+    asset_path: str,
+    repo_root: Path,
+    *,
+    timeout_seconds: float | None = None,
+    thread_factory=None,
+) -> DataAssetSchema:
     """Quickly inspect a single data asset. Returns schema info or a load error."""
     import threading
+
+    timeout_seconds = (
+        DATA_PROBE_TIMEOUT_SECONDS if timeout_seconds is None else timeout_seconds
+    )
+    if thread_factory is None:
+        thread_factory = threading.Thread
 
     if not _looks_like_local_asset_path(asset_path):
         return DataAssetSchema(
@@ -598,14 +610,14 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
         except Exception as exc:
             result_holder["error"] = exc
 
-    worker = threading.Thread(target=_run_probe, daemon=True)
+    worker = thread_factory(target=_run_probe, daemon=True)
     _ACTIVE_DATA_PROBES[probe_key] = worker
     worker.start()
-    worker.join(timeout=DATA_PROBE_TIMEOUT_SECONDS)
+    worker.join(timeout=timeout_seconds)
     if worker.is_alive():
         return DataAssetSchema(
             asset_path=asset_path,
-            load_error=f"Probe timed out after {DATA_PROBE_TIMEOUT_SECONDS}s",
+            load_error=f"Probe timed out after {timeout_seconds}s",
         )
     _ACTIVE_DATA_PROBES.pop(probe_key, None)
     if "error" in result_holder:

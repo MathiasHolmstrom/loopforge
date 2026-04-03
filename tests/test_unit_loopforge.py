@@ -10,6 +10,7 @@ from types import ModuleType
 import pytest
 
 import loopforge.bootstrap as bootstrap_module
+import loopforge.core.agentic_execution as agentic_execution_module
 import loopforge.pilot_adapters as pilot_adapters_module
 from loopforge import (
     AdapterSetup,
@@ -1892,8 +1893,6 @@ def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(
     tmp_path,
 ) -> None:
     store = FileMemoryStore(tmp_path / "loop")
-    repo_root = tmp_path / "repo"
-    repo_root.mkdir()
     worker = FakeWorkerBackend(
         [
             ExperimentCandidate(
@@ -1907,18 +1906,7 @@ def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(
                 action_type="fix_failure",
                 change_type="repair",
                 instructions="Create and run the minimal metric-producing script.",
-                execution_steps=[
-                    ExecutionStep(
-                        kind="write_file",
-                        path="run_metric.py",
-                        content="print('log_loss=0.21')\n",
-                    ),
-                    ExecutionStep(
-                        kind="shell",
-                        command=f'"{sys.executable}" run_metric.py',
-                        cwd=str(repo_root),
-                    ),
-                ],
+                execution_steps=[ExecutionStep(kind="shell", command="fake", cwd=".")],
             ),
         ]
     )
@@ -1928,14 +1916,27 @@ def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(
         stop_conditions={"max_iterations": 1, "max_same_iteration_repairs": 3},
         metadata={"execution_mode": "autonomous_after_bootstrap"},
     )
+    class RepairingPlanExecutor:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, candidate, snapshot):
+            self.calls += 1
+            if self.calls == 1:
+                return ExperimentOutcome(
+                    status="recoverable_failure",
+                    failure_type="MissingExecutionSteps",
+                    failure_summary="The worker proposed an agentic step without concrete execution steps.",
+                    recoverable=True,
+                )
+            return ExperimentOutcome(status="success", primary_metric_value=0.21)
+
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor(
             handlers={},
-            plan_executor=bootstrap_module.GenericExecutionPlanExecutor(
-                repo_root=repo_root
-            ),
+            plan_executor=RepairingPlanExecutor(),
         ),
         reflection_backend=FakeReflectionBackend(
             [ReflectionSummary(assessment="Recovered in-place.")]
@@ -2561,6 +2562,82 @@ def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(
     assert schema.verification_level == "verified_total_rows"
     assert schema.columns == ["kills", "playername"]
     assert schema.sample_values["kills"] == [0, 1, 2, 3, 4]
+
+
+def test_probe_data_asset_timeout_reports_timeout_without_real_sleep(
+    tmp_path, monkeypatch
+) -> None:
+    asset_path = tmp_path / "matches.csv"
+    asset_path.write_text("kills\n1\n", encoding="utf-8")
+    join_timeouts: list[float] = []
+
+    class HungThread:
+        def __init__(self, *, target, daemon) -> None:
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            join_timeouts.append(timeout)
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(bootstrap_module, "_ACTIVE_DATA_PROBES", {})
+
+    schema = bootstrap_module._probe_data_asset(
+        str(asset_path),
+        tmp_path,
+        timeout_seconds=0.01,
+        thread_factory=HungThread,
+    )
+
+    assert schema.load_error == "Probe timed out after 0.01s"
+    assert join_timeouts == [0.01]
+
+
+def test_probe_data_asset_skips_reprobe_for_same_asset_after_timeout_without_real_sleep(
+    tmp_path, monkeypatch
+) -> None:
+    asset_path = tmp_path / "matches.csv"
+    asset_path.write_text("kills\n1\n", encoding="utf-8")
+
+    class HungThread:
+        def __init__(self, *, target, daemon) -> None:
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            pass
+
+        def join(self, timeout=None) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return True
+
+    monkeypatch.setattr(bootstrap_module, "_ACTIVE_DATA_PROBES", {})
+
+    first_schema = bootstrap_module._probe_data_asset(
+        str(asset_path),
+        tmp_path,
+        timeout_seconds=0.01,
+        thread_factory=HungThread,
+    )
+    second_schema = bootstrap_module._probe_data_asset(
+        str(asset_path),
+        tmp_path,
+        timeout_seconds=0.01,
+        thread_factory=HungThread,
+    )
+
+    assert first_schema.load_error == "Probe timed out after 0.01s"
+    assert (
+        second_schema.load_error
+        == "Probe skipped because a previous timed-out probe is still running for this asset."
+    )
 
 
 def test_lol_preflight_treats_missing_installable_dependency_as_setup_step(
@@ -3525,6 +3602,7 @@ def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_av
 
 def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(
     tmp_path,
+    monkeypatch,
 ) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -3557,25 +3635,21 @@ def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(
                 ready_to_start=True,
             )
 
+    def fake_execute(self, candidate, snapshot):
+        return ExperimentOutcome(
+            status="success",
+            primary_metric_value=0.25,
+            execution_details={"step_results": [{"returncode": 0, "stdout": "ordinal_loss=0.25"}]},
+        )
+
+    monkeypatch.setattr(agentic_execution_module.GenericExecutionPlanExecutor, "execute", fake_execute)
+
     app = Loopforge(
         executor_factory_path=None,
         repo_root=repo_root,
         memory_root=tmp_path / "memory",
         bootstrap_backend=StubBootstrapBackend(),
-        worker_backend=FakeWorkerBackend(
-            [
-                build_candidate(
-                    hypothesis="Run generic baseline.",
-                    execution_steps=[
-                        ExecutionStep(
-                            kind="shell",
-                            command=f'"{sys.executable}" -c "print(\'ordinal_loss=0.25\')"',
-                            cwd=str(repo_root),
-                        )
-                    ],
-                )
-            ]
-        ),
+        worker_backend=FakeWorkerBackend([build_candidate(hypothesis="Run generic baseline.", execution_steps=[])]),
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
@@ -3596,7 +3670,7 @@ def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(
     assert not (tmp_path / "memory" / "runners").exists()
 
 
-def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) -> None:
+def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
@@ -3640,6 +3714,16 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
         model="openai/gpt-5.4",
         completion_fn=fake_completion,
     )
+
+    def fake_execute(self, candidate, snapshot):
+        return ExperimentOutcome(
+            status="success",
+            primary_metric_value=0.5,
+            execution_details={"step_results": [{"returncode": 0, "stdout": '{"metric_results":{"ordinal_loss":0.5}}'}]},
+        )
+
+    monkeypatch.setattr(agentic_execution_module.GenericExecutionPlanExecutor, "execute", fake_execute)
+
     app = Loopforge(
         executor_factory_path=None,
         repo_root=repo_root,
@@ -3652,20 +3736,7 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
                     action_type="inspect_repo",
                     change_type="inspect",
                     instructions="Run a minimal step that also reports the primary metric.",
-                    execution_steps=[
-                        ExecutionStep(
-                            kind="write_file",
-                            path="emit_metric.py",
-                            content=(
-                                'import json\nprint(json.dumps({"metric_results": {"ordinal_loss": 0.5}}))\n'
-                            ),
-                        ),
-                        ExecutionStep(
-                            kind="shell",
-                            command=f'"{sys.executable}" emit_metric.py',
-                            cwd=str(repo_root),
-                        ),
-                    ],
+                    execution_steps=[],
                 )
             ]
         ),
@@ -4069,7 +4140,7 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(
     assert any(check.name == "authored_runner_ready" for check in turn.preflight_checks)
 
 
-def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> None:
+def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path, monkeypatch) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "evaluate_pipeline.py").write_text(
@@ -4107,20 +4178,7 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
                 build_candidate(
                     hypothesis="Use the generic executor directly.",
                     instructions="Run a bounded generic command that reports the primary metric.",
-                    execution_steps=[
-                        ExecutionStep(
-                            kind="write_file",
-                            path="emit_metric.py",
-                            content=(
-                                'import json\nprint(json.dumps({"metric_results": {"primary_metric": 1.0}}))\n'
-                            ),
-                        ),
-                        ExecutionStep(
-                            kind="shell",
-                            command=f'"{sys.executable}" emit_metric.py',
-                            cwd=str(repo_root),
-                        ),
-                    ],
+                    execution_steps=[],
                 )
             ]
         ),
@@ -4132,6 +4190,12 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
         review_backend=FakeReviewBackend(
             [ReviewDecision(status="accepted", reason="ok")]
         ),
+    )
+
+    monkeypatch.setattr(
+        agentic_execution_module.GenericExecutionPlanExecutor,
+        "execute",
+        lambda self, candidate, snapshot: ExperimentOutcome(status="success", primary_metric_value=1.0),
     )
 
     result = app.start(user_goal="Improve approval precision.")
@@ -4186,6 +4250,214 @@ def test_routing_executor_recovery_handler_can_retry_after_recovery() -> None:
 
     assert outcome.primary_metric_value == 0.11
     assert attempts["count"] == 2
+
+
+def test_inline_python_command_args_parses_multiline_python_c_commands() -> None:
+    args = agentic_execution_module._inline_python_command_args(
+        (
+            f'"{sys.executable}" -c "from pathlib import Path; files=[\'pyproject.toml\'];\n'
+            "for fp in files:\n"
+            "    print(fp)\n"
+            "print('ordinal_loss=0.27')"
+            '"'
+        )
+    )
+
+    assert args is not None
+    assert args[0] == sys.executable
+    assert args[1] == "-c"
+    assert "print('ordinal_loss=0.27')" in args[2]
+    assert "\nfor fp in files:\n" in args[2]
+
+
+def test_classify_shell_failure_treats_permission_denied_as_recoverable() -> None:
+    failure_type, recoverable, recovery_actions = agentic_execution_module._classify_shell_failure(
+        "",
+        "PermissionError: [WinError 5] Access is denied",
+    )
+
+    assert failure_type == "ShellPermissionDenied"
+    assert recoverable is True
+    assert "writable repo path" in recovery_actions[0]
+
+
+def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(monkeypatch) -> None:
+    repo_root = Path(".").resolve()
+    spec = build_spec(allowed_actions=["run_experiment", "fix_failure"])
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=CapabilityContext(
+            environment_facts={"execution_shell": "cmd.exe", "shell_family": "windows_cmd"}
+        ),
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=1,
+    )
+    candidate = ExperimentCandidate(
+        hypothesis="Repair the failing command incrementally.",
+        action_type="run_experiment",
+        change_type="run",
+        instructions="Run the experiment.",
+        execution_steps=[
+            ExecutionStep(
+                kind="shell",
+                command="python missing_script.py",
+                cwd=str(repo_root),
+            )
+        ],
+    )
+
+    class RecordingFixBackend:
+        def __init__(self) -> None:
+            self.model = "anthropic/claude-opus-4-6-v1"
+
+        def fix_execution_plan(self, candidate, failed_step_index, failure_summary, step_results):
+            current_command = candidate.execution_steps[0].command
+            if current_command == "python missing_script.py":
+                return [ExecutionStep(kind="shell", command="head missing_script.py", cwd=str(repo_root))]
+            return [ExecutionStep(kind="shell", command='python -c "print(123)"', cwd=str(repo_root))]
+
+    attempts: list[str] = []
+
+    def fake_run_steps(steps, repo_root, default_timeout_seconds, max_captured_chars, progress_fn=None):
+        attempts.append(steps[0].command)
+        if len(attempts) < 3:
+            return (
+                ExperimentOutcome(
+                    status="recoverable_failure",
+                    failure_type="ShellCommandFailed",
+                    failure_summary="simulated command failure",
+                    recoverable=True,
+                    execution_details={"step_results": [{"command": steps[0].command}]},
+                ),
+                [{"command": steps[0].command}],
+            )
+        return (
+            None,
+            [{"command": steps[0].command, "returncode": 0, "stdout": "123", "stderr": ""}],
+        )
+
+    monkeypatch.setattr(agentic_execution_module, "_validate_steps_pre_execution", lambda steps, repo_root: (True, 0, ""))
+    monkeypatch.setattr(agentic_execution_module, "_run_steps", fake_run_steps)
+
+    outcome = agentic_execution_module.GenericExecutionPlanExecutor(
+        repo_root=repo_root,
+        fix_backend=RecordingFixBackend(),
+        max_retries=2,
+    ).execute(candidate, snapshot)
+
+    assert outcome.status == "success"
+    assert attempts == ["python missing_script.py", "head missing_script.py", 'python -c "print(123)"']
+
+
+def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(monkeypatch) -> None:
+    repo_root = Path(".").resolve()
+    spec = build_spec(
+        allowed_actions=["run_experiment"],
+        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+        secondary_metrics=[MetricSpec(name="accuracy", goal="maximize")],
+        guardrail_metrics=[MetricSpec(name="latency_ms", goal="minimize")],
+    )
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=CapabilityContext(),
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=1,
+    )
+    candidate = ExperimentCandidate(
+        hypothesis="Emit metrics in machine-readable form.",
+        action_type="run_experiment",
+        change_type="run",
+        instructions="Run the experiment and print metrics as JSON.",
+        execution_steps=[ExecutionStep(kind="shell", command="fake", cwd=str(repo_root))],
+    )
+
+    monkeypatch.setattr(agentic_execution_module, "_validate_steps_pre_execution", lambda steps, repo_root: (True, 0, ""))
+    monkeypatch.setattr(
+        agentic_execution_module,
+        "_run_steps",
+        lambda steps, repo_root, default_timeout_seconds, max_captured_chars, progress_fn=None: (
+            None,
+            [
+                {
+                    "index": 1,
+                    "kind": "shell",
+                    "command": "fake",
+                    "cwd": str(repo_root),
+                    "returncode": 0,
+                    "stdout": json.dumps(
+                        {
+                            "metric_results": {"ordinal_loss": 0.19, "accuracy": 0.81},
+                            "guardrail_metrics": {"latency_ms": 123.0},
+                        }
+                    ),
+                    "stderr": "",
+                }
+            ],
+        ),
+    )
+
+    outcome = agentic_execution_module.GenericExecutionPlanExecutor(repo_root=repo_root).execute(candidate, snapshot)
+
+    assert outcome.status == "success"
+    assert outcome.primary_metric_value == 0.19
+    assert outcome.metric_results["ordinal_loss"].value == 0.19
+    assert outcome.secondary_metrics["accuracy"] == 0.81
+    assert outcome.guardrail_metrics["latency_ms"] == 123.0
+    assert "Captured metric output" in outcome.notes[-1]
+
+
+def test_routing_executor_uses_plan_executor_for_execution_steps_without_running_shell() -> None:
+    class StubPlanExecutor:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def execute(self, candidate, snapshot):
+            self.calls.append(candidate.action_type)
+            return ExperimentOutcome(status="success", execution_details={"step_results": [{"returncode": 0}]})
+
+    plan_executor = StubPlanExecutor()
+    spec = build_spec(allowed_actions=["baseline"])
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=CapabilityContext(),
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=1,
+    )
+    candidate = ExperimentCandidate(
+        hypothesis="Use generic execution.",
+        action_type="baseline",
+        change_type="baseline",
+        instructions="Run bounded shell steps.",
+        execution_steps=[ExecutionStep(kind="shell", command="fake", cwd=".")],
+    )
+
+    executor = RoutingExperimentExecutor(handlers={}, plan_executor=plan_executor)
+
+    outcome = executor.execute(candidate, snapshot)
+
+    assert outcome.status == "success"
+    assert plan_executor.calls == ["baseline"]
 
 
 @pytest.mark.parametrize(
