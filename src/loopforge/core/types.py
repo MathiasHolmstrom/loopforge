@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Literal
 
 
-MetricGoal = Literal["maximize", "minimize"]
+MetricGoal = Literal["maximize", "minimize", "unspecified"]
 IterationResult = Literal["improved", "regressed", "inconclusive"]
 OutcomeStatus = Literal["success", "recoverable_failure", "blocked"]
 ReviewStatus = Literal["accepted", "rejected", "pending_human"]
@@ -69,7 +69,9 @@ class MetricSpec:
         threshold = self.min_effect_size or 0.0
         if self.goal == "maximize":
             return (candidate - incumbent) > threshold
-        return (incumbent - candidate) > threshold
+        if self.goal == "minimize":
+            return (incumbent - candidate) > threshold
+        raise ValueError(f"Unsupported metric goal: {self.goal!r}")
 
     def resolve_passed(self, result: "MetricResult | None") -> bool | None:
         if result is None:
@@ -382,9 +384,20 @@ class OpsConsultation:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "OpsConsultation":
+        focus = payload.get("focus")
+        guidance = payload.get("guidance")
+        if not isinstance(focus, str) or not focus.strip():
+            focus = str(payload.get("topic") or payload.get("problem") or "general execution help")
+        if not isinstance(guidance, str) or not guidance.strip():
+            guidance = str(
+                payload.get("advice")
+                or payload.get("recommendation")
+                or payload.get("summary")
+                or "No concrete guidance was returned."
+            )
         return cls(
-            focus=payload["focus"],
-            guidance=payload["guidance"],
+            focus=focus,
+            guidance=guidance,
             commands=payload.get("commands", []),
             required_env_vars=payload.get("required_env_vars", []),
             risks=payload.get("risks", []),

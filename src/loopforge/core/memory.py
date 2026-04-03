@@ -32,7 +32,7 @@ class FileMemoryStore:
         self._experiment_journal_path = self.root / "experiment_journal.md"
         self._artifact_index_path = self._artifacts_dir / "index.json"
 
-    def initialize(self, spec: ExperimentSpec) -> None:
+    def initialize(self, spec: ExperimentSpec, *, reset_state: bool = False) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._objective_path.write_text(spec.objective.strip() + "\n", encoding="utf-8")
@@ -46,8 +46,10 @@ class FileMemoryStore:
             (self._experiment_journal_path, ""),
             (self._artifact_index_path, "[]\n"),
         ]:
-            if not path.exists():
+            if reset_state or not path.exists():
                 path.write_text(default_contents, encoding="utf-8")
+        if reset_state:
+            self._best_result_path.unlink(missing_ok=True)
 
     def load_spec(self) -> ExperimentSpec:
         return ExperimentSpec.from_dict(json.loads(self._spec_path.read_text(encoding="utf-8")))
@@ -92,6 +94,21 @@ class FileMemoryStore:
             "lessons_learned": lessons.strip(),
             "markdown_memory": [item.to_dict() for item in self._read_markdown_memory()],
         }
+
+    def has_persisted_state(self) -> bool:
+        return any(
+            path.exists() and path.read_text(encoding="utf-8").strip()
+            for path in (
+                self._records_path,
+                self._summaries_path,
+                self._updates_path,
+                self._human_notes_path,
+                self._lessons_path,
+                self._experiment_journal_path,
+                self._artifact_index_path,
+                self._best_result_path,
+            )
+        )
 
     def append_iteration_record(self, record: IterationRecord) -> None:
         with self._records_path.open("a", encoding="utf-8") as handle:

@@ -14,6 +14,7 @@ from loopforge.bootstrap import (
     apply_answers_to_bootstrap_turn,
     discover_capabilities_for_objective,
     default_role_models,
+    run_preflight_checks,
 )
 from loopforge.core import (
     AdapterSetup,
@@ -34,6 +35,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run")
     run_parser.add_argument("--spec", required=True, help="Path to a JSON experiment spec.")
+    run_parser.add_argument("--repo-root", default=".", help="Repository root used for relative execution steps.")
     run_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory and summaries.")
     run_parser.add_argument("--executor-factory", required=True, help="Import path package.module:function_name")
     run_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
@@ -245,13 +247,17 @@ def _make_stream_fn():
 
 
 def _make_progress_fn(print_fn=print):
-    """Build a progress callback that prints stage updates to the console."""
+    """Build a progress callback that prints stage updates and detail blocks."""
     last_stage = [None]
 
     def progress(stage: str, message: str) -> None:
         if stage == last_stage[0]:
             return
         last_stage[0] = stage
+        # Detail stages contain multi-line content — print as-is
+        if stage.endswith("_detail"):
+            print_fn(message)
+            return
         print_fn(f"\n  ... {message}")
 
     return progress
@@ -333,7 +339,7 @@ def _resolve_question_answer(question, raw: str) -> str:
 
 def _is_start_intent(text: str) -> bool:
     normalized = " ".join(text.lower().split())
-    if normalized in {"y", "yes", "go", "start", "run", "proceed", "continue"}:
+    if normalized in {"y", "yes", "go", "start", "run", "proceed", "continue", "cont"}:
         return True
     start_phrases = (
         "go ahead",
@@ -387,10 +393,12 @@ def run_interactive_start(
     answers: dict[str, Any] = {}
     replan_reason = "initial"
     first_run = True
+    resume_existing_run = False
     turn = None
     planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
     narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
+        deferred_start_response: str | None = None
         # Only call the LLM when we actually need a new plan
         if replan_reason:
             planning_message = _planning_status_message(
@@ -497,6 +505,10 @@ def run_interactive_start(
                     raw = input_fn("> ").strip()
                     answers[question.key] = _resolve_question_answer(question, raw)
             turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+            # Re-show blockers if still blocked after answering
+            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            if failed_checks and not turn.ready_to_start:
+                _print_blocked_summary(turn, print_fn=print_fn)
             continue
 
         optional_questions = [q for q in turn.proposal.questions if not q.required and q.key not in answers]
@@ -508,25 +520,42 @@ def run_interactive_start(
                     print_fn(f"  {i}. {opt}")
                 print_fn("  Or press Enter to skip.")
                 raw = input_fn("Your choice: ").strip()
-                answers[question.key] = _resolve_question_answer(question, raw)
+                if turn.ready_to_start and raw and _is_start_intent(raw):
+                    deferred_start_response = raw
+                else:
+                    answers[question.key] = _resolve_question_answer(question, raw)
             else:
                 print_fn(f"\n{question.prompt}")
                 raw = input_fn("> ").strip()
-                answers[question.key] = raw
-            if answers[question.key]:
+                if turn.ready_to_start and raw and _is_start_intent(raw):
+                    deferred_start_response = raw
+                else:
+                    answers[question.key] = raw
+            if deferred_start_response is not None:
+                response = deferred_start_response
+            elif answers[question.key]:
                 turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+                # Re-show blockers if still blocked
+                failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+                if failed_checks and not turn.ready_to_start:
+                    _print_blocked_summary(turn, print_fn=print_fn)
                 continue
+            else:
+                response = ""
+        else:
+            response = ""
 
         # Show the plan summary if ready
         if turn.ready_to_start:
             _print_plan_summary(turn, print_fn=print_fn)
 
         # Always prompt the user — whether ready, blocked, or anything else
-        if turn.ready_to_start:
-            prompt_text = "Ready to start? [Y to go / or type feedback] "
-        else:
-            prompt_text = "> "
-        response = input_fn(prompt_text).strip()
+        if not response:
+            if turn.ready_to_start:
+                prompt_text = "Ready to start? [Y to go / or type feedback] "
+            else:
+                prompt_text = "> "
+            response = input_fn(prompt_text).strip()
         if not response:
             continue
         if response.lower() in ("quit", "exit"):
@@ -541,6 +570,7 @@ def run_interactive_start(
                     user_goal=user_goal,
                     iterations=iterations,
                     iteration_callback=iteration_cb,
+                    reset_state=not resume_existing_run,
                 )
             except ExperimentInterrupted as exc:
                 print_fn(f"\n--- Interrupted after {len(exc.results_so_far)} iteration(s) ---")
@@ -563,6 +593,7 @@ def run_interactive_start(
                     type_="override",
                 )
                 answers["user_feedback"] = redirect
+                resume_existing_run = True
                 replan_reason = "feedback"
                 continue
             except KeyboardInterrupt:
@@ -576,6 +607,7 @@ def run_interactive_start(
                     print_fn("Stopped.")
                     return 0
                 answers["user_feedback"] = redirect
+                resume_existing_run = True
                 replan_reason = "feedback"
                 continue
             _print_result_summary(result, print_fn=print_fn)
@@ -592,7 +624,22 @@ def run_interactive_start(
                 answers["user_feedback"] = response
                 replan_reason = "feedback"
             continue
-        # Anything else is feedback that changes the plan — re-plan
+        # Try to patch the existing plan with the feedback (no full replan)
+        self_progress = _make_progress_fn(print_fn)
+        self_progress("interpret_feedback", "Interpreting feedback...")
+        updated_turn = app.apply_feedback(turn, response)
+        if updated_turn is not None:
+            turn = updated_turn
+            if turn.human_update:
+                print_fn(f"\n{narrator_tag} {turn.human_update}")
+            # Re-show blockers or plan
+            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            if failed_checks:
+                _print_blocked_summary(turn, print_fn=print_fn)
+            elif turn.ready_to_start:
+                _print_plan_summary(turn, print_fn=print_fn)
+            continue
+        # Feedback requires full replan
         answers["user_feedback"] = response
         replan_reason = "feedback"
         continue
@@ -601,6 +648,7 @@ def run_interactive_start(
 def run_from_spec(
     *,
     spec_path: Path | str,
+    repo_root: Path | str = ".",
     memory_root: Path | str,
     executor_factory_path: str,
     worker_model: str | None,
@@ -624,6 +672,7 @@ def run_from_spec(
     )
     app = Loopforge(
         executor_factory_path=executor_factory_path,
+        repo_root=repo_root,
         memory_root=memory_root,
         model_profile=model_profile,
         planner_model=role_models.planner,
@@ -650,14 +699,31 @@ def run_from_spec(
         worker_backend=app.worker_backend,
         executor=RoutingExperimentExecutor(
             handlers=handlers,
-            plan_executor=GenericExecutionPlanExecutor(repo_root=Path(".")),
+            plan_executor=GenericExecutionPlanExecutor(
+                repo_root=app.repo_root,
+                fix_backend=app.execution_fix_backend,
+                progress_fn=app.progress_fn,
+            ),
+            recovery_handler=app._make_execution_recovery_handler(),
         ),
         reflection_backend=app.reflection_backend,
         review_backend=app.review_backend,
         narrator_backend=app.narrator_backend,
         capability_provider=capability_provider,
+        progress_fn=app.progress_fn,
+        role_models=app.role_models,
     )
-    orchestrator.initialize(spec=spec)
+    capability_context = capability_provider(spec) if capability_provider is not None else CapabilityContext()
+    preflight_checks = run_preflight_checks(
+        spec=spec,
+        capability_context=capability_context,
+        memory_root=memory_root,
+        executor_factory_path=executor_factory_path,
+    )
+    blocking_checks = [check.detail for check in preflight_checks if check.required and check.status == "failed"]
+    if blocking_checks:
+        raise ValueError("; ".join(blocking_checks))
+    orchestrator.initialize(spec=spec, reset_state=True)
     return [
         {
             "record": cycle_result.record.to_dict(),
@@ -728,19 +794,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.command is None:
         return run_interactive_start()
     if args.command == "run":
-        results = run_from_spec(
-            spec_path=args.spec,
-            memory_root=args.memory_root,
-            executor_factory_path=args.executor_factory,
-            worker_model=args.worker_model,
-            reflection_model=args.reflection_model,
-            review_model=args.review_model,
-            consultation_model=args.consultation_model,
-            narrator_model=args.narrator_model,
-            model_profile=args.model_profile,
-            iterations=args.iterations,
-            temperature=args.temperature,
-        )
+        try:
+            results = run_from_spec(
+                spec_path=args.spec,
+                repo_root=args.repo_root,
+                memory_root=args.memory_root,
+                executor_factory_path=args.executor_factory,
+                worker_model=args.worker_model,
+                reflection_model=args.reflection_model,
+                review_model=args.review_model,
+                consultation_model=args.consultation_model,
+                narrator_model=args.narrator_model,
+                model_profile=args.model_profile,
+                iterations=args.iterations,
+                temperature=args.temperature,
+            )
+        except ValueError as exc:
+            print(json.dumps({"status": "blocked", "error": str(exc)}, indent=2, sort_keys=True))
+            return 1
         print(json.dumps(results, indent=2, sort_keys=True))
         return 0
 

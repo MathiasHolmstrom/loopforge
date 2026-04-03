@@ -141,8 +141,8 @@ class ExperimentOrchestrator:
         self.progress_fn: ProgressFn = progress_fn or _noop_progress
         self.role_models = role_models
 
-    def initialize(self, spec: ExperimentSpec) -> None:
-        self.memory_store.initialize(spec=spec)
+    def initialize(self, spec: ExperimentSpec, *, reset_state: bool = False) -> None:
+        self.memory_store.initialize(spec=spec, reset_state=reset_state)
 
     def run_iteration(self) -> IterationCycleResult:
         snapshot = self._load_snapshot()
@@ -278,6 +278,16 @@ class ExperimentOrchestrator:
             if len(instr) > 300:
                 instr = instr[:300] + "..."
             lines.append(f"  Plan       : {instr}")
+        helper_consult = candidate.metadata.get("helper_consultation") or candidate.metadata.get("ops_consultation")
+        if isinstance(helper_consult, dict):
+            focus = str(helper_consult.get("focus", "")).strip()
+            guidance = str(helper_consult.get("guidance", "")).strip()
+            if focus:
+                lines.append(f"  Helper     : {focus}")
+            if guidance:
+                if len(guidance) > 220:
+                    guidance = guidance[:220] + "..."
+                lines.append(f"               {guidance}")
         if candidate.execution_steps:
             lines.append(f"  Steps      : {len(candidate.execution_steps)} execution step(s)")
             for step in candidate.execution_steps[:5]:
@@ -438,6 +448,19 @@ class ExperimentOrchestrator:
             for token in ("no module named", "file not found", "path not found", "command not found")
         )
         recovery_actions: list[str] = []
+        if (
+            "permissionerror" in lower_summary
+            and "access is denied" in lower_summary
+            and any(token in lower_summary for token in ("socketpair", "multiprocessing", "_ssock", "_csock"))
+        ):
+            recoverable = True
+            failure_type = "MultiprocessingPermissionError"
+            recovery_actions.extend(
+                [
+                    "Retry with multiprocessing disabled or worker count reduced to 1.",
+                    "Switch to a serial execution path that avoids socketpair/resource setup if available.",
+                ]
+            )
         if "no module named" in lower_summary:
             recovery_actions.append("Install or sync the missing Python dependency, then retry the iteration.")
         if "file not found" in lower_summary or "path not found" in lower_summary:

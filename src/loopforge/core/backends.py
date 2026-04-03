@@ -22,8 +22,10 @@ from loopforge.core.types import (
     RunnerAuthoringRequest,
     RunnerAuthoringResult,
     ReviewDecision,
+    ProgressFn,
     SpecQuestion,
     StreamFn,
+    _noop_progress,
 )
 
 
@@ -52,7 +54,13 @@ DATA_SCIENCE_METRICS_REASONING = (
     "join from another table, or compute it as a transformation. "
     "State your plan clearly. Only ask the user when you genuinely can't figure out the path to the data.\n"
     "\n"
-    "4. DON'T ASK WHAT YOU CAN DERIVE: "
+    "4. METRIC GOAL DIRECTION: For every metric you propose, you MUST explicitly set goal to 'minimize' or 'maximize'. "
+    "Reason from what the metric actually measures: if a perfect prediction yields 0 and worse predictions yield "
+    "higher values, that is minimize. If a perfect prediction yields 1.0 and worse predictions yield lower, "
+    "that is maximize. Never leave goal unspecified or assume a default — there is no safe default. "
+    "Think about the metric's semantics, not just its name.\n"
+    "\n"
+    "5. DON'T ASK WHAT YOU CAN DERIVE: "
     "If the objective implies the metric, use it. "
     "If the complement subset is obvious, make it a guardrail. "
     "If a column can be derived from existing data, propose the derivation. "
@@ -282,9 +290,13 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
         forced_next_action is None
         and latest_record is not None
         and latest_record.outcome.status == "recoverable_failure"
-        and latest_record.candidate.action_type in allowed_actions
     ):
-        recommended_next_action = latest_record.candidate.action_type
+        if generic_autonomous and "fix_failure" in allowed_actions:
+            recommended_next_action = "fix_failure"
+        elif latest_record.candidate.action_type in allowed_actions:
+            recommended_next_action = latest_record.candidate.action_type
+        else:
+            recommended_next_action = forced_next_action or (allowed_actions[0] if allowed_actions else "explore")
     else:
         recommended_next_action = forced_next_action or (allowed_actions[0] if allowed_actions else "explore")
     return {
@@ -326,6 +338,8 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "If you propose a change action, explain which observation or result justifies it and keep the modification narrow. "
                 "When the execution mode is generic autonomous, treat action_type as a lightweight label only. The real work should be expressed in bounded execution_steps. "
                 "In generic autonomous mode, prefer execution_steps whenever the next step requires inspection, dependency installation, code edits, test runs, or retries. "
+                "When recovering from a prior failure, your first step must directly address the specific failure_summary and recovery_actions from the latest record. "
+                "Do not repeat the same failing command unchanged. If you want to run a new repo-local script, create it in an earlier write_file step first. "
                 "When useful, include bounded execution_steps with concrete shell commands or safe repo file writes the runtime can run directly. "
                 "Return one bounded next experiment.\n\n"
                 + DATA_SCIENCE_METRICS_REASONING
@@ -362,21 +376,20 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         iteration_policy: dict[str, Any],
     ) -> dict[str, Any]:
         candidate_payload = dict(payload or {})
-        allowed_actions = list(snapshot.effective_spec.allowed_actions)
-        default_action = iteration_policy["recommended_next_action"]
         generic_autonomous = bool(iteration_policy.get("generic_autonomous"))
+        # Structural: ensure required string fields exist (visible if agent failed to specify)
         action_type = candidate_payload.get("action_type")
         if not isinstance(action_type, str) or not action_type.strip():
-            candidate_payload["action_type"] = default_action
+            candidate_payload["action_type"] = "unspecified"
         change_type = candidate_payload.get("change_type")
         if not isinstance(change_type, str) or not change_type.strip():
             candidate_payload["change_type"] = candidate_payload["action_type"]
         instructions = candidate_payload.get("instructions")
         if not isinstance(instructions, str) or not instructions.strip():
-            candidate_payload["instructions"] = f"Run the {candidate_payload['action_type']} step."
+            candidate_payload["instructions"] = "[agent did not specify]"
         hypothesis = candidate_payload.get("hypothesis")
         if not isinstance(hypothesis, str) or not hypothesis.strip():
-            candidate_payload["hypothesis"] = f"Try {candidate_payload['action_type']} next."
+            candidate_payload["hypothesis"] = "[agent did not specify]"
         config_patch = candidate_payload.get("config_patch")
         if not isinstance(config_patch, dict):
             candidate_payload["config_patch"] = {}
@@ -424,14 +437,60 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         metadata = candidate_payload.get("metadata")
         if not isinstance(metadata, dict):
             candidate_payload["metadata"] = {}
-        if generic_autonomous and candidate_payload["execution_steps"] and not candidate_payload["action_type"].strip():
-            candidate_payload["action_type"] = default_action
-        if candidate_payload["action_type"] not in allowed_actions and allowed_actions and not (
-            generic_autonomous and candidate_payload["execution_steps"]
-        ):
-            candidate_payload["action_type"] = default_action
-            candidate_payload["change_type"] = default_action
+        # Don't silently replace action_type — let the executor validate and raise if invalid.
+        # The agent's choice should be visible, even if wrong.
         return candidate_payload
+
+
+class ExecutionFixBackend(Protocol):
+    def fix_execution_plan(
+        self,
+        candidate: ExperimentCandidate,
+        failed_step_index: int,
+        failure_summary: str,
+        step_results: list[dict[str, Any]],
+    ) -> list[ExecutionStep]: ...
+
+
+class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
+    def fix_execution_plan(
+        self,
+        candidate: ExperimentCandidate,
+        failed_step_index: int,
+        failure_summary: str,
+        step_results: list[dict[str, Any]],
+    ) -> list[ExecutionStep]:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are fixing a failed execution plan. A previous attempt to run the execution steps failed. "
+                "You are given the original hypothesis and instructions, the steps that were attempted, "
+                "which step failed and why. Return a revised list of execution_steps that fixes the problem. "
+                "Common fixes: create missing scripts with write_file before running them, install missing "
+                "dependencies, fix import paths, adjust commands for the platform. "
+                "Do NOT change the hypothesis or objective — only fix the execution steps. "
+                "Return JSON with a single field: execution_steps (array of step objects)."
+            ),
+            payload={
+                "hypothesis": candidate.hypothesis,
+                "instructions": candidate.instructions,
+                "original_steps": [step.to_dict() for step in candidate.execution_steps],
+                "failed_step_index": failed_step_index,
+                "failure_summary": failure_summary,
+                "step_results_so_far": step_results,
+            },
+        )
+        raw_steps = payload.get("execution_steps", [])
+        if not isinstance(raw_steps, list):
+            return []
+        steps = []
+        for item in raw_steps:
+            if not isinstance(item, dict):
+                continue
+            try:
+                steps.append(ExecutionStep.from_dict(item))
+            except Exception:
+                continue
+        return steps
 
 
 CONSULTATION_TRIGGER_TOKENS = (
@@ -474,11 +533,20 @@ def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
         " ".join(item.content for item in snapshot.markdown_memory),
     ]
     haystack = " ".join(part.lower() for part in search_space if part)
-    return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
+    if any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS):
+        return True
+    recent_failures = [record for record in snapshot.recent_records if record.outcome.status == "recoverable_failure"]
+    if not recent_failures:
+        return False
+    if snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic":
+        return True
+    return len(recent_failures) >= 2
 
 
 def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation) -> MemorySnapshot:
     updated_notes = list(snapshot.capability_context.notes)
+    updated_notes.append(f"Helper consult focus: {consultation.focus}")
+    updated_notes.append(f"Helper consult guidance: {consultation.guidance}")
     updated_notes.append(f"Ops consult focus: {consultation.focus}")
     updated_notes.append(f"Ops consult guidance: {consultation.guidance}")
     if consultation.commands:
@@ -489,6 +557,7 @@ def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation
         updated_notes.append("Operational risks: " + "; ".join(consultation.risks))
     updated_environment_facts = dict(snapshot.capability_context.environment_facts)
     updated_environment_facts["ops_consultation"] = consultation.to_dict()
+    updated_environment_facts["helper_consultation"] = consultation.to_dict()
     updated_context = replace(
         snapshot.capability_context,
         notes=updated_notes,
@@ -502,14 +571,19 @@ class ConsultingWorkerBackend:
         self,
         worker_backend: WorkerBackend,
         consultation_backend: ConsultationBackend | None = None,
+        progress_fn: ProgressFn | None = None,
+        helper_label: str = "helper",
     ) -> None:
         self.worker_backend = worker_backend
         self.consultation_backend = consultation_backend
+        self.progress_fn: ProgressFn = progress_fn or _noop_progress
+        self.helper_label = helper_label
 
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
         consultation = None
         delegated_snapshot = snapshot
         if self.consultation_backend is not None and should_request_ops_consult(snapshot):
+            self.progress_fn("helper_consult", f"[{self.helper_label}] Codex is asking helper agent for advice...")
             try:
                 consultation = self.consultation_backend.consult(snapshot)
             except Exception as exc:
@@ -518,6 +592,7 @@ class ConsultingWorkerBackend:
                     guidance=f"Consultation backend failed: {exc}",
                     should_consult=False,
                 )
+            self.progress_fn("helper_consult_detail", self._format_consultation(consultation))
             if consultation.should_consult:
                 delegated_snapshot = _inject_consultation(snapshot, consultation)
         candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
@@ -525,7 +600,22 @@ class ConsultingWorkerBackend:
             return candidate
         merged_metadata = dict(candidate.metadata)
         merged_metadata["ops_consultation"] = consultation.to_dict()
+        merged_metadata["helper_consultation"] = consultation.to_dict()
         return replace(candidate, metadata=merged_metadata)
+
+    @staticmethod
+    def _format_consultation(consultation: OpsConsultation) -> str:
+        lines = [
+            f"  Focus      : {consultation.focus}",
+            f"  Guidance   : {consultation.guidance}",
+        ]
+        if consultation.commands:
+            lines.append(f"  Commands   : {' ; '.join(consultation.commands[:3])}")
+        if consultation.required_env_vars:
+            lines.append(f"  Env        : {', '.join(consultation.required_env_vars[:5])}")
+        if consultation.risks:
+            lines.append(f"  Risks      : {' ; '.join(consultation.risks[:3])}")
+        return "\n".join(lines)
 
 
 class LiteLLMSpecBackend(_LiteLLMJsonBackend):
@@ -620,6 +710,13 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "recommended_spec",
                         "questions",
                         "notes",
+                    ],
+                    "CRITICAL_recommended_spec_rules": [
+                        "The recommended_spec JSON is what drives execution. Describing metrics in assistant_message "
+                        "is NOT enough — you MUST populate the actual JSON fields.",
+                        "primary_metric MUST have 'name' (string, the actual metric/scorer name) and 'goal' ('minimize' or 'maximize').",
+                        "guardrail_metrics MUST be an array of metric objects, each with 'name' and 'goal'.",
+                        "DO NOT leave primary_metric as an empty object — fill in the name and goal you decided on.",
                     ],
                     "question_fields": [
                         "key",
@@ -753,33 +850,23 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         recommended_spec = dict(raw_recommended_spec) if isinstance(raw_recommended_spec, Mapping) else {}
         if not isinstance(recommended_spec.get("objective"), str) or not recommended_spec.get("objective", "").strip():
             recommended_spec["objective"] = proposal_payload["objective"]
+        # Normalise metrics — structural only, never inject domain decisions
         recommended_spec["primary_metric"] = LiteLLMBootstrapBackend._normalise_metric_payload(
             recommended_spec.get("primary_metric"),
-            default_name="primary_metric",
-            default_goal="maximize",
         )
         recommended_spec["secondary_metrics"] = [
-            LiteLLMBootstrapBackend._normalise_metric_payload(
-                metric_payload,
-                default_name=f"secondary_metric_{index + 1}",
-                default_goal="maximize",
-            )
-            for index, metric_payload in enumerate(recommended_spec.get("secondary_metrics", []))
+            LiteLLMBootstrapBackend._normalise_metric_payload(metric_payload)
+            for metric_payload in recommended_spec.get("secondary_metrics", [])
         ]
         recommended_spec["guardrail_metrics"] = [
-            LiteLLMBootstrapBackend._normalise_metric_payload(
-                metric_payload,
-                default_name=f"guardrail_metric_{index + 1}",
-                default_goal="maximize",
-            )
-            for index, metric_payload in enumerate(recommended_spec.get("guardrail_metrics", []))
+            LiteLLMBootstrapBackend._normalise_metric_payload(metric_payload)
+            for metric_payload in recommended_spec.get("guardrail_metrics", [])
         ]
+        # Normalise allowed_actions — keep what the agent proposed
         allowed_actions = recommended_spec.get("allowed_actions", [])
         if not isinstance(allowed_actions, list):
             allowed_actions = [str(allowed_actions)] if allowed_actions else []
         normalized_actions = [str(action) for action in allowed_actions if str(action).strip()]
-        if not normalized_actions:
-            normalized_actions = list(capability_context.available_actions.keys())
         if capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic":
             generic_actions = capability_context.environment_facts.get("generic_autonomous_actions", [])
             if isinstance(generic_actions, list):
@@ -789,13 +876,14 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                         merged_actions.append(action)
                 normalized_actions = merged_actions
         recommended_spec["allowed_actions"] = normalized_actions
+        # Structural defaults — empty containers and infrastructure safety limits
         recommended_spec.setdefault("constraints", {})
         recommended_spec.setdefault("search_space", {})
         recommended_spec.setdefault("stop_conditions", {})
+        # Infrastructure safety limits (not domain decisions)
         recommended_spec["stop_conditions"].setdefault("max_iterations", 30)
         recommended_spec["stop_conditions"].setdefault("max_autonomous_hours", 6)
         recommended_spec.setdefault("metadata", {})
-        recommended_spec["metadata"].setdefault("execution_mode", "autonomous_after_bootstrap")
         recommended_spec = LiteLLMBootstrapBackend._apply_capability_metric_defaults(
             recommended_spec,
             capability_context=capability_context,
@@ -809,21 +897,17 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         return proposal_payload
 
     @staticmethod
-    def _normalise_metric_payload(
-        payload: dict[str, Any] | str | None,
-        *,
-        default_name: str,
-        default_goal: str,
-    ) -> dict[str, Any]:
+    def _normalise_metric_payload(payload: dict[str, Any] | str | None) -> dict[str, Any]:
+        """Ensure structurally required fields exist so the dataclass won't crash."""
         if isinstance(payload, str):
             payload = {"name": payload}
         metric_payload = dict(payload or {})
-        metric_payload.setdefault("name", default_name)
-        metric_payload.setdefault("goal", default_goal)
+        # name and goal are required by MetricSpec — use visible sentinels if agent omitted them
+        metric_payload.setdefault("name", "[unspecified]")
+        metric_payload.setdefault("goal", "unspecified")
+        # Structural defaults — empty containers
         metric_payload.setdefault("params", {})
-        metric_payload.setdefault("aggregation", "scalar")
         metric_payload.setdefault("slice_by", [])
-        metric_payload.setdefault("comparator", "value")
         metric_payload.setdefault("constraints", {})
         return metric_payload
 
@@ -833,42 +917,18 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         *,
         capability_context: CapabilityContext,
     ) -> dict[str, Any]:
+        """Enrich agent-proposed metrics with repo metadata (scorer_ref). Never override agent decisions."""
         metric_catalog = capability_context.available_metrics
         primary_metric = dict(recommended_spec["primary_metric"])
         metric_name = primary_metric.get("name", "primary_metric")
-        if metric_name == "primary_metric":
-            # LLM returned placeholder — find the repo's primary metric
-            for name, metadata in metric_catalog.items():
-                if metadata.get("preferred_role") == "primary":
-                    primary_metric["name"] = name
-                    primary_metric["goal"] = metadata.get("goal", primary_metric.get("goal", "maximize"))
-                    primary_metric["scorer_ref"] = metadata.get("scorer_ref")
-                    break
-        elif metric_name in metric_catalog:
-            # LLM named a real metric — trust the repo's metadata for goal/scorer
+        if metric_name in metric_catalog:
+            # Agent named a real metric — enrich with repo's scorer_ref if agent didn't specify
             repo_meta = metric_catalog[metric_name]
-            if "goal" in repo_meta:
-                primary_metric["goal"] = repo_meta["goal"]
             if "scorer_ref" in repo_meta:
                 primary_metric.setdefault("scorer_ref", repo_meta["scorer_ref"])
         recommended_spec["primary_metric"] = primary_metric
-        if not recommended_spec.get("guardrail_metrics"):
-            inferred_guardrails = []
-            for name, metadata in metric_catalog.items():
-                if metadata.get("preferred_role") != "guardrail":
-                    continue
-                inferred_guardrails.append(
-                    LiteLLMBootstrapBackend._normalise_metric_payload(
-                        {
-                            "name": name,
-                            "goal": metadata.get("goal", "maximize"),
-                            "scorer_ref": metadata.get("scorer_ref"),
-                        },
-                        default_name=name,
-                        default_goal=metadata.get("goal", "maximize"),
-                    )
-                )
-            recommended_spec["guardrail_metrics"] = inferred_guardrails
+        # Don't auto-inject guardrails — the agent already has the full metric catalog
+        # in the capability context and can propose guardrails if it decides they're needed.
         return recommended_spec
 
 
@@ -886,37 +946,55 @@ LiteLLMBootstrapBackend._apply_capability_metric_defaults = staticmethod(
 
 class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
     def consult(self, snapshot: MemorySnapshot) -> OpsConsultation:
-        payload = self._complete_json(
-            system_prompt=(
-                "You are a specialist operations consult agent. "
-                "Help the primary coding agent with external services, CLI workflows, environment variables, "
-                "deployment steps, data access setup, and authentication issues. "
-                "Give concise, concrete guidance without taking ownership of the main task."
-            ),
-            payload={
-                "effective_spec": snapshot.effective_spec.to_dict(),
-                "capability_context": snapshot.capability_context.to_dict(),
-                "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
-                "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
-                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
-                "instructions": {
-                    "return_fields": [
-                        "focus",
-                        "guidance",
-                        "commands",
-                        "required_env_vars",
-                        "risks",
-                        "should_consult",
-                    ],
-                    "behavior": [
-                        "Prioritize exact operational steps.",
-                        "Call out missing credentials, env vars, or permissions explicitly.",
-                        "Prefer bounded commands over long prose.",
-                    ],
+        try:
+            payload = self._complete_json(
+                system_prompt=(
+                    "You are a specialist operations consult agent. "
+                    "Help the primary coding agent with external services, CLI workflows, environment variables, "
+                    "deployment steps, data access setup, and authentication issues. "
+                    "Give concise, concrete guidance without taking ownership of the main task."
+                ),
+                payload={
+                    "effective_spec": snapshot.effective_spec.to_dict(),
+                    "capability_context": snapshot.capability_context.to_dict(),
+                    "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
+                    "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
+                    "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                    "instructions": {
+                        "return_fields": [
+                            "focus",
+                            "guidance",
+                            "commands",
+                            "required_env_vars",
+                            "risks",
+                            "should_consult",
+                        ],
+                        "behavior": [
+                            "Prioritize exact operational steps.",
+                            "Call out missing credentials, env vars, or permissions explicitly.",
+                            "Prefer bounded commands over long prose.",
+                        ],
+                    },
                 },
-            },
-        )
-        return OpsConsultation.from_dict(payload)
+            )
+        except Exception as exc:
+            return OpsConsultation(
+                focus="helper consultation unavailable",
+                guidance=f"Consultation backend failed: {exc}",
+                should_consult=False,
+            )
+        if isinstance(payload, Mapping):
+            nested_payload = payload.get("consultation")
+            if isinstance(nested_payload, Mapping):
+                payload = dict(nested_payload)
+        try:
+            return OpsConsultation.from_dict(dict(payload) if isinstance(payload, Mapping) else {})
+        except Exception as exc:
+            return OpsConsultation(
+                focus="helper consultation unavailable",
+                guidance=f"Consultation response could not be parsed: {exc}",
+                should_consult=False,
+            )
 
 
 class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
@@ -985,7 +1063,7 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
             },
         )
         if not isinstance(payload.get("assessment"), str) or not payload.get("assessment", "").strip():
-            payload["assessment"] = "The run completed; treat the result as provisional until reviewed."
+            payload["assessment"] = "[fallback] Reflection agent did not provide an assessment."
         return ReflectionSummary(
             assessment=payload["assessment"],
             lessons=payload.get("lessons", []),
@@ -1023,9 +1101,9 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
             },
         )
         if payload.get("status") not in {"accepted", "rejected", "pending_human"}:
-            payload["status"] = "accepted"
+            payload["status"] = "pending_human"
         if not isinstance(payload.get("reason"), str) or not payload.get("reason", "").strip():
-            payload["reason"] = "Accepted by fallback because the review response was incomplete."
+            payload["reason"] = "[fallback] Review agent returned incomplete response; escalating to human."
         return ReviewDecision(
             status=payload["status"],
             reason=payload["reason"],
@@ -1084,6 +1162,60 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                 "Don't repeat the full plan — just answer what they asked."
             ),
             user_message=f"Current context:\n{context}\n\nUser question: {question}",
+        )
+
+    def interpret_feedback(
+        self,
+        turn: BootstrapTurn,
+        feedback: str,
+        capability_context: CapabilityContext,
+    ) -> dict[str, Any]:
+        """Interpret user feedback and return spec updates or signal full replan."""
+        return self._complete_json(
+            system_prompt=(
+                "You are interpreting user feedback on an experiment plan. "
+                "The plan may have blockers. The user's feedback may resolve a blocker, adjust the spec, "
+                "or fundamentally change the objective. "
+                "If the feedback can be applied as a patch to the existing spec, return "
+                '{"action": "patch", "spec_updates": {...}, "message": "what you changed"}. '
+                "spec_updates should contain only the fields to change, using the same structure as the spec. "
+                "For example, to fix the primary metric: "
+                '{"action": "patch", "spec_updates": {"primary_metric": {"name": "ordinal_loss", "goal": "minimize"}}, '
+                '"message": "Set primary metric to ordinal_loss (minimize)."}. '
+                "If the feedback fundamentally changes the objective or requires re-analyzing the repo, return "
+                '{"action": "replan", "message": "why a full replan is needed"}. '
+                "Prefer patching over replanning. Most feedback is a small adjustment."
+            ),
+            payload={
+                "current_spec": turn.proposal.recommended_spec.to_dict(),
+                "blockers": [c.to_dict() for c in turn.preflight_checks if c.status == "failed"],
+                "missing_requirements": turn.missing_requirements,
+                "user_feedback": feedback,
+                "capability_context": capability_context.to_dict(),
+            },
+        )
+
+    def fix_incomplete_metrics(
+        self,
+        current_spec: dict[str, Any],
+        assistant_message: str,
+    ) -> dict[str, Any]:
+        """Ask the agent to fix incomplete metrics by extracting info from its own prose."""
+        return self._complete_json(
+            system_prompt=(
+                "You are fixing an experiment spec where the metric fields were left incomplete. "
+                "The agent already described the metrics in its message but forgot to fill them into the JSON. "
+                "Extract the metric names and goals from the assistant_message and return the corrected spec fields. "
+                "Return JSON with: primary_metric (object with name and goal), "
+                "guardrail_metrics (array of objects with name and goal), "
+                "secondary_metrics (array of objects with name and goal). "
+                "For goal: 'minimize' means lower is better (losses, errors), 'maximize' means higher is better (scores, accuracies). "
+                "Only include metrics the agent actually described."
+            ),
+            payload={
+                "current_spec": current_spec,
+                "assistant_message": assistant_message,
+            },
         )
 
     def summarize_iteration(

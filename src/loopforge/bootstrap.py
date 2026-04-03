@@ -20,6 +20,7 @@ from loopforge.core import (
     ConsultingWorkerBackend,
     DataAssetSchema,
     ExperimentCandidate,
+    ExperimentInterrupted,
     ExperimentOrchestrator,
     ExperimentOutcome,
     ExperimentSpec,
@@ -30,6 +31,7 @@ from loopforge.core import (
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
+    LiteLLMExecutionFixBackend,
     LiteLLMReviewBackend,
     LiteLLMWorkerBackend,
     PreflightCheck,
@@ -355,6 +357,7 @@ DATA_PROBE_TIMEOUT_SECONDS = 5
 DATA_PROBE_MAX_FILE_MB = 50
 DATA_PROBE_SAMPLE_ROWS = 5
 LOCAL_PROBEABLE_SUFFIXES = {".csv", ".parquet", ".json", ".jsonl", ".xlsx", ".xls"}
+_ACTIVE_DATA_PROBES: dict[str, Any] = {}
 
 
 def _normalise_probe_value(value: Any) -> Any:
@@ -411,7 +414,7 @@ def _probe_rows_note(schema: DataAssetSchema) -> str:
 
 def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
     """Quickly inspect a single data asset. Returns schema info or a load error."""
-    import concurrent.futures
+    import threading
 
     if not _looks_like_local_asset_path(asset_path):
         return DataAssetSchema(
@@ -423,6 +426,14 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
     resolved = Path(asset_path)
     if not resolved.is_absolute():
         resolved = repo_root / resolved
+    probe_key = str(resolved.resolve())
+    active_probe = _ACTIVE_DATA_PROBES.get(probe_key)
+    if active_probe is not None and active_probe.is_alive():
+        return DataAssetSchema(
+            asset_path=asset_path,
+            load_error="Probe skipped because a previous timed-out probe is still running for this asset.",
+        )
+    _ACTIVE_DATA_PROBES.pop(probe_key, None)
 
     def _do_probe() -> DataAssetSchema:
         if not resolved.exists():
@@ -500,24 +511,51 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
             sample_values=sample_values,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+    result_holder: dict[str, DataAssetSchema | Exception] = {}
+
+    def _run_probe() -> None:
         try:
-            future = pool.submit(_do_probe)
-            return future.result(timeout=DATA_PROBE_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError:
-            return DataAssetSchema(
-                asset_path=asset_path,
-                load_error=f"Probe timed out after {DATA_PROBE_TIMEOUT_SECONDS}s",
-            )
+            result_holder["result"] = _do_probe()
         except Exception as exc:
-            return DataAssetSchema(asset_path=asset_path, load_error=f"Probe error: {exc}")
+            result_holder["error"] = exc
+
+    worker = threading.Thread(target=_run_probe, daemon=True)
+    _ACTIVE_DATA_PROBES[probe_key] = worker
+    worker.start()
+    worker.join(timeout=DATA_PROBE_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        return DataAssetSchema(
+            asset_path=asset_path,
+            load_error=f"Probe timed out after {DATA_PROBE_TIMEOUT_SECONDS}s",
+        )
+    _ACTIVE_DATA_PROBES.pop(probe_key, None)
+    if "error" in result_holder:
+        return DataAssetSchema(asset_path=asset_path, load_error=f"Probe error: {result_holder['error']}")
+    return result_holder.get("result") or DataAssetSchema(
+        asset_path=asset_path,
+        load_error="Probe failed without returning a schema result.",
+    )
 
 
 def probe_data_assets(capability_context: CapabilityContext, repo_root: Path) -> CapabilityContext:
     """Run a quick schema probe on all discovered data assets. Non-blocking with hard timeout."""
     if not capability_context.available_data_assets:
         return capability_context
-    schemas = [_probe_data_asset(asset, repo_root) for asset in capability_context.available_data_assets]
+    schemas: list[DataAssetSchema] = []
+    stop_after_timeout = False
+    for asset in capability_context.available_data_assets:
+        if stop_after_timeout:
+            schemas.append(
+                DataAssetSchema(
+                    asset_path=asset,
+                    load_error="Probe skipped because a previous asset probe timed out in this scan.",
+                )
+            )
+            continue
+        schema = _probe_data_asset(asset, repo_root)
+        schemas.append(schema)
+        if schema.load_error and "timed out" in schema.load_error.lower():
+            stop_after_timeout = True
     notes = list(capability_context.notes)
     for schema in schemas:
         if schema.load_error:
@@ -581,6 +619,25 @@ def run_preflight_checks(
 ) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     memory_root_path = Path(memory_root)
+
+    invalid_metric_goals = [
+        metric.name
+        for metric in [spec.primary_metric, *spec.secondary_metrics, *spec.guardrail_metrics]
+        if metric.goal not in {"maximize", "minimize"}
+    ]
+    if invalid_metric_goals:
+        checks.append(
+            PreflightCheck(
+                name="metric_goal_unspecified",
+                status="failed",
+                detail=(
+                    "Every metric must explicitly set goal to 'maximize' or 'minimize'. "
+                    f"Invalid goal on: {', '.join(invalid_metric_goals)}"
+                ),
+                scope="bootstrap",
+            )
+        )
+
     try:
         memory_root_path.mkdir(parents=True, exist_ok=True)
         probe_path = memory_root_path / ".loopforge-write-check"
@@ -751,66 +808,14 @@ def sanitise_bootstrap_questions(questions: list[SpecQuestion]) -> list[SpecQues
     return [question for question in questions if not _is_internal_bootstrap_question(question)]
 
 
-ESSENTIAL_BOOTSTRAP_QUESTION_TOKENS = (
-    "metric",
-    "scorer",
-    "guardrail",
-    "primary",
-    "secondary",
-    "probab",
-    "precision",
-    "recall",
-    "mae",
-    "rmse",
-    "log loss",
-    "ordinal",
-    "calibration",
-    "threshold",
-    "objective",
-    "target",
-)
-
-
-def _is_essential_bootstrap_question(question: SpecQuestion) -> bool:
-    joined = " ".join(
-        part
-        for part in (
-            question.key,
-            question.prompt,
-            question.rationale or "",
-            " ".join(str(o) for o in (question.options or [])),
-            question.suggested_answer or "",
-        )
-        if part
-    ).lower()
-    return any(token in joined for token in ESSENTIAL_BOOTSTRAP_QUESTION_TOKENS)
-
 
 def refine_bootstrap_questions(
     questions: list[SpecQuestion],
     *,
     answers: dict[str, Any] | None,
 ) -> list[SpecQuestion]:
-    sanitized = sanitise_bootstrap_questions(questions)
-    essential_required = [question for question in sanitized if question.required and _is_essential_bootstrap_question(question)]
-    optional_questions = [question for question in sanitized if not question.required]
-    refined: list[SpecQuestion] = []
-    if essential_required:
-        refined.append(essential_required[0])
-    existing_keys = {question.key for question in refined + optional_questions}
-    if "user_extra_context" not in existing_keys and "user_extra_context" not in (answers or {}):
-        optional_questions.append(
-            SpecQuestion(
-                key="user_extra_context",
-                prompt=(
-                    "Any extra modelling context, constraints, or ideas the agent should consider before it proceeds autonomously? "
-                    "Leave blank to skip."
-                ),
-                required=False,
-            )
-        )
-    refined.extend(optional_questions)
-    return refined
+    """Remove internal implementation questions but keep all domain questions the agent proposed."""
+    return sanitise_bootstrap_questions(questions)
 
 
 def should_prepare_access_guide(
@@ -827,77 +832,6 @@ def should_prepare_access_guide(
     joined_env = str(capability_context.environment_facts).lower()
     return any(token in joined_notes or token in joined_env for token in access_tokens)
 
-
-def should_force_metric_discussion(
-    *,
-    user_goal: str,
-    answers: dict[str, Any] | None,
-    capability_context: CapabilityContext,
-    turn: BootstrapTurn,
-) -> bool:
-    if not capability_context.available_metrics:
-        return False
-    goal_text = user_goal.lower()
-    if any(token in goal_text for token in ("metric", "mae", "rmse", "log loss", "ordinal", "precision", "recall")):
-        return False
-    answer_values = " ".join(str(value).lower() for value in (answers or {}).values())
-    if any(token in answer_values for token in ("metric", "mae", "rmse", "log loss", "ordinal", "precision", "recall")):
-        return False
-    if any("metric" in question.key.lower() or "metric" in question.prompt.lower() for question in turn.proposal.questions):
-        return False
-    return True
-
-
-def _metric_relevant_to_objective(name: str, metadata: dict[str, Any], objective: str) -> bool:
-    """Check whether a metric seems relevant to the stated objective."""
-    objective_lower = objective.lower()
-    name_lower = name.lower()
-    # Generic regression/accuracy metrics are always relevant
-    generic_tokens = ("mae", "rmse", "mse", "r2", "accuracy", "precision", "recall", "f1")
-    if any(token in name_lower for token in generic_tokens):
-        return True
-    # Check if the metric's target/domain overlaps with the objective
-    metric_domain_tokens = name_lower.replace("_", " ").split()
-    objective_tokens = set(objective_lower.replace("_", " ").split())
-    if any(token in objective_tokens for token in metric_domain_tokens if len(token) > 2):
-        return True
-    # Check metadata for a target field that matches
-    target = str(metadata.get("target", "")).lower()
-    if target and target in objective_lower:
-        return True
-    return False
-
-
-def build_metric_guess(capability_context: CapabilityContext, objective: str = "") -> str:
-    primary = None
-    guardrails: list[str] = []
-    secondary: list[str] = []
-    for name, metadata in capability_context.available_metrics.items():
-        if objective and not _metric_relevant_to_objective(name, metadata, objective):
-            continue
-        role = str(metadata.get("preferred_role", "")).lower()
-        if role == "primary" and primary is None:
-            primary = name
-        elif role == "guardrail":
-            guardrails.append(name)
-        else:
-            secondary.append(name)
-    if primary is None and capability_context.available_metrics:
-        # Fall back to first relevant metric, or first overall
-        for name, metadata in capability_context.available_metrics.items():
-            if not objective or _metric_relevant_to_objective(name, metadata, objective):
-                primary = name
-                break
-        if primary is None:
-            primary = next(iter(capability_context.available_metrics))
-    parts = []
-    if primary is not None:
-        parts.append(f"Primary: {primary}")
-    if secondary:
-        parts.append("Secondary: " + ", ".join(secondary))
-    if guardrails:
-        parts.append("Guardrails: " + ", ".join(guardrails))
-    return "; ".join(parts)
 
 
 def resolve_repo_root_from_objective(objective: str, current_root: Path) -> Path:
@@ -956,7 +890,7 @@ class Loopforge:
         self.progress_fn: ProgressFn = progress_fn or _noop_progress
         self._stream_fn = stream_fn
         self._cached_capability_context: CapabilityContext | None = None
-        self._cached_capability_key: tuple[str, str | None] | None = None
+        self._cached_capability_key: tuple[str, str | None, str] | None = None
         self._cached_authoring_failure_reason: str | None = None
         self._attempted_dependency_installs: set[str] = set()
         bedrock_base = os.getenv("ANTHROPIC_BEDROCK_BASE_URL")
@@ -1000,6 +934,8 @@ class Loopforge:
         self.worker_backend = ConsultingWorkerBackend(
             worker_backend=primary_worker_backend,
             consultation_backend=self.consultation_backend,
+            progress_fn=self.progress_fn,
+            helper_label=self.role_models.consultation,
         )
         self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
             model=self.role_models.reflection, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.reflection),
@@ -1009,6 +945,9 @@ class Loopforge:
         )
         self.narrator_backend = narrator_backend or LiteLLMNarrationBackend(
             model=self.role_models.narrator, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.narrator),
+        )
+        self.execution_fix_backend = LiteLLMExecutionFixBackend(
+            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
         )
 
     def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
@@ -1038,6 +977,8 @@ class Loopforge:
         except Exception:
             return None
         if Path(manifest.get("repo_root", "")).resolve() != self.repo_root.resolve():
+            return None
+        if str(manifest.get("user_goal", "")).strip() != objective.strip():
             return None
         validation = _validate_runner_factory(
             factory_path=f"{runner_path}:build_adapter",
@@ -1142,7 +1083,7 @@ class Loopforge:
         # Don't load prior session memory during bootstrap — it pollutes new objectives
         # with irrelevant context from previous runs. Memory is only used during iterations.
         bootstrap_memory = {}
-        capability_key = (str(self.repo_root.resolve()), executor_factory_path)
+        capability_key = (str(self.repo_root.resolve()), executor_factory_path, user_goal.strip())
         if self._cached_capability_context is None or self._cached_capability_key != capability_key:
             self.progress_fn("discover_capabilities", "Scanning repository capabilities...")
             self._cached_capability_context = discover_capabilities_for_objective(
@@ -1208,6 +1149,34 @@ class Loopforge:
                 questions=refine_bootstrap_questions(turn.proposal.questions, answers=answers),
             ),
         )
+        # Auto-fix incomplete metrics — the agent often describes metrics in prose but
+        # leaves the JSON fields empty. Extract from the agent's own message.
+        spec = turn.proposal.recommended_spec
+        all_metrics = [spec.primary_metric, *spec.secondary_metrics, *spec.guardrail_metrics]
+        has_incomplete = any(
+            m.name == "[unspecified]" or m.goal not in ("maximize", "minimize")
+            for m in all_metrics
+        )
+        if has_incomplete:
+            self.progress_fn("fix_metrics", "Extracting metric details from agent's analysis...")
+            try:
+                fixes = self.narrator_backend.fix_incomplete_metrics(
+                    current_spec=spec.to_dict(),
+                    assistant_message=turn.assistant_message,
+                )
+                if fixes:
+                    spec_dict = spec.to_dict()
+                    for key in ("primary_metric", "secondary_metrics", "guardrail_metrics"):
+                        if key in fixes:
+                            spec_dict[key] = fixes[key]
+                    try:
+                        patched_spec = ExperimentSpec.from_dict(spec_dict)
+                        turn = replace(turn, proposal=replace(turn.proposal, recommended_spec=patched_spec))
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # Preflight check will catch remaining issues
+
         preflight_checks = run_preflight_checks(
             spec=turn.proposal.recommended_spec,
             capability_context=capability_context,
@@ -1266,6 +1235,77 @@ class Loopforge:
             human_update = f"{human_update}\nAccess guide: {access_guide_path}"
         return replace(resolved_turn, human_update=human_update)
 
+    @staticmethod
+    def _apply_metric_goal_fixes(turn: BootstrapTurn, fixes: dict[str, str]) -> BootstrapTurn:
+        """Apply goal fixes from the LLM to metrics in the spec."""
+        spec = turn.proposal.recommended_spec
+        primary = spec.primary_metric
+        if primary.name in fixes:
+            primary = replace(primary, goal=fixes[primary.name])
+        secondary = [
+            replace(m, goal=fixes[m.name]) if m.name in fixes else m
+            for m in spec.secondary_metrics
+        ]
+        guardrails = [
+            replace(m, goal=fixes[m.name]) if m.name in fixes else m
+            for m in spec.guardrail_metrics
+        ]
+        patched_spec = replace(spec, primary_metric=primary, secondary_metrics=secondary, guardrail_metrics=guardrails)
+        return replace(turn, proposal=replace(turn.proposal, recommended_spec=patched_spec))
+
+    def apply_feedback(self, turn: BootstrapTurn, feedback: str) -> BootstrapTurn | None:
+        """Interpret user feedback and patch the existing plan. Returns None if full replan needed."""
+        cap_ctx = self._cached_capability_context or CapabilityContext()
+        try:
+            result = self.narrator_backend.interpret_feedback(turn, feedback, cap_ctx)
+        except Exception:
+            return None  # Fall through to full replan
+        action = result.get("action", "replan")
+        if action == "replan":
+            return None
+        spec_updates = result.get("spec_updates", {})
+        if not spec_updates:
+            return None
+        # Apply the patch to the existing spec
+        spec = turn.proposal.recommended_spec
+        spec_dict = spec.to_dict()
+        for key, value in spec_updates.items():
+            if isinstance(value, dict) and isinstance(spec_dict.get(key), dict):
+                spec_dict[key] = {**spec_dict[key], **value}
+            else:
+                spec_dict[key] = value
+        try:
+            patched_spec = ExperimentSpec.from_dict(spec_dict)
+        except Exception:
+            return None  # Malformed patch — fall through to replan
+        patched_proposal = replace(turn.proposal, recommended_spec=patched_spec)
+        # Re-run preflight checks on the patched spec
+        executor_factory_path = self.resolve_executor_factory_path(patched_spec.objective)
+        preflight_checks = run_preflight_checks(
+            spec=patched_spec,
+            capability_context=cap_ctx,
+            memory_root=self.memory_root,
+            executor_factory_path=executor_factory_path,
+        )
+        bootstrap_answers = patched_spec.metadata.get("bootstrap_answers", {})
+        if not isinstance(bootstrap_answers, dict):
+            bootstrap_answers = {}
+        missing_requirements = missing_requirements_from_bootstrap(
+            questions=patched_proposal.questions,
+            answers=bootstrap_answers,
+            preflight_checks=preflight_checks,
+        )
+        ready_to_start = not missing_requirements
+        message = result.get("message", "Plan updated.")
+        return replace(
+            turn,
+            proposal=patched_proposal,
+            preflight_checks=preflight_checks,
+            missing_requirements=missing_requirements,
+            ready_to_start=ready_to_start,
+            human_update=message,
+        )
+
     def start(
         self,
         *,
@@ -1278,6 +1318,7 @@ class Loopforge:
             bootstrap_turn=bootstrap_turn,
             user_goal=user_goal,
             iterations=iterations,
+            reset_state=True,
         )
 
     def _install_python_dependency(self, package_name: str) -> tuple[bool, dict[str, Any]]:
@@ -1364,12 +1405,21 @@ class Loopforge:
         user_goal: str,
         iterations: int | None = None,
         iteration_callback=None,
+        reset_state: bool = False,
     ) -> dict[str, Any]:
         if not bootstrap_turn.ready_to_start:
             return {"status": "needs_input", "bootstrap": bootstrap_turn.to_dict()}
 
         spec = bootstrap_turn.proposal.recommended_spec
         memory_store = FileMemoryStore(self.memory_root)
+        if not reset_state and memory_store.has_persisted_state():
+            try:
+                stored_spec = memory_store.load_spec()
+            except Exception:
+                reset_state = True
+            else:
+                if stored_spec.to_dict() != spec.to_dict():
+                    reset_state = True
         executor_factory_path = self.resolve_executor_factory_path(user_goal)
         if executor_factory_path is None:
             handlers = {}
@@ -1387,7 +1437,11 @@ class Loopforge:
             worker_backend=self.worker_backend,
             executor=RoutingExperimentExecutor(
                 handlers=handlers,
-                plan_executor=GenericExecutionPlanExecutor(repo_root=self.repo_root),
+                plan_executor=GenericExecutionPlanExecutor(
+                    repo_root=self.repo_root,
+                    fix_backend=self.execution_fix_backend,
+                    progress_fn=self.progress_fn,
+                ),
                 recovery_handler=self._make_execution_recovery_handler(),
             ),
             reflection_backend=self.reflection_backend,
@@ -1397,9 +1451,11 @@ class Loopforge:
             progress_fn=self.progress_fn,
             role_models=self.role_models,
         )
-        orchestrator.initialize(spec=spec)
+        orchestrator.initialize(spec=spec, reset_state=reset_state)
         try:
             results = orchestrator.run(iterations=iterations, iteration_callback=iteration_callback)
+        except (ExperimentInterrupted, KeyboardInterrupt):
+            raise
         except Exception as exc:
             return {
                 "status": "blocked",

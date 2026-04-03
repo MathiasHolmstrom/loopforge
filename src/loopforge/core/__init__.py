@@ -7,6 +7,7 @@ from loopforge.core.backends import (
     LiteLLMAccessAdvisorBackend,
     LiteLLMBootstrapBackend,
     LiteLLMConsultationBackend,
+    LiteLLMExecutionFixBackend,
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
