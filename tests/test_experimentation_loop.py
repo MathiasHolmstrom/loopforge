@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 
+import loopforge.bootstrap as bootstrap_module
 from loopforge import (
     AdapterSetup,
     BootstrapTurn,
@@ -130,6 +131,29 @@ def build_spec(**overrides) -> ExperimentSpec:
     }
     payload.update(overrides)
     return ExperimentSpec(**payload)
+
+
+def test_default_role_models_routes_claude_only_to_helper_roles() -> None:
+    role_models = bootstrap_module.default_role_models()
+
+    assert role_models.planner == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert role_models.worker == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert role_models.reflection == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert role_models.review == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert role_models.consultation == bootstrap_module.DEFAULT_CLAUDE_MODEL
+    assert role_models.narrator == bootstrap_module.DEFAULT_CLAUDE_MODEL
+
+
+def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> None:
+    app = Loopforge(memory_root=tmp_path / "memory")
+
+    assert app.bootstrap_backend.model == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert app.worker_backend.worker_backend.model == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert app.reflection_backend.model == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert app.review_backend.model == bootstrap_module.DEFAULT_OPENAI_MODEL
+    assert app.consultation_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
+    assert app.access_advisor_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
+    assert app.narrator_backend.model == bootstrap_module.DEFAULT_CLAUDE_MODEL
 
 
 def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_effective_spec(tmp_path) -> None:
@@ -499,6 +523,9 @@ def test_draft_spec_returns_metric_questions_and_recommended_spec(tmp_path, monk
 
 
 def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, monkeypatch) -> None:
+    access_advisor = FakeAccessAdvisorBackend()
+    narrator = FakeNarrationBackend()
+
     class StubBootstrapBackend:
         def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
             assert capability_context.available_metrics["fraud_recall"]["scorer_ref"] == "metrics.fraud_recall"
@@ -550,8 +577,8 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
         executor_factory_path="fake.module:factory",
         memory_root=tmp_path / "memory",
         bootstrap_backend=StubBootstrapBackend(),
-        access_advisor_backend=FakeAccessAdvisorBackend(),
-        narrator_backend=FakeNarrationBackend(),
+        access_advisor_backend=access_advisor,
+        narrator_backend=narrator,
     )
 
     turn = app.bootstrap(user_goal="Improve fraud detection recall.")
@@ -568,6 +595,8 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
     assert "bootstrap:Improve fraud detection recall." in turn.human_update
     assert "Access guide:" in turn.human_update
     assert Path(turn.access_guide_path).read_text(encoding="utf-8").startswith("# Access Guide")
+    assert len(access_advisor.calls) == 1
+    assert len(narrator.bootstrap_calls) == 1
 
 
 def test_loopforge_blocks_autonomous_start_without_execution_preflight(tmp_path, monkeypatch) -> None:
