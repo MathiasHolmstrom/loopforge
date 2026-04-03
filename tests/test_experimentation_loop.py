@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import sys
@@ -10,7 +10,11 @@ from types import ModuleType
 
 import loopforge.bootstrap as bootstrap_module
 import loopforge.pilot_adapters as pilot_adapters_module
-from loopforge.core.backends import build_execution_handoff, build_iteration_policy, should_request_ops_consult
+from loopforge.core.backends import (
+    build_execution_handoff,
+    build_iteration_policy,
+    should_request_ops_consult,
+)
 from loopforge import (
     AdapterSetup,
     AccessGuide,
@@ -106,8 +110,12 @@ class FakeNarrationBackend:
         self.bootstrap_calls.append((turn, capability_context))
         return f"bootstrap:{turn.proposal.objective}"
 
-    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
-        self.iteration_calls.append((snapshot, candidate, outcome, reflection, review, accepted_summary))
+    def summarize_iteration(
+        self, snapshot, candidate, outcome, reflection, review, accepted_summary
+    ):
+        self.iteration_calls.append(
+            (snapshot, candidate, outcome, reflection, review, accepted_summary)
+        )
         return f"iteration:{candidate.action_type}:{review.status}"
 
 
@@ -153,7 +161,9 @@ class RaisingNarrationBackend:
     def summarize_bootstrap(self, turn, capability_context):
         raise RuntimeError("invalid bearer token")
 
-    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+    def summarize_iteration(
+        self, snapshot, candidate, outcome, reflection, review, accepted_summary
+    ):
         raise RuntimeError("invalid bearer token")
 
 
@@ -207,7 +217,9 @@ def test_default_role_models_keeps_claude_helpers_when_supported(monkeypatch) ->
 def test_detect_builtin_executor_factory_for_lol_kills_repo(tmp_path) -> None:
     repo_root = tmp_path / "player-performance-ratings"
     (repo_root / "examples" / "lol").mkdir(parents=True)
-    (repo_root / "examples" / "lol" / "pipeline_transformer_example.py").write_text("print('lol')\n", encoding="utf-8")
+    (repo_root / "examples" / "lol" / "pipeline_transformer_example.py").write_text(
+        "print('lol')\n", encoding="utf-8"
+    )
 
     factory = pilot_adapters_module.detect_builtin_executor_factory(
         repo_root,
@@ -220,11 +232,15 @@ def test_detect_builtin_executor_factory_for_lol_kills_repo(tmp_path) -> None:
 def test_loopforge_does_not_prefer_builtin_lol_adapter_by_default(tmp_path) -> None:
     repo_root = tmp_path / "player-performance-ratings"
     (repo_root / "examples" / "lol").mkdir(parents=True)
-    (repo_root / "examples" / "lol" / "pipeline_transformer_example.py").write_text("print('lol')\n", encoding="utf-8")
+    (repo_root / "examples" / "lol" / "pipeline_transformer_example.py").write_text(
+        "print('lol')\n", encoding="utf-8"
+    )
 
     app = Loopforge(repo_root=repo_root, memory_root=tmp_path / "memory")
 
-    resolution = app.resolve_execution_backend("create player kills model in player-performance-ratings repo for lol")
+    resolution = app.resolve_execution_backend(
+        "create player kills model in player-performance-ratings repo for lol"
+    )
 
     assert resolution.kind == "planning_only"
     assert resolution.factory_path is None
@@ -258,13 +274,19 @@ def test_loopforge_prefers_explicit_executor_factory(tmp_path) -> None:
     assert resolved == "custom.module:build_adapter"
 
 
-def test_loopforge_cached_authored_runner_requires_matching_objective(tmp_path, monkeypatch) -> None:
+def test_loopforge_cached_authored_runner_requires_matching_objective(
+    tmp_path, monkeypatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     memory_root = tmp_path / "memory"
-    runner_path, manifest_path = bootstrap_module._authored_runner_paths(memory_root, repo_root)
+    runner_path, manifest_path = bootstrap_module._authored_runner_paths(
+        memory_root, repo_root
+    )
     runner_path.parent.mkdir(parents=True, exist_ok=True)
-    runner_path.write_text("def build_adapter(spec, memory_root):\n    return None\n", encoding="utf-8")
+    runner_path.write_text(
+        "def build_adapter(spec, memory_root):\n    return None\n", encoding="utf-8"
+    )
     manifest_path.write_text(
         json.dumps(
             {
@@ -278,7 +300,9 @@ def test_loopforge_cached_authored_runner_requires_matching_objective(tmp_path, 
     monkeypatch.setattr(
         bootstrap_module,
         "_validate_runner_factory",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("cache validation should not run for another objective")),
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("cache validation should not run for another objective")
+        ),
     )
     app = Loopforge(repo_root=repo_root, memory_root=memory_root)
 
@@ -287,7 +311,9 @@ def test_loopforge_cached_authored_runner_requires_matching_objective(tmp_path, 
     assert resolution is None
 
 
-def test_loopforge_uses_planning_only_backend_when_no_supported_runner(tmp_path) -> None:
+def test_loopforge_uses_planning_only_backend_when_no_supported_runner(
+    tmp_path,
+) -> None:
     app = Loopforge(repo_root=tmp_path / "repo", memory_root=tmp_path / "memory")
 
     resolution = app.resolve_execution_backend("Improve the LoL kills model.")
@@ -317,8 +343,14 @@ def test_run_interactive_start_does_not_enable_raw_token_streaming(monkeypatch) 
                 human_update="Ready to start.",
             )
 
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
-            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
+            return {
+                "status": "started",
+                "bootstrap": {"objective": user_goal},
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
@@ -331,8 +363,9 @@ def test_run_interactive_start_does_not_enable_raw_token_streaming(monkeypatch) 
     assert "stream_fn" not in captured_kwargs or captured_kwargs["stream_fn"] is None
 
 
-
-def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(monkeypatch) -> None:
+def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(
+    monkeypatch,
+) -> None:
     prompts = []
     outputs = []
     answers = iter(["Fix Databricks deploy", "dev workspace", "y"])
@@ -352,7 +385,12 @@ def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(monkeypat
                     proposal=ExperimentSpecProposal(
                         objective=user_goal,
                         recommended_spec=build_spec(objective=user_goal),
-                        questions=[SpecQuestion(key="workspace", prompt="Which workspace should I target?")],
+                        questions=[
+                            SpecQuestion(
+                                key="workspace",
+                                prompt="Which workspace should I target?",
+                            )
+                        ],
                     ),
                     role_models=bootstrap_module.default_role_models(),
                     ready_to_start=False,
@@ -370,9 +408,21 @@ def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(monkeypat
                 human_update="Ready to start.",
             )
 
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
-            self.start_calls.append((user_goal, bootstrap_turn.proposal.recommended_spec.metadata, iterations))
-            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
+            self.start_calls.append(
+                (
+                    user_goal,
+                    bootstrap_turn.proposal.recommended_spec.metadata,
+                    iterations,
+                )
+            )
+            return {
+                "status": "started",
+                "bootstrap": {"objective": user_goal},
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
@@ -386,15 +436,22 @@ def test_run_interactive_start_asks_for_goal_then_follow_up_and_starts(monkeypat
     # Questions without options show prompt as output, use "> " for input
     assert "> " in prompts
     # Confirmation prompt when ready
-    assert any("Ready to start?" in p or "What would you like to do?" in p for p in prompts)
+    assert any(
+        "Ready to start?" in p or "What would you like to do?" in p for p in prompts
+    )
     assert any("Scanning repo" in o for o in outputs)
     assert any("finished" in o.lower() or "started" in o.lower() for o in outputs)
     assert len(created_apps) == 1
     assert created_apps[0].bootstrap_calls == [("Fix Databricks deploy", {})]
-    assert created_apps[0].start_calls[0][1]["bootstrap_answers"]["workspace"] == "dev workspace"
+    assert (
+        created_apps[0].start_calls[0][1]["bootstrap_answers"]["workspace"]
+        == "dev workspace"
+    )
 
 
-def test_run_interactive_start_accepts_natural_language_start_intent(monkeypatch) -> None:
+def test_run_interactive_start_accepts_natural_language_start_intent(
+    monkeypatch,
+) -> None:
     outputs = []
 
     class StubLoopforge:
@@ -414,14 +471,22 @@ def test_run_interactive_start_accepts_natural_language_start_intent(monkeypatch
                 human_update="Ready to start.",
             )
 
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
             self.start_calls += 1
-            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+            return {
+                "status": "started",
+                "bootstrap": {"objective": user_goal},
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
     exit_code = run_interactive_start(
-        input_fn=lambda prompt: "Go ahead start man" if "Ready to start?" in prompt else "Improve model",
+        input_fn=lambda prompt: (
+            "Go ahead start man" if "Ready to start?" in prompt else "Improve model"
+        ),
         print_fn=outputs.append,
     )
 
@@ -429,7 +494,9 @@ def test_run_interactive_start_accepts_natural_language_start_intent(monkeypatch
     assert any("Starting experiment loop" in output for output in outputs)
 
 
-def test_run_interactive_start_does_not_print_plan_update_when_replanning_after_required_answer(monkeypatch) -> None:
+def test_run_interactive_start_does_not_print_plan_update_when_replanning_after_required_answer(
+    monkeypatch,
+) -> None:
     outputs = []
     answers = iter(["Improve the LoL kills model", "1", "quit"])
     captured_bootstraps = []
@@ -452,7 +519,10 @@ def test_run_interactive_start_does_not_print_plan_update_when_replanning_after_
                             SpecQuestion(
                                 key="dataset_choice",
                                 prompt="Which dataset should I use?",
-                                options=["Use the larger dataset", "Use the subsample first"],
+                                options=[
+                                    "Use the larger dataset",
+                                    "Use the subsample first",
+                                ],
                             )
                         ],
                     ),
@@ -472,8 +542,14 @@ def test_run_interactive_start_does_not_print_plan_update_when_replanning_after_
                 human_update="Dataset choice captured.",
             )
 
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
-            return {"status": "started", "bootstrap": bootstrap_turn.to_dict(), "results": []}
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
+            return {
+                "status": "started",
+                "bootstrap": bootstrap_turn.to_dict(),
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
@@ -483,12 +559,16 @@ def test_run_interactive_start_does_not_print_plan_update_when_replanning_after_
     )
 
     assert exit_code == 0
-    assert any("Analysing repository and planning experiment" in output for output in outputs)
+    assert any(
+        "Analysing repository and planning experiment" in output for output in outputs
+    )
     assert not any("Updating plan..." in output for output in outputs)
     assert len(captured_bootstraps) == 1
 
 
-def test_run_interactive_start_patches_plan_with_feedback_before_replanning(monkeypatch) -> None:
+def test_run_interactive_start_patches_plan_with_feedback_before_replanning(
+    monkeypatch,
+) -> None:
     """Feedback tries to patch the plan first; falls through to replan if patch returns None."""
     outputs = []
     answers = iter(["Improve the LoL kills model", "Use Bayesian smoothing", "quit"])
@@ -540,10 +620,14 @@ def test_run_interactive_start_patches_plan_with_feedback_before_replanning(monk
     assert any("Plan revised around your feedback." in output for output in outputs)
 
 
-def test_run_interactive_start_offers_optional_context_once_then_replans(monkeypatch) -> None:
+def test_run_interactive_start_offers_optional_context_once_then_replans(
+    monkeypatch,
+) -> None:
     outputs = []
     prompts = []
-    answers = iter(["Improve the LoL kills model", "Try position-aware features if useful", "y"])
+    answers = iter(
+        ["Improve the LoL kills model", "Try position-aware features if useful", "y"]
+    )
 
     class StubLoopforge:
         def __init__(self, **kwargs) -> None:
@@ -571,9 +655,22 @@ def test_run_interactive_start_offers_optional_context_once_then_replans(monkeyp
                     ready_to_start=True,
                     human_update="Ready to start.",
                 )
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
-            self.start_calls.append((user_goal, bootstrap_turn.proposal.recommended_spec.metadata, iterations))
-            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
+            self.start_calls.append(
+                (
+                    user_goal,
+                    bootstrap_turn.proposal.recommended_spec.metadata,
+                    iterations,
+                )
+            )
+            return {
+                "status": "started",
+                "bootstrap": {"objective": user_goal},
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
@@ -588,7 +685,9 @@ def test_run_interactive_start_offers_optional_context_once_then_replans(monkeyp
     assert not any("Updating plan..." in output for output in outputs)
 
 
-def test_run_interactive_start_accepts_cont_as_start_intent_after_optional_question(monkeypatch) -> None:
+def test_run_interactive_start_accepts_cont_as_start_intent_after_optional_question(
+    monkeypatch,
+) -> None:
     prompts = []
     outputs = []
 
@@ -621,9 +720,15 @@ def test_run_interactive_start_accepts_cont_as_start_intent_after_optional_quest
                 human_update="Ready to start.",
             )
 
-        def start_from_bootstrap_turn(self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs):
+        def start_from_bootstrap_turn(
+            self, *, bootstrap_turn, user_goal, iterations=None, **_kwargs
+        ):
             self.start_calls += 1
-            return {"status": "started", "bootstrap": {"objective": user_goal}, "results": []}
+            return {
+                "status": "started",
+                "bootstrap": {"objective": user_goal},
+                "results": [],
+            }
 
     monkeypatch.setattr("loopforge.cli.Loopforge", StubLoopforge)
 
@@ -684,7 +789,10 @@ def test_bootstrap_backend_tolerates_missing_recommended_spec_objective() -> Non
                                 "proposal": {
                                     "objective": "Improve NBA points model.",
                                     "recommended_spec": {
-                                        "primary_metric": {"name": "mae", "goal": "minimize"},
+                                        "primary_metric": {
+                                            "name": "mae",
+                                            "goal": "minimize",
+                                        },
                                         "allowed_actions": ["baseline"],
                                     },
                                 },
@@ -756,8 +864,13 @@ def test_bootstrap_backend_tolerates_incomplete_metric_payloads() -> None:
                                 "assistant_message": "I found enough context to continue.",
                                 "proposal": {
                                     "recommended_spec": {
-                                        "primary_metric": {"name": "mae", "goal": "minimize"},
-                                        "secondary_metrics": [{"name": "r2", "goal": "maximize"}],
+                                        "primary_metric": {
+                                            "name": "mae",
+                                            "goal": "minimize",
+                                        },
+                                        "secondary_metrics": [
+                                            {"name": "r2", "goal": "maximize"}
+                                        ],
                                         "guardrail_metrics": [],
                                         "allowed_actions": [],
                                     },
@@ -799,7 +912,10 @@ def test_bootstrap_backend_coerces_invalid_objective_and_allowed_actions() -> No
                                     "objective": {"bad": "shape"},
                                     "recommended_spec": {
                                         "objective": {"also": "bad"},
-                                        "primary_metric": {"name": "mae", "goal": "minimize"},
+                                        "primary_metric": {
+                                            "name": "mae",
+                                            "goal": "minimize",
+                                        },
                                         "allowed_actions": "baseline",
                                     },
                                 },
@@ -838,7 +954,10 @@ def test_bootstrap_backend_respects_agent_empty_allowed_actions() -> None:
                                 "assistant_message": "Ready.",
                                 "proposal": {
                                     "recommended_spec": {
-                                        "primary_metric": {"name": "mae", "goal": "minimize"},
+                                        "primary_metric": {
+                                            "name": "mae",
+                                            "goal": "minimize",
+                                        },
                                         "allowed_actions": [],
                                     },
                                 },
@@ -853,7 +972,9 @@ def test_bootstrap_backend_respects_agent_empty_allowed_actions() -> None:
 
     turn = backend.propose_bootstrap_turn(
         user_goal="Improve NBA points model.",
-        capability_context=CapabilityContext(available_actions={"baseline": "pilot.py", "tune": "pilot.py"}),
+        capability_context=CapabilityContext(
+            available_actions={"baseline": "pilot.py", "tune": "pilot.py"}
+        ),
         role_models=bootstrap_module.default_role_models(),
     )
 
@@ -874,7 +995,10 @@ def test_bootstrap_backend_does_not_override_agent_metric_decisions() -> None:
                                 "assistant_message": "Ready.",
                                 "proposal": {
                                     "recommended_spec": {
-                                        "primary_metric": {"name": "mae", "goal": "minimize"},
+                                        "primary_metric": {
+                                            "name": "mae",
+                                            "goal": "minimize",
+                                        },
                                         "guardrail_metrics": [],
                                         "allowed_actions": ["baseline"],
                                     },
@@ -892,8 +1016,16 @@ def test_bootstrap_backend_does_not_override_agent_metric_decisions() -> None:
         user_goal="Improve NBA points model.",
         capability_context=CapabilityContext(
             available_metrics={
-                "mae": {"goal": "minimize", "preferred_role": "primary", "scorer_ref": "pilot:mae"},
-                "ordinal_loss": {"goal": "minimize", "preferred_role": "guardrail", "scorer_ref": "pilot:ord"},
+                "mae": {
+                    "goal": "minimize",
+                    "preferred_role": "primary",
+                    "scorer_ref": "pilot:mae",
+                },
+                "ordinal_loss": {
+                    "goal": "minimize",
+                    "preferred_role": "guardrail",
+                    "scorer_ref": "pilot:ord",
+                },
             }
         ),
         role_models=bootstrap_module.default_role_models(),
@@ -908,9 +1040,11 @@ def test_bootstrap_backend_does_not_override_agent_metric_decisions() -> None:
 def test_worker_backend_tolerates_missing_action_type() -> None:
     worker = bootstrap_module.LiteLLMWorkerBackend(
         model="openai/gpt-5.4",
-        completion_fn=lambda **kwargs: {"choices": [{"message": {"content": json.dumps({})}}]},
+        completion_fn=lambda **kwargs: {
+            "choices": [{"message": {"content": json.dumps({})}}]
+        },
     )
-    snapshot = FileMemoryStore(Path(".")).load_snapshot if False else None
+    snapshot = FileMemoryStore(Path(".")).load_snapshot if False else None  # noqa: F841
     spec = build_spec(allowed_actions=["baseline", "tune"])
     memory_snapshot = MemorySnapshot(
         spec=spec,
@@ -934,7 +1068,10 @@ def test_worker_backend_tolerates_missing_action_type() -> None:
 
 
 def test_iteration_policy_uses_force_next_action_when_present() -> None:
-    spec = build_spec(allowed_actions=["inspect_data", "train_model"], metadata={"force_next_action": "train_model"})
+    spec = build_spec(
+        allowed_actions=["inspect_data", "train_model"],
+        metadata={"force_next_action": "train_model"},
+    )
     snapshot = MemorySnapshot(
         spec=spec,
         effective_spec=spec,
@@ -972,16 +1109,18 @@ def test_worker_candidate_normalisation_preserves_agent_action_type() -> None:
         next_iteration_id=1,
     )
 
-    candidate_payload = bootstrap_module.LiteLLMWorkerBackend._normalise_candidate_payload(
-        {
-            "hypothesis": "Do something unsupported.",
-            "action_type": "invented_action",
-            "change_type": "invented_action",
-            "instructions": "Use a made up action.",
-            "metadata": {},
-        },
-        snapshot,
-        iteration_policy=build_iteration_policy(snapshot),
+    candidate_payload = (
+        bootstrap_module.LiteLLMWorkerBackend._normalise_candidate_payload(
+            {
+                "hypothesis": "Do something unsupported.",
+                "action_type": "invented_action",
+                "change_type": "invented_action",
+                "instructions": "Use a made up action.",
+                "metadata": {},
+            },
+            snapshot,
+            iteration_policy=build_iteration_policy(snapshot),
+        )
     )
 
     # Agent's choice is preserved — not silently replaced
@@ -989,7 +1128,9 @@ def test_worker_candidate_normalisation_preserves_agent_action_type() -> None:
     assert candidate_payload["change_type"] == "invented_action"
 
 
-def test_diagnostic_actions_are_recorded_as_inconclusive_not_regressed(tmp_path) -> None:
+def test_diagnostic_actions_are_recorded_as_inconclusive_not_regressed(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
@@ -1004,12 +1145,26 @@ def test_diagnostic_actions_are_recorded_as_inconclusive_not_regressed(tmp_path)
             ]
         ),
         executor=RoutingExperimentExecutor(
-            handlers={"eda": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41, notes=["EDA completed."])])}
+            handlers={
+                "eda": StaticActionExecutor(
+                    [
+                        ExperimentOutcome(
+                            primary_metric_value=0.41, notes=["EDA completed."]
+                        )
+                    ]
+                )
+            }
         ),
         reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Useful diagnosis.", lessons=["Found worst slices."])]
+            [
+                ReflectionSummary(
+                    assessment="Useful diagnosis.", lessons=["Found worst slices."]
+                )
+            ]
         ),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="keep diagnostic memory")]),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="keep diagnostic memory")]
+        ),
         capability_provider=lambda effective_spec: CapabilityContext(
             environment_facts={"inconclusive_actions": ["eda", "slice_analysis"]}
         ),
@@ -1049,10 +1204,18 @@ def test_orchestrator_stops_when_max_autonomous_hours_elapsed(tmp_path) -> None:
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41)])}
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.41)]
+                )
+            }
         ),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         monotonic_fn=iter([0.0, 0.0, 21600.0]).__next__,
     )
     orchestrator.initialize(
@@ -1067,7 +1230,9 @@ def test_orchestrator_stops_when_max_autonomous_hours_elapsed(tmp_path) -> None:
     assert len(results) == 1
 
 
-def test_orchestrator_continuation_merges_follow_up_outcome_without_crashing(tmp_path) -> None:
+def test_orchestrator_continuation_merges_follow_up_outcome_without_crashing(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
 
     class ContinuationWorker:
@@ -1095,13 +1260,21 @@ def test_orchestrator_continuation_merges_follow_up_outcome_without_crashing(tmp
                 "baseline": StaticActionExecutor(
                     [
                         ExperimentOutcome(status="success", notes=["Setup completed."]),
-                        ExperimentOutcome(status="success", primary_metric_value=0.41, notes=["Metrics produced."]),
+                        ExperimentOutcome(
+                            status="success",
+                            primary_metric_value=0.41,
+                            notes=["Metrics produced."],
+                        ),
                     ]
                 )
             }
         ),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Baseline captured.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Baseline captured.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
     orchestrator.initialize(
         build_spec(
@@ -1120,7 +1293,9 @@ def test_orchestrator_continuation_merges_follow_up_outcome_without_crashing(tmp
 def test_review_backend_tolerates_missing_status_and_reason() -> None:
     review = bootstrap_module.LiteLLMReviewBackend(
         model="openai/gpt-5.4",
-        completion_fn=lambda **kwargs: {"choices": [{"message": {"content": json.dumps({})}}]},
+        completion_fn=lambda **kwargs: {
+            "choices": [{"message": {"content": json.dumps({})}}]
+        },
     )
     spec = build_spec(allowed_actions=["baseline"])
     snapshot = MemorySnapshot(
@@ -1139,7 +1314,12 @@ def test_review_backend_tolerates_missing_status_and_reason() -> None:
 
     decision = review.review(
         snapshot,
-        ExperimentCandidate(hypothesis="Baseline", action_type="baseline", change_type="baseline", instructions="Run."),
+        ExperimentCandidate(
+            hypothesis="Baseline",
+            action_type="baseline",
+            change_type="baseline",
+            instructions="Run.",
+        ),
         ExperimentOutcome(primary_metric_value=1.0),
         ReflectionSummary(assessment="ok"),
     )
@@ -1150,14 +1330,18 @@ def test_review_backend_tolerates_missing_status_and_reason() -> None:
 
 def test_bootstrap_survives_helper_backend_failures(tmp_path, monkeypatch) -> None:
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Bootstrap completed.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="fraud_recall", goal="maximize"
+                        ),
                         allowed_actions=["train"],
                     ),
                 ),
@@ -1197,7 +1381,9 @@ def test_bootstrap_survives_helper_backend_failures(tmp_path, monkeypatch) -> No
     assert turn.human_update == "Bootstrap completed."
 
 
-def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_effective_spec(tmp_path) -> None:
+def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_effective_spec(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     worker = FakeWorkerBackend(
         [
@@ -1220,19 +1406,39 @@ def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_eff
         worker_backend=worker,
         executor=RoutingExperimentExecutor(
             handlers={
-                "baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41, notes=["Baseline done."])]),
-                "eda": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41, notes=["Rest-day slice found drift."])]),
+                "baseline": StaticActionExecutor(
+                    [
+                        ExperimentOutcome(
+                            primary_metric_value=0.41, notes=["Baseline done."]
+                        )
+                    ]
+                ),
+                "eda": StaticActionExecutor(
+                    [
+                        ExperimentOutcome(
+                            primary_metric_value=0.41,
+                            notes=["Rest-day slice found drift."],
+                        )
+                    ]
+                ),
             }
         ),
         reflection_backend=FakeReflectionBackend(
             [
-                ReflectionSummary(assessment="Useful baseline.", lessons=["Baseline established."]),
-                ReflectionSummary(assessment="Rest-day slice is worth following up.", lessons=["Rest days matter."]),
+                ReflectionSummary(
+                    assessment="Useful baseline.", lessons=["Baseline established."]
+                ),
+                ReflectionSummary(
+                    assessment="Rest-day slice is worth following up.",
+                    lessons=["Rest days matter."],
+                ),
             ]
         ),
         review_backend=FakeReviewBackend(
             [
-                ReviewDecision(status="accepted", reason="Use this as starting memory."),
+                ReviewDecision(
+                    status="accepted", reason="Use this as starting memory."
+                ),
                 ReviewDecision(status="accepted", reason="EDA finding is actionable."),
             ]
         ),
@@ -1243,17 +1449,30 @@ def test_only_accepted_memory_reaches_the_next_worker_and_human_notes_modify_eff
     append_human_intervention(
         memory_root=tmp_path / "loop",
         message="Focus on EDA before more tuning.",
-        effects={"disable_actions": ["tune"], "force_next_action": "eda", "suggested_hypothesis": "Check rest-day drift"},
+        effects={
+            "disable_actions": ["tune"],
+            "force_next_action": "eda",
+            "suggested_hypothesis": "Check rest-day drift",
+        },
     )
     second_cycle = orchestrator.run_iteration()
 
     assert first_cycle.accepted_summary is not None
     assert second_cycle.accepted_summary is not None
     assert worker.snapshots[0].recent_summaries == []
-    assert [summary.hypothesis for summary in worker.snapshots[1].recent_summaries] == ["Baseline"]
-    assert worker.snapshots[1].effective_spec.allowed_actions == ["baseline", "eda", "train", "evaluate"]
+    assert [summary.hypothesis for summary in worker.snapshots[1].recent_summaries] == [
+        "Baseline"
+    ]
+    assert worker.snapshots[1].effective_spec.allowed_actions == [
+        "baseline",
+        "eda",
+        "train",
+        "evaluate",
+    ]
     assert worker.snapshots[1].effective_spec.metadata["force_next_action"] == "eda"
-    assert worker.snapshots[1].effective_spec.metadata["suggested_hypotheses"] == ["Check rest-day drift"]
+    assert worker.snapshots[1].effective_spec.metadata["suggested_hypotheses"] == [
+        "Check rest-day drift"
+    ]
 
 
 def test_orchestrator_injects_capability_context_into_worker_snapshot(tmp_path) -> None:
@@ -1272,10 +1491,18 @@ def test_orchestrator_injects_capability_context_into_worker_snapshot(tmp_path) 
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41)])}
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.41)]
+                )
+            }
         ),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         capability_provider=lambda effective_spec: CapabilityContext(
             available_actions={"baseline": "Run baseline"},
             available_entities={"model_keys": ["pass_outcome", "fumble_expanded"]},
@@ -1295,8 +1522,15 @@ def test_orchestrator_injects_capability_context_into_worker_snapshot(tmp_path) 
         "pass_outcome",
         "fumble_expanded",
     ]
-    assert worker.snapshots[0].capability_context.available_data_assets == ["gold_cross_validated_pass_outcome_ncaaf"]
-    assert worker.snapshots[0].capability_context.available_metrics["log_loss"]["scorer_ref"] == "metrics.log_loss_cv"
+    assert worker.snapshots[0].capability_context.available_data_assets == [
+        "gold_cross_validated_pass_outcome_ncaaf"
+    ]
+    assert (
+        worker.snapshots[0].capability_context.available_metrics["log_loss"][
+            "scorer_ref"
+        ]
+        == "metrics.log_loss_cv"
+    )
 
 
 def test_consulting_worker_requests_ops_help_for_databricks_flows(tmp_path) -> None:
@@ -1314,13 +1548,25 @@ def test_consulting_worker_requests_ops_help_for_databricks_flows(tmp_path) -> N
     consultation = FakeConsultationBackend()
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
-        worker_backend=ConsultingWorkerBackend(worker_backend=worker, consultation_backend=consultation),
-        executor=RoutingExperimentExecutor(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41)])}
+        worker_backend=ConsultingWorkerBackend(
+            worker_backend=worker, consultation_backend=consultation
         ),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
-        capability_provider=lambda effective_spec: CapabilityContext(notes=["Need Databricks deploy guidance"]),
+        executor=RoutingExperimentExecutor(
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.41)]
+                )
+            }
+        ),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
+        capability_provider=lambda effective_spec: CapabilityContext(
+            notes=["Need Databricks deploy guidance"]
+        ),
     )
     orchestrator.initialize(
         build_spec(
@@ -1332,18 +1578,25 @@ def test_consulting_worker_requests_ops_help_for_databricks_flows(tmp_path) -> N
     cycle = orchestrator.run_iteration()
 
     assert consultation.calls
-    assert "Ops consult guidance: Use bundle deploy and verify env vars first." in worker.snapshots[0].capability_context.notes
+    assert (
+        "Ops consult guidance: Use bundle deploy and verify env vars first."
+        in worker.snapshots[0].capability_context.notes
+    )
     assert cycle.record.candidate.metadata["ops_consultation"]["required_env_vars"] == [
         "DATABRICKS_HOST",
         "DATABRICKS_TOKEN",
     ]
-    assert cycle.record.candidate.metadata["helper_consultation"]["required_env_vars"] == [
+    assert cycle.record.candidate.metadata["helper_consultation"][
+        "required_env_vars"
+    ] == [
         "DATABRICKS_HOST",
         "DATABRICKS_TOKEN",
     ]
 
 
-def test_consulting_worker_surfaces_helper_consult_progress_for_recoverable_failure(tmp_path) -> None:
+def test_consulting_worker_surfaces_helper_consult_progress_for_recoverable_failure(
+    tmp_path,
+) -> None:
     progress_messages: list[tuple[str, str]] = []
     worker = FakeWorkerBackend(
         [
@@ -1401,9 +1654,15 @@ def test_consulting_worker_surfaces_helper_consult_progress_for_recoverable_fail
     candidate = consulting_worker.propose_next_experiment(snapshot)
 
     assert consultation.calls
-    assert candidate.metadata["helper_consultation"]["guidance"] == "Use bundle deploy and verify env vars first."
+    assert (
+        candidate.metadata["helper_consultation"]["guidance"]
+        == "Use bundle deploy and verify env vars first."
+    )
     assert any(stage == "helper_consult" for stage, _ in progress_messages)
-    assert any(stage == "helper_consult_detail" and "Guidance" in message for stage, message in progress_messages)
+    assert any(
+        stage == "helper_consult_detail" and "Guidance" in message
+        for stage, message in progress_messages
+    )
 
 
 def test_should_request_ops_consult_skips_generic_runbook_handoff() -> None:
@@ -1421,7 +1680,10 @@ def test_should_request_ops_consult_skips_generic_runbook_handoff() -> None:
         recent_human_interventions=[],
         lessons_learned="",
         markdown_memory=[
-            MarkdownMemoryNote(path="execution_runbook.md", content="# Execution Runbook\nUse the verified Python path.")
+            MarkdownMemoryNote(
+                path="execution_runbook.md",
+                content="# Execution Runbook\nUse the verified Python path.",
+            )
         ],
         next_iteration_id=1,
     )
@@ -1449,8 +1711,14 @@ def test_build_execution_handoff_exposes_verified_lane_from_markdown_memory() ->
         recent_human_interventions=[],
         lessons_learned="",
         markdown_memory=[
-            MarkdownMemoryNote(path="execution_runbook.md", content="# Execution Runbook\nUse the verified Python path."),
-            MarkdownMemoryNote(path="experiment_guide.md", content="# Experiment Guide\nBuild and run one script."),
+            MarkdownMemoryNote(
+                path="execution_runbook.md",
+                content="# Execution Runbook\nUse the verified Python path.",
+            ),
+            MarkdownMemoryNote(
+                path="experiment_guide.md",
+                content="# Experiment Guide\nBuild and run one script.",
+            ),
         ],
         next_iteration_id=1,
     )
@@ -1463,7 +1731,9 @@ def test_build_execution_handoff_exposes_verified_lane_from_markdown_memory() ->
     assert handoff["experiment_guide"].startswith("# Experiment Guide")
 
 
-def test_rejected_review_stays_in_raw_records_but_not_in_accepted_memory(tmp_path) -> None:
+def test_rejected_review_stays_in_raw_records_but_not_in_accepted_memory(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
@@ -1478,10 +1748,18 @@ def test_rejected_review_stays_in_raw_records_but_not_in_accepted_memory(tmp_pat
             ]
         ),
         executor=RoutingExperimentExecutor(
-            handlers={"train": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.3)])}
+            handlers={
+                "train": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.3)]
+                )
+            }
         ),
         reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Looks leaky.", lessons=["Need leakage check."])]
+            [
+                ReflectionSummary(
+                    assessment="Looks leaky.", lessons=["Need leakage check."]
+                )
+            ]
         ),
         review_backend=FakeReviewBackend(
             [ReviewDecision(status="rejected", reason="Do not trust this run.")]
@@ -1491,7 +1769,9 @@ def test_rejected_review_stays_in_raw_records_but_not_in_accepted_memory(tmp_pat
 
     cycle = orchestrator.run_iteration()
     snapshot = store.load_snapshot()
-    records_text = (tmp_path / "loop" / "iteration_records.jsonl").read_text(encoding="utf-8")
+    records_text = (tmp_path / "loop" / "iteration_records.jsonl").read_text(
+        encoding="utf-8"
+    )
 
     assert cycle.accepted_summary is None
     assert snapshot.latest_summary is None
@@ -1523,7 +1803,9 @@ def test_orchestrator_persists_recoverable_failures_for_next_worker(tmp_path) ->
 
     class PassingExecutor:
         def execute(self, candidate, snapshot):
-            return ExperimentOutcome(primary_metric_value=0.25, notes=["Retry succeeded."])
+            return ExperimentOutcome(
+                primary_metric_value=0.25, notes=["Retry succeeded."]
+            )
 
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
@@ -1533,8 +1815,13 @@ def test_orchestrator_persists_recoverable_failures_for_next_worker(tmp_path) ->
         ),
         reflection_backend=FakeReflectionBackend(
             [
-                ReflectionSummary(assessment="Recoverable dependency failure.", lessons=["Install sklearn first."]),
-                ReflectionSummary(assessment="Retry worked.", lessons=["Environment is now usable."]),
+                ReflectionSummary(
+                    assessment="Recoverable dependency failure.",
+                    lessons=["Install sklearn first."],
+                ),
+                ReflectionSummary(
+                    assessment="Retry worked.", lessons=["Environment is now usable."]
+                ),
             ]
         ),
         review_backend=FakeReviewBackend(
@@ -1544,10 +1831,16 @@ def test_orchestrator_persists_recoverable_failures_for_next_worker(tmp_path) ->
             ]
         ),
     )
-    orchestrator.initialize(spec=build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 2}))
+    orchestrator.initialize(
+        spec=build_spec(
+            allowed_actions=["baseline"], stop_conditions={"max_iterations": 2}
+        )
+    )
 
     first_cycle = orchestrator.run_iteration()
-    orchestrator.executor = RoutingExperimentExecutor(handlers={"baseline": PassingExecutor()})
+    orchestrator.executor = RoutingExperimentExecutor(
+        handlers={"baseline": PassingExecutor()}
+    )
     second_cycle = orchestrator.run_iteration()
 
     assert first_cycle.accepted_summary is not None
@@ -1558,7 +1851,9 @@ def test_orchestrator_persists_recoverable_failures_for_next_worker(tmp_path) ->
     assert second_cycle.accepted_summary.outcome_status == "success"
 
 
-def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(tmp_path) -> None:
+def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -1601,10 +1896,16 @@ def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(t
         worker_backend=worker,
         executor=RoutingExperimentExecutor(
             handlers={},
-            plan_executor=bootstrap_module.GenericExecutionPlanExecutor(repo_root=repo_root),
+            plan_executor=bootstrap_module.GenericExecutionPlanExecutor(
+                repo_root=repo_root
+            ),
         ),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Recovered in-place.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Recovered in-place.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         progress_fn=lambda stage, msg: progress_log.append((stage, msg)),
     )
     orchestrator.initialize(spec=spec)
@@ -1614,11 +1915,17 @@ def test_orchestrator_repairs_generic_autonomous_failure_within_same_iteration(t
     assert cycle.record.outcome.status == "success"
     assert cycle.record.outcome.primary_metric_value == 0.21
     assert len(worker.snapshots) == 2
-    assert worker.snapshots[1].recent_records[-1].outcome.status == "recoverable_failure"
-    assert any("repair within the same iteration" in message for _, message in progress_log)
+    assert (
+        worker.snapshots[1].recent_records[-1].outcome.status == "recoverable_failure"
+    )
+    assert any(
+        "repair within the same iteration" in message for _, message in progress_log
+    )
 
 
-def test_cli_interjection_appends_human_note_and_changes_future_effective_spec(tmp_path) -> None:
+def test_cli_interjection_appends_human_note_and_changes_future_effective_spec(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
 
@@ -1636,7 +1943,9 @@ def test_cli_interjection_appends_human_note_and_changes_future_effective_spec(t
     assert snapshot.effective_spec.metadata["force_next_action"] == "eda"
 
 
-def test_file_memory_store_loads_markdown_memory_and_experiment_journal(tmp_path) -> None:
+def test_file_memory_store_loads_markdown_memory_and_experiment_journal(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
     (tmp_path / "loop" / "agent_markdown").mkdir(parents=True, exist_ok=True)
@@ -1674,14 +1983,22 @@ def test_file_memory_store_loads_markdown_memory_and_experiment_journal(tmp_path
     assert "agent_markdown/ops_access_guide.md" in markdown_by_path
     assert "agent_markdown/execution_runbook.md" in markdown_by_path
     assert "agent_markdown/experiment_journal.md" in markdown_by_path
-    assert "## Iteration 1: Baseline" in markdown_by_path["agent_markdown/experiment_journal.md"]
-    assert "Do not repeat: Rerun the broken config." in markdown_by_path["agent_markdown/experiment_journal.md"]
+    assert (
+        "## Iteration 1: Baseline"
+        in markdown_by_path["agent_markdown/experiment_journal.md"]
+    )
+    assert (
+        "Do not repeat: Rerun the broken config."
+        in markdown_by_path["agent_markdown/experiment_journal.md"]
+    )
 
 
 def test_file_memory_store_still_reads_legacy_root_markdown_memory(tmp_path) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
-    (tmp_path / "loop" / "ops_access_guide.md").write_text("# Access\nLegacy location.\n", encoding="utf-8")
+    (tmp_path / "loop" / "ops_access_guide.md").write_text(
+        "# Access\nLegacy location.\n", encoding="utf-8"
+    )
 
     snapshot = store.load_snapshot()
     markdown_by_path = {note.path: note.content for note in snapshot.markdown_memory}
@@ -1727,7 +2044,11 @@ def test_worker_backend_sends_markdown_memory_to_completion() -> None:
         recent_summaries=[],
         recent_human_interventions=[],
         lessons_learned="Do not repeat the broken deploy path.",
-        markdown_memory=[MarkdownMemoryNote(path="ops_access_guide.md", content="# Access\nUse token auth.")],
+        markdown_memory=[
+            MarkdownMemoryNote(
+                path="ops_access_guide.md", content="# Access\nUse token auth."
+            )
+        ],
         next_iteration_id=1,
     )
 
@@ -1760,8 +2081,13 @@ def test_worker_payload_carries_autonomous_execution_mode() -> None:
             ]
         }
 
-    worker = bootstrap_module.LiteLLMWorkerBackend(model="openai/gpt-5.4", completion_fn=completion_fn)
-    spec = build_spec(allowed_actions=["baseline"], metadata={"execution_mode": "autonomous_after_bootstrap"})
+    worker = bootstrap_module.LiteLLMWorkerBackend(
+        model="openai/gpt-5.4", completion_fn=completion_fn
+    )
+    spec = build_spec(
+        allowed_actions=["baseline"],
+        metadata={"execution_mode": "autonomous_after_bootstrap"},
+    )
     snapshot = MemorySnapshot(
         spec=spec,
         effective_spec=spec,
@@ -1778,10 +2104,15 @@ def test_worker_payload_carries_autonomous_execution_mode() -> None:
 
     worker.propose_next_experiment(snapshot)
 
-    assert captured_payload["payload"]["effective_spec"]["metadata"]["execution_mode"] == "autonomous_after_bootstrap"
+    assert (
+        captured_payload["payload"]["effective_spec"]["metadata"]["execution_mode"]
+        == "autonomous_after_bootstrap"
+    )
 
 
-def test_loopforge_bootstrap_passes_existing_markdown_memory(tmp_path, monkeypatch) -> None:
+def test_loopforge_bootstrap_passes_existing_markdown_memory(
+    tmp_path, monkeypatch
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     store.initialize(build_spec())
     (tmp_path / "loop" / "agent_markdown").mkdir(parents=True, exist_ok=True)
@@ -1805,14 +2136,19 @@ def test_loopforge_bootstrap_passes_existing_markdown_memory(tmp_path, monkeypat
                 assistant_message="Ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
-                    recommended_spec=build_spec(objective=user_goal, allowed_actions=["baseline"]),
+                    recommended_spec=build_spec(
+                        objective=user_goal, allowed_actions=["baseline"]
+                    ),
                     questions=[],
                 ),
                 role_models=bootstrap_module.default_role_models(),
                 ready_to_start=False,
             )
 
-    monkeypatch.setattr("loopforge.bootstrap.discover_capabilities_for_objective", lambda **kwargs: CapabilityContext())
+    monkeypatch.setattr(
+        "loopforge.bootstrap.discover_capabilities_for_objective",
+        lambda **kwargs: CapabilityContext(),
+    )
     monkeypatch.setattr("loopforge.bootstrap.run_preflight_checks", lambda **kwargs: [])
 
     app = Loopforge(
@@ -1829,13 +2165,24 @@ def test_loopforge_bootstrap_passes_existing_markdown_memory(tmp_path, monkeypat
     assert captured["bootstrap_memory"] == {}
 
 
-def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_path, monkeypatch) -> None:
-    spec = build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1})
+def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(
+    tmp_path, monkeypatch
+) -> None:
+    spec = build_spec(
+        allowed_actions=["baseline"], stop_conditions={"max_iterations": 1}
+    )
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
 
     class StubWorker:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def propose_next_experiment(self, snapshot):
@@ -1847,39 +2194,72 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
             )
 
     class StubReflection:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def reflect(self, snapshot, candidate, outcome):
-            return ReflectionSummary(assessment="Baseline is fine.", lessons=["Keep this baseline."])
+            return ReflectionSummary(
+                assessment="Baseline is fine.", lessons=["Keep this baseline."]
+            )
 
     class StubReview:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def review(self, snapshot, candidate, outcome, reflection):
             return ReviewDecision(status="accepted", reason="Approved into memory.")
 
     class StubNarration:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def summarize_bootstrap(self, turn, capability_context):
             return "bootstrap update"
 
-        def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        def summarize_iteration(
+            self, snapshot, candidate, outcome, reflection, review, accepted_summary
+        ):
             return "iteration update"
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.39)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.39)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(
                 available_actions={"baseline": "Run baseline"},
                 available_entities={"model_keys": ["pass_outcome"]},
                 available_data_assets=["gold_cross_validated_pass_outcome_ncaaf"],
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -1901,13 +2281,22 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
     assert results[0]["human_update"] == "iteration update"
 
 
-def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, monkeypatch) -> None:
+def test_run_from_spec_uses_configured_repo_root_for_generic_executor(
+    tmp_path, monkeypatch
+) -> None:
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(build_spec().to_dict()), encoding="utf-8")
     captured_repo_roots: list[Path] = []
 
     class StubWorker:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def propose_next_experiment(self, snapshot):
@@ -1919,27 +2308,50 @@ def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, 
             )
 
     class StubReflection:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def reflect(self, snapshot, candidate, outcome):
             return ReflectionSummary(assessment="Baseline is fine.")
 
     class StubReview:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def review(self, snapshot, candidate, outcome, reflection):
             return ReviewDecision(status="accepted", reason="Approved into memory.")
 
     class StubNarration:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def summarize_bootstrap(self, turn, capability_context):
             return "bootstrap update"
 
-        def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        def summarize_iteration(
+            self, snapshot, candidate, outcome, reflection, review, accepted_summary
+        ):
             return "iteration update"
 
     class CapturingPlanExecutor:
@@ -1951,12 +2363,20 @@ def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, 
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.39)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.39)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(
                 available_actions={"baseline": "Run baseline"},
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -1965,7 +2385,9 @@ def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, 
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor)
+    monkeypatch.setattr(
+        "loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor
+    )
 
     run_from_spec(
         spec_path=spec_path,
@@ -1978,13 +2400,22 @@ def test_run_from_spec_uses_configured_repo_root_for_generic_executor(tmp_path, 
     assert captured_repo_roots == [tmp_path / "repo"]
 
 
-def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_path, monkeypatch) -> None:
+def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(
+    tmp_path, monkeypatch
+) -> None:
     spec_path = tmp_path / "spec.json"
     spec_path.write_text(json.dumps(build_spec().to_dict()), encoding="utf-8")
     captured_fix_backends = []
 
     class StubWorker:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def propose_next_experiment(self, snapshot):
@@ -1996,31 +2427,56 @@ def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_pat
             )
 
     class StubReflection:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def reflect(self, snapshot, candidate, outcome):
             return ReflectionSummary(assessment="Baseline is fine.")
 
     class StubReview:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def review(self, snapshot, candidate, outcome, reflection):
             return ReviewDecision(status="accepted", reason="Approved into memory.")
 
     class StubNarration:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def summarize_bootstrap(self, turn, capability_context):
             return "bootstrap update"
 
-        def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        def summarize_iteration(
+            self, snapshot, candidate, outcome, reflection, review, accepted_summary
+        ):
             return "iteration update"
 
     class CapturingPlanExecutor:
-        def __init__(self, *, repo_root: Path | str, fix_backend=None, **kwargs) -> None:
+        def __init__(
+            self, *, repo_root: Path | str, fix_backend=None, **kwargs
+        ) -> None:
             captured_fix_backends.append(fix_backend)
 
         def execute(self, candidate, snapshot):
@@ -2028,12 +2484,20 @@ def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_pat
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.39)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.39)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(
                 available_actions={"baseline": "Run baseline"},
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -2042,7 +2506,9 @@ def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_pat
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
-    monkeypatch.setattr("loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor)
+    monkeypatch.setattr(
+        "loopforge.bootstrap.GenericExecutionPlanExecutor", CapturingPlanExecutor
+    )
 
     run_from_spec(
         spec_path=spec_path,
@@ -2056,7 +2522,9 @@ def test_run_from_spec_wires_execution_fix_backend_into_generic_executor(tmp_pat
     assert captured_fix_backends[0] is not None
 
 
-def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_executor(tmp_path, monkeypatch, capsys) -> None:
+def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_executor(
+    tmp_path, monkeypatch, capsys
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     spec = build_spec(
@@ -2069,7 +2537,14 @@ def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_execut
     spec_path.write_text(json.dumps(spec.to_dict()), encoding="utf-8")
 
     class StubWorker:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def propose_next_experiment(self, snapshot):
@@ -2093,27 +2568,50 @@ def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_execut
             )
 
     class StubReflection:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def reflect(self, snapshot, candidate, outcome):
             return ReflectionSummary(assessment="First iteration succeeded.")
 
     class StubReview:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def review(self, snapshot, candidate, outcome, reflection):
             return ReviewDecision(status="accepted", reason="ok")
 
     class StubNarration:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def summarize_bootstrap(self, turn, capability_context):
             return "bootstrap update"
 
-        def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        def summarize_iteration(
+            self, snapshot, candidate, outcome, reflection, review, accepted_summary
+        ):
             return "iteration update"
 
     def fake_factory(spec, memory_root: Path):
@@ -2123,14 +2621,22 @@ def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_execut
                 environment_facts={
                     "execution_backend_kind": "generic_agentic",
                     "autonomous_execution_supported": True,
-                    "execution_shell": "cmd.exe" if sys.platform.startswith("win") else "/bin/sh",
-                    "shell_family": "windows_cmd" if sys.platform.startswith("win") else "posix_sh",
+                    "execution_shell": "cmd.exe"
+                    if sys.platform.startswith("win")
+                    else "/bin/sh",
+                    "shell_family": "windows_cmd"
+                    if sys.platform.startswith("win")
+                    else "posix_sh",
                     "repo_root": str(repo_root),
                     "python_executable": sys.executable,
                 }
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Generic autonomous executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Generic autonomous executor is configured.",
+                )
             ],
         )
 
@@ -2163,7 +2669,9 @@ def test_cli_main_run_succeeds_on_first_iteration_with_generic_autonomous_execut
     assert payload[0]["record"]["outcome"]["primary_metric_value"] == 0.18
 
 
-def test_run_from_spec_blocks_invalid_metric_goal_before_execution(tmp_path, monkeypatch) -> None:
+def test_run_from_spec_blocks_invalid_metric_goal_before_execution(
+    tmp_path, monkeypatch
+) -> None:
     spec = build_spec(
         allowed_actions=["baseline"],
         primary_metric=PrimaryMetric(name="mae", goal="unspecified"),
@@ -2174,10 +2682,18 @@ def test_run_from_spec_blocks_invalid_metric_goal_before_execution(tmp_path, mon
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.39)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.39)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -2196,15 +2712,21 @@ def test_run_from_spec_blocks_invalid_metric_goal_before_execution(tmp_path, mon
         assert "mae" in str(exc)
 
 
-def test_discover_capabilities_for_objective_prefers_discovery_provider(tmp_path, monkeypatch) -> None:
+def test_discover_capabilities_for_objective_prefers_discovery_provider(
+    tmp_path, monkeypatch
+) -> None:
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
             handlers={},
             capability_provider=lambda effective_spec: CapabilityContext(
-                available_metrics={"fallback_metric": {"scorer_ref": "metrics.fallback"}}
+                available_metrics={
+                    "fallback_metric": {"scorer_ref": "metrics.fallback"}
+                }
             ),
             discovery_provider=lambda objective: CapabilityContext(
-                available_metrics={"precision_floor": {"scorer_ref": "metrics.precision_floor"}},
+                available_metrics={
+                    "precision_floor": {"scorer_ref": "metrics.precision_floor"}
+                },
                 notes=[f"objective={objective}"],
             ),
         )
@@ -2217,11 +2739,16 @@ def test_discover_capabilities_for_objective_prefers_discovery_provider(tmp_path
         executor_factory_path="fake.module:factory",
     )
 
-    assert context.available_metrics["precision_floor"]["scorer_ref"] == "metrics.precision_floor"
+    assert (
+        context.available_metrics["precision_floor"]["scorer_ref"]
+        == "metrics.precision_floor"
+    )
     assert "objective=Keep precision high." in context.notes
 
 
-def test_discover_capabilities_for_objective_exposes_execution_shell_facts(tmp_path, monkeypatch) -> None:
+def test_discover_capabilities_for_objective_exposes_execution_shell_facts(
+    tmp_path, monkeypatch
+) -> None:
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
             handlers={},
@@ -2243,7 +2770,9 @@ def test_discover_capabilities_for_objective_exposes_execution_shell_facts(tmp_p
     assert any("Runtime platform:" in note for note in context.notes)
 
 
-def test_discover_capabilities_for_objective_loads_real_repo_data_files(tmp_path, monkeypatch) -> None:
+def test_discover_capabilities_for_objective_loads_real_repo_data_files(
+    tmp_path, monkeypatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     data_dir = repo_root / "examples" / "lol" / "data"
@@ -2272,8 +2801,13 @@ def test_discover_capabilities_for_objective_loads_real_repo_data_files(tmp_path
     )
 
     assert "examples/lol/data/matches.csv" in context.available_data_assets
-    assert any(schema.asset_path == "examples/lol/data/matches.csv" and schema.columns for schema in context.data_schemas)
-    assert any("Data probe (examples/lol/data/matches.csv)" in note for note in context.notes)
+    assert any(
+        schema.asset_path == "examples/lol/data/matches.csv" and schema.columns
+        for schema in context.data_schemas
+    )
+    assert any(
+        "Data probe (examples/lol/data/matches.csv)" in note for note in context.notes
+    )
 
 
 def test_normalise_probe_value_serializes_timestamp_like_objects() -> None:
@@ -2286,7 +2820,9 @@ def test_normalise_probe_value_serializes_timestamp_like_objects() -> None:
     assert value == "2026-04-03T12:34:56"
 
 
-def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(
+    tmp_path, monkeypatch
+) -> None:
     asset_path = tmp_path / "matches.parquet"
     asset_path.write_text("placeholder", encoding="utf-8")
 
@@ -2321,7 +2857,7 @@ def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(tmp_
             self.num_rows = len(rows)
 
         def slice(self, offset: int, length: int):
-            return FakeArrowTable(self._rows[offset:offset + length])
+            return FakeArrowTable(self._rows[offset : offset + length])
 
         def to_pandas(self) -> FakeDataFrame:
             return FakeDataFrame(self._rows)
@@ -2329,7 +2865,10 @@ def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(tmp_
     class FakeParquetFile:
         def __init__(self, path: Path) -> None:
             assert path == asset_path
-            self._rows = [{"kills": index % 9, "playername": f"player-{index}"} for index in range(123)]
+            self._rows = [
+                {"kills": index % 9, "playername": f"player-{index}"}
+                for index in range(123)
+            ]
             self.metadata = type("Meta", (), {"num_rows": len(self._rows)})()
             self.num_row_groups = 1
 
@@ -2342,7 +2881,11 @@ def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(tmp_
     fake_parquet.ParquetFile = FakeParquetFile
     fake_pyarrow.parquet = fake_parquet
 
-    monkeypatch.setitem(sys.modules, "pandas", type("FakePandasModule", (), {"DataFrame": FakeDataFrame}))
+    monkeypatch.setitem(
+        sys.modules,
+        "pandas",
+        type("FakePandasModule", (), {"DataFrame": FakeDataFrame}),
+    )
     monkeypatch.setitem(sys.modules, "pyarrow", fake_pyarrow)
     monkeypatch.setitem(sys.modules, "pyarrow.parquet", fake_parquet)
 
@@ -2355,7 +2898,9 @@ def test_probe_data_asset_reports_full_parquet_row_count_even_when_sampling(tmp_
     assert schema.sample_values["kills"] == [0, 1, 2, 3, 4]
 
 
-def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(
+    tmp_path, monkeypatch
+) -> None:
     asset_path = tmp_path / "matches.csv"
     asset_path.write_text("kills\n1\n", encoding="utf-8")
 
@@ -2376,7 +2921,9 @@ def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(t
     assert elapsed < 0.15
 
 
-def test_probe_data_asset_skips_new_probe_while_timed_out_probe_is_still_running(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_skips_new_probe_while_timed_out_probe_is_still_running(
+    tmp_path, monkeypatch
+) -> None:
     first_asset = tmp_path / "first.csv"
     second_asset = tmp_path / "second.csv"
     first_asset.write_text("kills\n1\n", encoding="utf-8")
@@ -2396,11 +2943,17 @@ def test_probe_data_asset_skips_new_probe_while_timed_out_probe_is_still_running
     second_schema = bootstrap_module._probe_data_asset(str(second_asset), tmp_path)
 
     assert first_schema.load_error == "Probe timed out after 0.01s"
-    assert second_schema.load_error is None or "timed out" in second_schema.load_error or "Probe skipped" in second_schema.load_error
+    assert (
+        second_schema.load_error is None
+        or "timed out" in second_schema.load_error
+        or "Probe skipped" in second_schema.load_error
+    )
     time.sleep(0.25)
 
 
-def test_probe_data_asset_skips_reprobe_for_same_asset_while_previous_timeout_is_still_running(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_skips_reprobe_for_same_asset_while_previous_timeout_is_still_running(
+    tmp_path, monkeypatch
+) -> None:
     asset_path = tmp_path / "matches.csv"
     asset_path.write_text("kills\n1\n", encoding="utf-8")
 
@@ -2418,11 +2971,16 @@ def test_probe_data_asset_skips_reprobe_for_same_asset_while_previous_timeout_is
     second_schema = bootstrap_module._probe_data_asset(str(asset_path), tmp_path)
 
     assert first_schema.load_error == "Probe timed out after 0.01s"
-    assert second_schema.load_error == "Probe skipped because a previous timed-out probe is still running for this asset."
+    assert (
+        second_schema.load_error
+        == "Probe skipped because a previous timed-out probe is still running for this asset."
+    )
     time.sleep(0.25)
 
 
-def test_lol_preflight_treats_missing_installable_dependency_as_setup_step(monkeypatch, tmp_path) -> None:
+def test_lol_preflight_treats_missing_installable_dependency_as_setup_step(
+    monkeypatch, tmp_path
+) -> None:
     repo_root = tmp_path / "player-performance-ratings"
     (repo_root / "examples" / "lol" / "data").mkdir(parents=True)
     (repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet").write_text(
@@ -2433,11 +2991,15 @@ def test_lol_preflight_treats_missing_installable_dependency_as_setup_step(monke
     def raise_missing_dependency(_repo_root):
         raise ModuleNotFoundError("No module named 'lightgbm'")
 
-    monkeypatch.setattr(pilot_adapters_module, "_load_lol_modules", raise_missing_dependency)
+    monkeypatch.setattr(
+        pilot_adapters_module, "_load_lol_modules", raise_missing_dependency
+    )
 
     checks = pilot_adapters_module._lol_preflight(repo_root)
 
-    runtime_check = next(check for check in checks if check.name == "lol_runtime_imports")
+    runtime_check = next(
+        check for check in checks if check.name == "lol_runtime_imports"
+    )
     assert runtime_check.status == "failed"
     assert runtime_check.required is False
     assert runtime_check.scope == "setup"
@@ -2456,7 +3018,9 @@ def test_complete_json_tolerates_datetime_payloads() -> None:
         completion_fn=fake_completion,
     )
 
-    result = backend._complete_json("test", {"seen_at": datetime(2026, 4, 3, 12, 34, 56)})
+    result = backend._complete_json(
+        "test", {"seen_at": datetime(2026, 4, 3, 12, 34, 56)}
+    )
 
     assert result == {"ok": True}
     assert "2026-04-03T12:34:56" in captured["messages"][1]["content"]
@@ -2473,14 +3037,28 @@ def test_sanitize_human_text_makes_console_unsafe_characters_safe(monkeypatch) -
     assert sanitized == "Baseline -> EDA ... ready"
 
 
-def test_draft_spec_returns_metric_questions_and_recommended_spec(tmp_path, monkeypatch) -> None:
+def test_draft_spec_returns_metric_questions_and_recommended_spec(
+    tmp_path, monkeypatch
+) -> None:
     class StubSpecBackend:
-        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs) -> None:
+        def __init__(
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
+        ) -> None:
             self.model = model
 
         def propose_spec(self, objective, capability_context, user_preferences=None):
-            assert capability_context.available_metrics["recall_at_p90"]["scorer_ref"] == "metrics.recall_at_p90"
-            assert user_preferences == {"custom_primary_scorer": "metrics.recall_at_p90"}
+            assert (
+                capability_context.available_metrics["recall_at_p90"]["scorer_ref"]
+                == "metrics.recall_at_p90"
+            )
+            assert user_preferences == {
+                "custom_primary_scorer": "metrics.recall_at_p90"
+            }
             return ExperimentSpecProposal(
                 objective=objective,
                 recommended_spec=ExperimentSpec(
@@ -2516,7 +3094,9 @@ def test_draft_spec_returns_metric_questions_and_recommended_spec(tmp_path, monk
                         options=["yes", "no"],
                     )
                 ],
-                notes=["Discovered scorer metrics.recall_at_p90 from the host codebase."],
+                notes=[
+                    "Discovered scorer metrics.recall_at_p90 from the host codebase."
+                ],
             )
 
     def fake_factory(spec, memory_root: Path):
@@ -2546,16 +3126,25 @@ def test_draft_spec_returns_metric_questions_and_recommended_spec(tmp_path, monk
     assert proposal.recommended_spec.primary_metric.name == "recall_at_p90"
     assert proposal.recommended_spec.guardrail_metrics[0].name == "precision_floor"
     assert proposal.questions[0].key == "primary_metric_confirmation"
-    assert proposal.notes == ["Discovered scorer metrics.recall_at_p90 from the host codebase."]
+    assert proposal.notes == [
+        "Discovered scorer metrics.recall_at_p90 from the host codebase."
+    ]
 
 
-def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, monkeypatch) -> None:
+def test_loopforge_bootstrap_returns_questions_and_preflight_failures(
+    tmp_path, monkeypatch
+) -> None:
     access_advisor = FakeAccessAdvisorBackend()
     narrator = FakeNarrationBackend()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
-            assert capability_context.available_metrics["fraud_recall"]["scorer_ref"] == "metrics.fraud_recall"
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
+            assert (
+                capability_context.available_metrics["fraud_recall"]["scorer_ref"]
+                == "metrics.fraud_recall"
+            )
             assert role_models.worker == "openai/gpt-5.4"
             return BootstrapTurn(
                 assistant_message="I need one more confirmation before starting.",
@@ -2586,7 +3175,9 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
         return AdapterSetup(
             handlers={},
             discovery_provider=lambda objective: CapabilityContext(
-                available_metrics={"fraud_recall": {"scorer_ref": "metrics.fraud_recall"}},
+                available_metrics={
+                    "fraud_recall": {"scorer_ref": "metrics.fraud_recall"}
+                },
                 available_data_assets=["fraud_training_set"],
             ),
             preflight_provider=lambda effective_spec, capability_context: [
@@ -2621,7 +3212,11 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
     assert turn.human_update is not None
     assert "bootstrap:Improve fraud detection recall." in turn.human_update
     assert "Access guide:" in turn.human_update
-    assert Path(turn.access_guide_path).read_text(encoding="utf-8").startswith("# Access Guide")
+    assert (
+        Path(turn.access_guide_path)
+        .read_text(encoding="utf-8")
+        .startswith("# Access Guide")
+    )
     runbook_path = tmp_path / "memory" / "agent_markdown" / "execution_runbook.md"
     assert runbook_path.exists()
     assert "Execution Runbook" in runbook_path.read_text(encoding="utf-8")
@@ -2629,16 +3224,22 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
     assert len(narrator.bootstrap_calls) == 1
 
 
-def test_loopforge_bootstrap_marks_turn_ready_when_no_hard_requirements_remain(tmp_path, monkeypatch) -> None:
+def test_loopforge_bootstrap_marks_turn_ready_when_no_hard_requirements_remain(
+    tmp_path, monkeypatch
+) -> None:
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Plan is concrete.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["baseline"],
                     ),
                     questions=[],
@@ -2647,7 +3248,10 @@ def test_loopforge_bootstrap_marks_turn_ready_when_no_hard_requirements_remain(t
                 ready_to_start=False,
             )
 
-    monkeypatch.setattr("loopforge.bootstrap.discover_capabilities_for_objective", lambda **kwargs: CapabilityContext())
+    monkeypatch.setattr(
+        "loopforge.bootstrap.discover_capabilities_for_objective",
+        lambda **kwargs: CapabilityContext(),
+    )
     monkeypatch.setattr(
         "loopforge.bootstrap.run_preflight_checks",
         lambda **kwargs: [
@@ -2697,7 +3301,9 @@ def test_bootstrap_sanitises_internal_adapter_questions() -> None:
     assert [question.key for question in sanitised] == ["primary_metric_confirmation"]
 
 
-def test_refine_bootstrap_questions_keeps_all_required_questions_and_adds_optional_context() -> None:
+def test_refine_bootstrap_questions_keeps_all_required_questions_and_adds_optional_context() -> (
+    None
+):
     questions = [
         SpecQuestion(
             key="position_handling",
@@ -2714,7 +3320,10 @@ def test_refine_bootstrap_questions_keeps_all_required_questions_and_adds_option
     refined = refine_bootstrap_questions(questions, answers={})
 
     # All agent-proposed questions are kept — the agent decides what to ask, code doesn't inject extras
-    assert [q.key for q in refined] == ["position_handling", "primary_metric_confirmation"]
+    assert [q.key for q in refined] == [
+        "position_handling",
+        "primary_metric_confirmation",
+    ]
 
 
 def test_run_preflight_checks_blocks_unspecified_metric_goal(tmp_path) -> None:
@@ -2727,7 +3336,9 @@ def test_run_preflight_checks_blocks_unspecified_metric_goal(tmp_path) -> None:
         executor_factory_path=None,
     )
 
-    invalid_goal_check = next(check for check in checks if check.name == "metric_goal_unspecified")
+    invalid_goal_check = next(
+        check for check in checks if check.name == "metric_goal_unspecified"
+    )
 
     assert invalid_goal_check.status == "failed"
     assert "mae" in invalid_goal_check.detail
@@ -2759,13 +3370,19 @@ def test_run_preflight_checks_verifies_generic_execution_lane(tmp_path) -> None:
     assert "Verified the generic autonomous execution lane" in checks[-1].detail
 
 
-def test_apply_answers_to_bootstrap_turn_stores_answers_and_clears_answer_blockers() -> None:
+def test_apply_answers_to_bootstrap_turn_stores_answers_and_clears_answer_blockers() -> (
+    None
+):
     turn = BootstrapTurn(
         assistant_message="Need one answer.",
         proposal=ExperimentSpecProposal(
             objective="Improve LoL kills model.",
             recommended_spec=build_spec(objective="Improve LoL kills model."),
-            questions=[SpecQuestion(key="target_binning", prompt="Cap at 7+ or 10+?", required=True)],
+            questions=[
+                SpecQuestion(
+                    key="target_binning", prompt="Cap at 7+ or 10+?", required=True
+                )
+            ],
             notes=[],
         ),
         role_models=bootstrap_module.default_role_models(),
@@ -2774,11 +3391,18 @@ def test_apply_answers_to_bootstrap_turn_stores_answers_and_clears_answer_blocke
         missing_requirements=["answer:target_binning"],
     )
 
-    updated = apply_answers_to_bootstrap_turn(turn, answers={"target_binning": "Cap at 10+"})
+    updated = apply_answers_to_bootstrap_turn(
+        turn, answers={"target_binning": "Cap at 10+"}
+    )
 
     assert updated.ready_to_start is True
     assert updated.missing_requirements == []
-    assert updated.proposal.recommended_spec.metadata["bootstrap_answers"]["target_binning"] == "Cap at 10+"
+    assert (
+        updated.proposal.recommended_spec.metadata["bootstrap_answers"][
+            "target_binning"
+        ]
+        == "Cap at 10+"
+    )
 
 
 def test_apply_feedback_preserves_previous_bootstrap_answers(tmp_path) -> None:
@@ -2798,7 +3422,11 @@ def test_apply_feedback_preserves_previous_bootstrap_answers(tmp_path) -> None:
                 build_spec(objective="Improve LoL kills model."),
                 metadata={"bootstrap_answers": {"target_binning": "Cap at 10+"}},
             ),
-            questions=[SpecQuestion(key="target_binning", prompt="Cap at 7+ or 10+?", required=True)],
+            questions=[
+                SpecQuestion(
+                    key="target_binning", prompt="Cap at 7+ or 10+?", required=True
+                )
+            ],
             notes=[],
         ),
         role_models=bootstrap_module.default_role_models(),
@@ -2817,7 +3445,12 @@ def test_apply_feedback_preserves_previous_bootstrap_answers(tmp_path) -> None:
     assert updated is not None
     assert updated.ready_to_start is True
     assert updated.missing_requirements == []
-    assert updated.proposal.recommended_spec.metadata["bootstrap_answers"]["target_binning"] == "Cap at 10+"
+    assert (
+        updated.proposal.recommended_spec.metadata["bootstrap_answers"][
+            "target_binning"
+        ]
+        == "Cap at 10+"
+    )
     assert updated.proposal.recommended_spec.constraints["max_runtime_minutes"] == 45
 
 
@@ -2886,9 +3519,18 @@ def test_print_plan_summary_uses_user_facing_next_step_summary() -> None:
             objective="Improve the LoL kills model.",
             recommended_spec=ExperimentSpec(
                 objective="Improve the LoL kills model.",
-                primary_metric=PrimaryMetric(name="ordinal_loss_scorer", goal="minimize"),
-                allowed_actions=["predict", "eda", "targeted_tune", "test_bad_helper_name"],
-                guardrail_metrics=[MetricSpec(name="calibration_error", goal="minimize")],
+                primary_metric=PrimaryMetric(
+                    name="ordinal_loss_scorer", goal="minimize"
+                ),
+                allowed_actions=[
+                    "predict",
+                    "eda",
+                    "targeted_tune",
+                    "test_bad_helper_name",
+                ],
+                guardrail_metrics=[
+                    MetricSpec(name="calibration_error", goal="minimize")
+                ],
                 secondary_metrics=[MetricSpec(name="mae", goal="minimize")],
             ),
         ),
@@ -2900,21 +3542,29 @@ def test_print_plan_summary_uses_user_facing_next_step_summary() -> None:
 
     joined = "\n".join(outputs)
     assert "test_bad_helper_name" not in joined
-    assert "choose among the discovered actions: predict, eda, targeted_tune, and 1 more" in joined
+    assert (
+        "choose among the discovered actions: predict, eda, targeted_tune, and 1 more"
+        in joined
+    )
     assert "Ordinal Loss Scorer" in joined
 
 
-
-def test_loopforge_blocks_autonomous_start_without_execution_preflight(tmp_path, monkeypatch) -> None:
+def test_loopforge_blocks_autonomous_start_without_execution_preflight(
+    tmp_path, monkeypatch
+) -> None:
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="The plan is clear.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="fraud_recall", goal="maximize"
+                        ),
                         allowed_actions=["train"],
                     ),
                 ),
@@ -2924,7 +3574,11 @@ def test_loopforge_blocks_autonomous_start_without_execution_preflight(tmp_path,
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"train": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.5)])},
+            handlers={
+                "train": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.5)]
+                )
+            },
             discovery_provider=lambda objective: CapabilityContext(
                 available_data_assets=["fraud_training_set"],
             ),
@@ -2948,9 +3602,13 @@ def test_loopforge_blocks_autonomous_start_without_execution_preflight(tmp_path,
     assert turn.preflight_checks[1].scope == "execution"
 
 
-def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path, monkeypatch) -> None:
+def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(
+    tmp_path, monkeypatch
+) -> None:
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             assert answer_history == {"positive_label_definition": "chargeback_60d"}
             return BootstrapTurn(
                 assistant_message="Configuration is specific enough to start.",
@@ -2958,7 +3616,9 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="fraud_recall", goal="maximize"
+                        ),
                         allowed_actions=["baseline"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -2978,7 +3638,11 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.55)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.55)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(
                 available_actions={"baseline": "Run baseline"},
                 available_data_assets=["fraud_training_set"],
@@ -3006,8 +3670,12 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(
@@ -3021,21 +3689,30 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
     assert role_models["reflection"] == "openai/gpt-5.4"
     assert role_models["review"] == "openai/gpt-5.4"
     assert result["results"][0]["accepted_summary"]["primary_metric_value"] == 0.55
-    assert "bootstrap:Improve fraud detection recall." in result["bootstrap"]["human_update"]
+    assert (
+        "bootstrap:Improve fraud detection recall."
+        in result["bootstrap"]["human_update"]
+    )
     assert result["bootstrap"]["access_guide_path"].endswith("ops_access_guide.md")
     assert result["results"][0]["human_update"] == "iteration:baseline:accepted"
 
 
-def test_loopforge_start_returns_blocked_when_execution_raises(tmp_path, monkeypatch) -> None:
+def test_loopforge_start_returns_blocked_when_execution_raises(
+    tmp_path, monkeypatch
+) -> None:
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Ready to start.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="fraud_recall", goal="maximize"
+                        ),
                         allowed_actions=["baseline"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -3055,7 +3732,9 @@ def test_loopforge_start_returns_blocked_when_execution_raises(tmp_path, monkeyp
 
     class RaisingExecutor:
         def execute(self, candidate, snapshot):
-            raise RuntimeError("PermissionError: [WinError 5] Access is denied while creating multiprocessing resources.")
+            raise RuntimeError(
+                "PermissionError: [WinError 5] Access is denied while creating multiprocessing resources."
+            )
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
@@ -3063,7 +3742,11 @@ def test_loopforge_start_returns_blocked_when_execution_raises(tmp_path, monkeyp
             discovery_provider=lambda objective: CapabilityContext(),
             capability_provider=lambda effective_spec: CapabilityContext(),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -3077,16 +3760,26 @@ def test_loopforge_start_returns_blocked_when_execution_raises(tmp_path, monkeyp
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Improve fraud detection recall.")
 
     assert result["status"] == "started"
     assert result["results"][0]["record"]["outcome"]["status"] == "recoverable_failure"
-    assert result["results"][0]["record"]["outcome"]["failure_type"] == "MultiprocessingPermissionError"
-    assert "worker count reduced to 1" in result["results"][0]["record"]["outcome"]["recovery_actions"][0]
+    assert (
+        result["results"][0]["record"]["outcome"]["failure_type"]
+        == "MultiprocessingPermissionError"
+    )
+    assert (
+        "worker count reduced to 1"
+        in result["results"][0]["record"]["outcome"]["recovery_actions"][0]
+    )
 
 
 def test_synthesize_auto_adapter_creates_loadable_reusable_factory(tmp_path) -> None:
@@ -3123,7 +3816,9 @@ def test_synthesize_auto_adapter_creates_loadable_reusable_factory(tmp_path) -> 
     assert Path(factory_path.rsplit(":", maxsplit=1)[0]).exists()
 
 
-def test_loopforge_bootstrap_uses_planning_only_discovery_when_runner_missing(tmp_path) -> None:
+def test_loopforge_bootstrap_uses_planning_only_discovery_when_runner_missing(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "credit_metrics.py").write_text(
@@ -3136,11 +3831,25 @@ def test_loopforge_bootstrap_uses_planning_only_discovery_when_runner_missing(tm
     )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
-            assert capability_context.environment_facts["execution_backend_kind"] == "generic_agentic"
-            assert capability_context.environment_facts["autonomous_execution_supported"] is True
-            assert "run_experiment" in capability_context.environment_facts["generic_autonomous_actions"]
-            assert capability_context.available_actions["run_experiment"] == "generic_autonomous_executor"
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
+            assert (
+                capability_context.environment_facts["execution_backend_kind"]
+                == "generic_agentic"
+            )
+            assert (
+                capability_context.environment_facts["autonomous_execution_supported"]
+                is True
+            )
+            assert (
+                "run_experiment"
+                in capability_context.environment_facts["generic_autonomous_actions"]
+            )
+            assert (
+                capability_context.available_actions["run_experiment"]
+                == "generic_autonomous_executor"
+            )
             assert "precision_guardrail_metric" in capability_context.available_metrics
             return BootstrapTurn(
                 assistant_message="Generic autonomous discovery is available.",
@@ -3177,12 +3886,17 @@ def test_loopforge_bootstrap_uses_planning_only_discovery_when_runner_missing(tm
 
     assert app.executor_factory_path is None
     assert turn.ready_to_start is True
-    assert turn.proposal.recommended_spec.metadata["execution_backend_kind"] == "generic_agentic"
+    assert (
+        turn.proposal.recommended_spec.metadata["execution_backend_kind"]
+        == "generic_agentic"
+    )
     assert "preflight:repo_execution_not_supported" not in turn.missing_requirements
     assert not (tmp_path / "memory" / "generated").exists()
 
 
-def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_available(tmp_path) -> None:
+def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_available(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
@@ -3190,7 +3904,9 @@ def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_av
         def __init__(self) -> None:
             self.calls = 0
 
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             self.calls += 1
             return BootstrapTurn(
                 assistant_message="Planning-only discovery is available.",
@@ -3198,10 +3914,18 @@ def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_av
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="primary_metric", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="primary_metric", goal="maximize"
+                        ),
                         allowed_actions=["inspect_data"],
                     ),
-                    questions=[SpecQuestion(key="data_size", prompt="How large is the dataset?", required=False)],
+                    questions=[
+                        SpecQuestion(
+                            key="data_size",
+                            prompt="How large is the dataset?",
+                            required=False,
+                        )
+                    ],
                 ),
                 role_models=role_models,
                 ready_to_start=True,
@@ -3228,7 +3952,9 @@ def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_av
     )
 
     first_turn = app.bootstrap(user_goal="Protect approval precision.")
-    second_turn = app.bootstrap(user_goal="Protect approval precision.", answers={"data_size": "12000 rows"})
+    second_turn = app.bootstrap(
+        user_goal="Protect approval precision.", answers={"data_size": "12000 rows"}
+    )
 
     assert first_turn.ready_to_start is True
     assert second_turn.ready_to_start is True
@@ -3236,21 +3962,32 @@ def test_loopforge_does_not_attempt_runner_authoring_when_generic_executor_is_av
     assert bootstrap_backend.calls == 2
 
 
-def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(tmp_path) -> None:
+def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    (repo_root / "metrics.py").write_text("def ordinal_loss():\n    return 0.0\n", encoding="utf-8")
+    (repo_root / "metrics.py").write_text(
+        "def ordinal_loss():\n    return 0.0\n", encoding="utf-8"
+    )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
-            assert capability_context.environment_facts["runner_kind"] == "generic_agentic_executor"
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
+            assert (
+                capability_context.environment_facts["runner_kind"]
+                == "generic_agentic_executor"
+            )
             return BootstrapTurn(
                 assistant_message="Generic executor is ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["baseline"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -3284,8 +4021,12 @@ def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(tmp_pa
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Create a kills model in this repo.")
@@ -3297,19 +4038,25 @@ def test_loopforge_can_run_with_generic_executor_when_no_supported_runner(tmp_pa
     assert not (tmp_path / "memory" / "runners").exists()
 
 
-def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_with_real_subprocess(tmp_path) -> None:
+def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_with_real_subprocess(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Generic executor is ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["run_experiment", "fix_failure"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -3353,7 +4100,9 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
             self.calls: list[tuple[int, str]] = []
             self.model = "anthropic/claude-opus-4-6-v1"
 
-        def fix_execution_plan(self, candidate, failed_step_index, failure_summary, step_results):
+        def fix_execution_plan(
+            self, candidate, failed_step_index, failure_summary, step_results
+        ):
             self.calls.append((failed_step_index, failure_summary))
             return [
                 ExecutionStep(
@@ -3379,8 +4128,12 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Recovered.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Recovered.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         progress_fn=lambda stage, msg: progress_log.append((stage, msg)),
     )
     app.execution_fix_backend = fix_backend
@@ -3395,14 +4148,22 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
     attempts = outcome["execution_details"]["attempts"]
     assert len(attempts) == 2
     assert attempts[0]["success"] is False
-    assert "self._ssock, self._csock = socket.socketpair()" in attempts[0]["step_results"][1]["stderr"]
+    assert (
+        "self._ssock, self._csock = socket.socketpair()"
+        in attempts[0]["step_results"][1]["stderr"]
+    )
     assert "asyncio\\proactor_events.py" in attempts[0]["step_results"][1]["stderr"]
     assert attempts[1]["success"] is True
-    assert any("[anthropic/claude-opus-4-6-v1] Step 2 failed" in message for _, message in progress_log)
+    assert any(
+        "[anthropic/claude-opus-4-6-v1] Step 2 failed" in message
+        for _, message in progress_log
+    )
     assert any("Revised plan with 2 step(s)" in message for _, message in progress_log)
 
 
-def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tmp_path) -> None:
+def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(allowed_actions=["run_experiment", "fix_failure"])
@@ -3410,7 +4171,10 @@ def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tm
         spec=spec,
         effective_spec=spec,
         capability_context=CapabilityContext(
-            environment_facts={"execution_shell": "cmd.exe", "shell_family": "windows_cmd"}
+            environment_facts={
+                "execution_shell": "cmd.exe",
+                "shell_family": "windows_cmd",
+            }
         ),
         best_summary=None,
         latest_summary=None,
@@ -3440,7 +4204,9 @@ def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tm
             self.model = "anthropic/claude-opus-4-6-v1"
             self.seen_commands: list[str] = []
 
-        def fix_execution_plan(self, candidate, failed_step_index, failure_summary, step_results):
+        def fix_execution_plan(
+            self, candidate, failed_step_index, failure_summary, step_results
+        ):
             self.seen_commands.append(candidate.execution_steps[0].command)
             if len(self.seen_commands) == 1:
                 return [
@@ -3467,23 +4233,34 @@ def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tm
     ).execute(candidate, snapshot)
 
     assert outcome.status == "success"
-    assert fix_backend.seen_commands == ["python missing_script.py", "head missing_script.py"]
+    assert fix_backend.seen_commands == [
+        "python missing_script.py",
+        "head missing_script.py",
+    ]
 
 
-def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_commands(tmp_path) -> None:
+def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_commands(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    (repo_root / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\n", encoding="utf-8"
+    )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Generic executor is ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["inspect_repo", "fix_failure"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -3506,7 +4283,7 @@ def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_comm
                             f'"{sys.executable}" -c "from pathlib import Path; files=[\'pyproject.toml\'];\n'
                             "for fp in files:\n"
                             "    print(fp)\n"
-                            "print(\'ordinal_loss=0.27\')"
+                            "print('ordinal_loss=0.27')"
                             '"'
                         ),
                         cwd=str(repo_root),
@@ -3523,14 +4300,20 @@ def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_comm
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Inspection succeeded.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Inspection succeeded.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Inspect the repo.")
 
     assert result["status"] == "started"
-    step_result = result["results"][0]["record"]["outcome"]["execution_details"]["step_results"][0]
+    step_result = result["results"][0]["record"]["outcome"]["execution_details"][
+        "step_results"
+    ][0]
     assert step_result["returncode"] == 0
     assert "pyproject.toml" in step_result["stdout"]
 
@@ -3540,14 +4323,18 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
     repo_root.mkdir()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["inspect_repo"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -3576,7 +4363,7 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
                         kind="shell",
                         command=f'"{sys.executable}" emit_metric.py',
                         cwd=str(repo_root),
-                    )
+                    ),
                 ],
             )
 
@@ -3586,7 +4373,9 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
                 {
                     "message": {
                         "content": json.dumps(
-                            {"summary": "Inspection completed and the loop can continue autonomously."}
+                            {
+                                "summary": "Inspection completed and the loop can continue autonomously."
+                            }
                         )
                     }
                 }
@@ -3606,21 +4395,35 @@ def test_loopforge_tolerates_narration_payloads_without_message_key(tmp_path) ->
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=narrator,
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Inspect the repo.")
 
     assert result["status"] == "started"
-    assert result["bootstrap"]["human_update"] == "Inspection completed and the loop can continue autonomously."
-    assert result["results"][0]["human_update"] == "Inspection completed and the loop can continue autonomously."
+    assert (
+        result["bootstrap"]["human_update"]
+        == "Inspection completed and the loop can continue autonomously."
+    )
+    assert (
+        result["results"][0]["human_update"]
+        == "Inspection completed and the loop can continue autonomously."
+    )
 
 
-def test_loopforge_runner_authoring_retries_after_failed_smoke_run_when_called_explicitly(tmp_path) -> None:
+def test_loopforge_runner_authoring_retries_after_failed_smoke_run_when_called_explicitly(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    (repo_root / "metrics.py").write_text("def ordinal_loss():\n    return 0.0\n", encoding="utf-8")
+    (repo_root / "metrics.py").write_text(
+        "def ordinal_loss():\n    return 0.0\n", encoding="utf-8"
+    )
 
     class RetryingRunnerAuthoringBackend:
         def __init__(self) -> None:
@@ -3661,8 +4464,8 @@ def build_adapter(spec, memory_root):
         preflight_provider=_preflight,
     )
 """.strip(),
-                        summary="First attempt fails smoke.",
-                    )
+                    summary="First attempt fails smoke.",
+                )
             assert request.previous_errors
             return bootstrap_module.RunnerAuthoringResult(
                 module_source="""
@@ -3697,7 +4500,7 @@ def build_adapter(spec, memory_root):
     )
 """.strip(),
                 summary="Second attempt passes smoke.",
-                )
+            )
 
     authoring_backend = RetryingRunnerAuthoringBackend()
     app = Loopforge(
@@ -3708,8 +4511,12 @@ def build_adapter(spec, memory_root):
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     resolution = app._author_runner(
@@ -3723,22 +4530,34 @@ def build_adapter(spec, memory_root):
     assert authoring_backend.calls[1][0] == 2
 
 
-def test_validate_runner_factory_accepts_dict_preflight_checks(tmp_path, monkeypatch) -> None:
+def test_validate_runner_factory_accepts_dict_preflight_checks(
+    tmp_path, monkeypatch
+) -> None:
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
             handlers={
                 "baseline": type(
                     "BaselineExecutor",
                     (),
-                    {"execute": lambda self, candidate, snapshot: ExperimentOutcome(primary_metric_value=0.1)},
+                    {
+                        "execute": lambda self, candidate, snapshot: ExperimentOutcome(
+                            primary_metric_value=0.1
+                        )
+                    },
                 )()
             },
             discovery_provider=lambda objective: CapabilityContext(
                 available_actions={"baseline": "authored runner"},
-                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                available_metrics={
+                    "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+                },
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                {"name": "authored_runner_ready", "status": "passed", "detail": "Runner validated."}
+                {
+                    "name": "authored_runner_ready",
+                    "status": "passed",
+                    "detail": "Runner validated.",
+                }
             ],
         )
 
@@ -3755,19 +4574,30 @@ def test_validate_runner_factory_accepts_dict_preflight_checks(tmp_path, monkeyp
     assert validation.preflight_checks[0].name == "authored_runner_ready"
 
 
-def test_bootstrap_injects_high_level_execution_guidance_question_for_unresolved_remote_data(tmp_path, monkeypatch) -> None:
+def test_bootstrap_injects_high_level_execution_guidance_question_for_unresolved_remote_data(
+    tmp_path, monkeypatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+        def propose_bootstrap_turn(
+            self,
+            user_goal,
+            capability_context,
+            answer_history=None,
+            role_models=None,
+            bootstrap_memory=None,
+        ):
             return BootstrapTurn(
                 assistant_message="I found the likely repo entrypoints.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["baseline"],
                     ),
                     questions=[],
@@ -3781,12 +4611,16 @@ def test_bootstrap_injects_high_level_execution_guidance_question_for_unresolved
         "discover_capabilities_for_objective",
         lambda **kwargs: CapabilityContext(
             available_data_assets=["s3://team-bucket/training/latest.parquet"],
-            available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+            available_metrics={
+                "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+            },
             environment_facts={
                 "repo_root": str(repo_root.resolve()),
                 "python_executable": sys.executable,
             },
-            notes=["The pipeline may load data from S3 or Databricks depending on the environment."],
+            notes=[
+                "The pipeline may load data from S3 or Databricks depending on the environment."
+            ],
         ),
     )
 
@@ -3796,40 +4630,62 @@ def test_bootstrap_injects_high_level_execution_guidance_question_for_unresolved
         bootstrap_backend=StubBootstrapBackend(),
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
     monkeypatch.setattr(
         app,
         "_author_runner",
-        lambda user_goal, capability_context, answers=None: bootstrap_module.ExecutionBackendResolution(
-            kind="planning_only",
-            reason="Runner authoring still needs one execution hint.",
+        lambda user_goal, capability_context, answers=None: (
+            bootstrap_module.ExecutionBackendResolution(
+                kind="planning_only",
+                reason="Runner authoring still needs one execution hint.",
+            )
         ),
     )
 
     turn = app.bootstrap(user_goal="Improve ranking quality.")
 
     assert turn.ready_to_start is False
-    assert any(question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY for question in turn.proposal.questions)
+    assert any(
+        question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY
+        for question in turn.proposal.questions
+    )
     assert "answer:execution_strategy_hint" in turn.missing_requirements
     assert "preflight:execution_strategy_unresolved" in turn.missing_requirements
-    assert any(check.name == "execution_strategy_unresolved" for check in turn.preflight_checks)
+    assert any(
+        check.name == "execution_strategy_unresolved" for check in turn.preflight_checks
+    )
 
 
-def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_path, monkeypatch) -> None:
+def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(
+    tmp_path, monkeypatch
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+        def propose_bootstrap_turn(
+            self,
+            user_goal,
+            capability_context,
+            answer_history=None,
+            role_models=None,
+            bootstrap_memory=None,
+        ):
             return BootstrapTurn(
                 assistant_message="Ready to run.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["baseline"],
                     ),
                     questions=[],
@@ -3842,7 +4698,9 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_
         if executor_factory_path:
             return CapabilityContext(
                 available_actions={"baseline": "authored baseline"},
-                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                available_metrics={
+                    "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+                },
                 environment_facts={
                     "repo_root": str(repo_root.resolve()),
                     "python_executable": sys.executable,
@@ -3852,7 +4710,9 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_
             )
         return CapabilityContext(
             available_data_assets=["s3://team-bucket/training/latest.parquet"],
-            available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+            available_metrics={
+                "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+            },
             environment_facts={
                 "repo_root": str(repo_root.resolve()),
                 "python_executable": sys.executable,
@@ -3865,20 +4725,30 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_
             handlers={},
             discovery_provider=lambda objective: CapabilityContext(
                 available_actions={"baseline": "authored baseline"},
-                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                available_metrics={
+                    "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+                },
                 environment_facts={"runner_kind": "authored"},
             ),
             capability_provider=lambda effective_spec: CapabilityContext(
                 available_actions={"baseline": "authored baseline"},
-                available_metrics={"ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}},
+                available_metrics={
+                    "ordinal_loss": {"goal": "minimize", "preferred_role": "primary"}
+                },
                 environment_facts={"runner_kind": "authored"},
             ),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="authored_runner_ready", status="passed", detail="Runner validated.")
+                PreflightCheck(
+                    name="authored_runner_ready",
+                    status="passed",
+                    detail="Runner validated.",
+                )
             ],
         )
 
-    monkeypatch.setattr(bootstrap_module, "discover_capabilities_for_objective", fake_discover)
+    monkeypatch.setattr(
+        bootstrap_module, "discover_capabilities_for_objective", fake_discover
+    )
     monkeypatch.setattr(bootstrap_module, "load_adapter_setup", fake_adapter_setup)
 
     app = Loopforge(
@@ -3887,12 +4757,18 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_
         bootstrap_backend=StubBootstrapBackend(),
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     def fake_author_runner(user_goal, capability_context, answers=None):
-        assert answers == {bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."}
+        assert answers == {
+            bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."
+        }
         return bootstrap_module.ExecutionBackendResolution(
             kind="supported",
             factory_path="generated.runner:build_adapter",
@@ -3902,11 +4778,16 @@ def test_bootstrap_uses_high_level_execution_hint_to_unlock_authored_runner(tmp_
 
     turn = app.bootstrap(
         user_goal="Improve ranking quality.",
-        answers={bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."},
+        answers={
+            bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY: "Use the repo's local Python loader against S3."
+        },
     )
 
     assert turn.ready_to_start is True
-    assert not any(question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY for question in turn.proposal.questions)
+    assert not any(
+        question.key == bootstrap_module.EXECUTION_GUIDANCE_QUESTION_KEY
+        for question in turn.proposal.questions
+    )
     assert not any(check.status == "failed" for check in turn.preflight_checks)
     assert any(check.name == "authored_runner_ready" for check in turn.preflight_checks)
 
@@ -3920,14 +4801,18 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
     )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Plan looks good.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="primary_metric", goal="maximize"),
+                        primary_metric=PrimaryMetric(
+                            name="primary_metric", goal="maximize"
+                        ),
                         allowed_actions=["baseline"],
                     ),
                 ),
@@ -3955,7 +4840,7 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
                         kind="shell",
                         command=f'"{sys.executable}" emit_metric.py',
                         cwd=str(repo_root),
-                    )
+                    ),
                 ],
             )
 
@@ -3967,8 +4852,12 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
         worker_backend=StubWorker(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fine.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Improve approval precision.")
@@ -3977,7 +4866,9 @@ def test_loopforge_start_refuses_unsupported_planning_only_repo(tmp_path) -> Non
     assert result["bootstrap"]["ready_to_start"] is True
 
 
-def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_path) -> None:
+def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(
@@ -4020,11 +4911,13 @@ def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_p
                 kind="shell",
                 command=f'"{sys.executable}" emit_metrics.py',
                 cwd=str(tmp_path),
-            )
+            ),
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "success"
     assert outcome.primary_metric_value == 0.19
@@ -4034,7 +4927,9 @@ def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_p
     assert "Captured metric output" in outcome.notes[-1]
 
 
-def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable_failure(tmp_path) -> None:
+def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable_failure(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(allowed_actions=["run_experiment"])
@@ -4061,14 +4956,16 @@ def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable
                 kind="shell",
                 command=(
                     f'"{sys.executable}" -c '
-                    '"import sys; sys.stderr.write(\'PermissionError: [WinError 5] Access is denied\'); sys.exit(1)"'
+                    "\"import sys; sys.stderr.write('PermissionError: [WinError 5] Access is denied'); sys.exit(1)\""
                 ),
                 cwd=str(tmp_path),
             )
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "recoverable_failure"
     assert outcome.failure_type == "ShellPermissionDenied"
@@ -4154,7 +5051,9 @@ def test_generic_execution_plan_executor_runs_shell_steps(tmp_path) -> None:
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "success"
     assert "Executed" in outcome.notes[0] and "step" in outcome.notes[0]
@@ -4203,7 +5102,9 @@ def test_routing_executor_uses_plan_executor_for_execution_steps(tmp_path) -> No
     assert outcome.execution_details["step_results"][0]["returncode"] == 0
 
 
-def test_routing_executor_ignores_action_label_when_execution_steps_are_present(tmp_path) -> None:
+def test_routing_executor_ignores_action_label_when_execution_steps_are_present(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(allowed_actions=["run_experiment"])
@@ -4250,9 +5151,17 @@ def test_routing_executor_ignores_action_label_when_execution_steps_are_present(
     assert outcome.execution_details["step_results"][0]["returncode"] == 0
 
 
-def test_routing_executor_treats_unbound_generic_action_as_recoverable_failure(tmp_path) -> None:
+def test_routing_executor_treats_unbound_generic_action_as_recoverable_failure(
+    tmp_path,
+) -> None:
     spec = build_spec(
-        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"]
+        allowed_actions=[
+            "inspect_repo",
+            "inspect_data",
+            "edit_code",
+            "run_experiment",
+            "fix_failure",
+        ]
     )
     snapshot = MemorySnapshot(
         spec=spec,
@@ -4287,9 +5196,17 @@ def test_routing_executor_treats_unbound_generic_action_as_recoverable_failure(t
     assert outcome.failure_type == "UnboundActionProposal"
 
 
-def test_routing_executor_uses_metadata_only_autonomous_mode_for_unbound_actions(tmp_path) -> None:
+def test_routing_executor_uses_metadata_only_autonomous_mode_for_unbound_actions(
+    tmp_path,
+) -> None:
     spec = build_spec(
-        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"],
+        allowed_actions=[
+            "inspect_repo",
+            "inspect_data",
+            "edit_code",
+            "run_experiment",
+            "fix_failure",
+        ],
         metadata={"execution_mode": "autonomous_after_bootstrap"},
     )
     snapshot = MemorySnapshot(
@@ -4321,7 +5238,9 @@ def test_routing_executor_uses_metadata_only_autonomous_mode_for_unbound_actions
     assert "execution_steps" in outcome.failure_summary
 
 
-def test_generic_execution_plan_executor_detects_missing_script_before_running(tmp_path) -> None:
+def test_generic_execution_plan_executor_detects_missing_script_before_running(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(allowed_actions=["run_experiment"])
@@ -4352,7 +5271,9 @@ def test_generic_execution_plan_executor_detects_missing_script_before_running(t
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "recoverable_failure"
     assert outcome.failure_type == "MissingScriptFile"
@@ -4395,10 +5316,14 @@ def test_generic_execution_plan_executor_can_write_files(tmp_path) -> None:
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "success"
-    assert (tmp_path / "notes" / "generated.txt").read_text(encoding="utf-8") == "hello\nworld\n"
+    assert (tmp_path / "notes" / "generated.txt").read_text(
+        encoding="utf-8"
+    ) == "hello\nworld\n"
 
 
 def test_generic_execution_plan_executor_blocks_writes_outside_repo(tmp_path) -> None:
@@ -4432,13 +5357,17 @@ def test_generic_execution_plan_executor_blocks_writes_outside_repo(tmp_path) ->
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "blocked"
     assert outcome.failure_type == "UnsafePath"
 
 
-def test_generic_execution_plan_executor_blocks_shell_cwd_outside_repo(tmp_path) -> None:
+def test_generic_execution_plan_executor_blocks_shell_cwd_outside_repo(
+    tmp_path,
+) -> None:
     from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     spec = build_spec(allowed_actions=["baseline"])
@@ -4470,17 +5399,23 @@ def test_generic_execution_plan_executor_blocks_shell_cwd_outside_repo(tmp_path)
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "blocked"
     assert outcome.failure_type == "UnsafePath"
     assert "cwd" in outcome.failure_summary
 
 
-def test_bootstrap_recomputes_capabilities_when_objective_changes(tmp_path, monkeypatch) -> None:
+def test_bootstrap_recomputes_capabilities_when_objective_changes(
+    tmp_path, monkeypatch
+) -> None:
     discovered_objectives = []
 
-    def fake_discover_capabilities_for_objective(*, objective, memory_root, executor_factory_path, repo_root="."):
+    def fake_discover_capabilities_for_objective(
+        *, objective, memory_root, executor_factory_path, repo_root="."
+    ):
         discovered_objectives.append(objective)
         return CapabilityContext(notes=[f"objective={objective}"])
 
@@ -4488,7 +5423,14 @@ def test_bootstrap_recomputes_capabilities_when_objective_changes(tmp_path, monk
         def __init__(self) -> None:
             self.notes_seen = []
 
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+        def propose_bootstrap_turn(
+            self,
+            user_goal,
+            capability_context,
+            answer_history=None,
+            role_models=None,
+            bootstrap_memory=None,
+        ):
             self.notes_seen.append(list(capability_context.notes))
             return BootstrapTurn(
                 assistant_message="Ready.",
@@ -4523,9 +5465,17 @@ def test_bootstrap_recomputes_capabilities_when_objective_changes(tmp_path, monk
     assert "objective=Reduce latency." in backend.notes_seen[1]
 
 
-def test_build_iteration_policy_prefers_fix_failure_for_generic_recoverable_failures() -> None:
+def test_build_iteration_policy_prefers_fix_failure_for_generic_recoverable_failures() -> (
+    None
+):
     spec = build_spec(
-        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"]
+        allowed_actions=[
+            "inspect_repo",
+            "inspect_data",
+            "edit_code",
+            "run_experiment",
+            "fix_failure",
+        ]
     )
     snapshot = MemorySnapshot(
         spec=spec,
@@ -4567,9 +5517,17 @@ def test_build_iteration_policy_prefers_fix_failure_for_generic_recoverable_fail
     assert policy["recommended_next_action"] == "fix_failure"
 
 
-def test_build_iteration_policy_treats_metadata_only_autonomous_mode_as_generic() -> None:
+def test_build_iteration_policy_treats_metadata_only_autonomous_mode_as_generic() -> (
+    None
+):
     spec = build_spec(
-        allowed_actions=["inspect_repo", "inspect_data", "edit_code", "run_experiment", "fix_failure"],
+        allowed_actions=[
+            "inspect_repo",
+            "inspect_data",
+            "edit_code",
+            "run_experiment",
+            "fix_failure",
+        ],
         metadata={"execution_mode": "autonomous_after_bootstrap"},
     )
     snapshot = MemorySnapshot(
@@ -4624,7 +5582,9 @@ def test_memory_store_initialize_resets_previous_run_state(tmp_path) -> None:
             change_type="baseline",
             instructions="Run baseline.",
         ),
-        outcome=ExperimentOutcome(primary_metric_value=0.5, notes=["Baseline recorded."]),
+        outcome=ExperimentOutcome(
+            primary_metric_value=0.5, notes=["Baseline recorded."]
+        ),
         reflection=ReflectionSummary(assessment="Looks fine."),
         review=ReviewDecision(status="accepted", reason="ok"),
     )
@@ -4659,7 +5619,10 @@ def test_memory_store_initialize_resets_previous_run_state(tmp_path) -> None:
         )
     )
 
-    store.initialize(build_spec(objective="Fresh objective", allowed_actions=["baseline"]), reset_state=True)
+    store.initialize(
+        build_spec(objective="Fresh objective", allowed_actions=["baseline"]),
+        reset_state=True,
+    )
     snapshot = store.load_snapshot()
 
     assert snapshot.spec.objective == "Fresh objective"
@@ -4671,10 +5634,14 @@ def test_memory_store_initialize_resets_previous_run_state(tmp_path) -> None:
     assert snapshot.lessons_learned == ""
 
 
-def test_start_from_bootstrap_turn_preserves_existing_memory_when_resuming(tmp_path, monkeypatch) -> None:
+def test_start_from_bootstrap_turn_preserves_existing_memory_when_resuming(
+    tmp_path, monkeypatch
+) -> None:
     memory_root = tmp_path / "memory"
     store = FileMemoryStore(memory_root)
-    original_spec = build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1})
+    original_spec = build_spec(
+        allowed_actions=["baseline"], stop_conditions={"max_iterations": 1}
+    )
     store.initialize(original_spec, reset_state=True)
     summary = IterationSummary(
         iteration_id=1,
@@ -4734,7 +5701,11 @@ def test_start_from_bootstrap_turn_preserves_existing_memory_when_resuming(tmp_p
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.4)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.4)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(),
         )
 
@@ -4746,8 +5717,12 @@ def test_start_from_bootstrap_turn_preserves_existing_memory_when_resuming(tmp_p
         worker_backend=worker,
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Resumed.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Resumed.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
     bootstrap_turn = BootstrapTurn(
         assistant_message="Ready.",
@@ -4768,14 +5743,21 @@ def test_start_from_bootstrap_turn_preserves_existing_memory_when_resuming(tmp_p
 
     assert result["status"] == "started"
     assert worker.snapshots[0].recent_summaries[0].hypothesis == "Existing baseline."
-    assert worker.snapshots[0].recent_human_interventions[0].message == "Continue from the existing memory."
+    assert (
+        worker.snapshots[0].recent_human_interventions[0].message
+        == "Continue from the existing memory."
+    )
     assert result["results"][0]["record"]["iteration_id"] == 2
 
 
-def test_start_from_bootstrap_turn_resets_state_when_resumed_spec_changes(tmp_path, monkeypatch) -> None:
+def test_start_from_bootstrap_turn_resets_state_when_resumed_spec_changes(
+    tmp_path, monkeypatch
+) -> None:
     memory_root = tmp_path / "memory"
     store = FileMemoryStore(memory_root)
-    original_spec = build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1})
+    original_spec = build_spec(
+        allowed_actions=["baseline"], stop_conditions={"max_iterations": 1}
+    )
     store.initialize(original_spec, reset_state=True)
     store.append_iteration_record(
         IterationRecord(
@@ -4814,7 +5796,11 @@ def test_start_from_bootstrap_turn_resets_state_when_resumed_spec_changes(tmp_pa
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.4)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.4)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(),
         )
 
@@ -4826,8 +5812,12 @@ def test_start_from_bootstrap_turn_resets_state_when_resumed_spec_changes(tmp_pa
         worker_backend=worker,
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Reset.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Reset.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
     updated_spec = build_spec(
         objective=original_spec.objective,
@@ -4861,7 +5851,9 @@ def test_start_from_bootstrap_turn_resets_state_when_resumed_spec_changes(tmp_pa
 def test_start_resets_previous_memory_for_fresh_run(tmp_path, monkeypatch) -> None:
     memory_root = tmp_path / "memory"
     store = FileMemoryStore(memory_root)
-    existing_spec = build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1})
+    existing_spec = build_spec(
+        allowed_actions=["baseline"], stop_conditions={"max_iterations": 1}
+    )
     store.initialize(existing_spec, reset_state=True)
     store.append_iteration_record(
         IterationRecord(
@@ -4880,7 +5872,14 @@ def test_start_resets_previous_memory_for_fresh_run(tmp_path, monkeypatch) -> No
     )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None, bootstrap_memory=None):
+        def propose_bootstrap_turn(
+            self,
+            user_goal,
+            capability_context,
+            answer_history=None,
+            role_models=None,
+            bootstrap_memory=None,
+        ):
             return BootstrapTurn(
                 assistant_message="Ready.",
                 proposal=ExperimentSpecProposal(
@@ -4908,11 +5907,19 @@ def test_start_resets_previous_memory_for_fresh_run(tmp_path, monkeypatch) -> No
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.4)])},
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.4)]
+                )
+            },
             capability_provider=lambda effective_spec: CapabilityContext(),
             discovery_provider=lambda objective: CapabilityContext(),
             preflight_provider=lambda effective_spec, capability_context: [
-                PreflightCheck(name="executor_ready", status="passed", detail="Executor is configured.")
+                PreflightCheck(
+                    name="executor_ready",
+                    status="passed",
+                    detail="Executor is configured.",
+                )
             ],
         )
 
@@ -4925,8 +5932,12 @@ def test_start_resets_previous_memory_for_fresh_run(tmp_path, monkeypatch) -> No
         worker_backend=worker,
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fresh.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Fresh.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="New objective")
@@ -4936,7 +5947,9 @@ def test_start_resets_previous_memory_for_fresh_run(tmp_path, monkeypatch) -> No
     assert result["results"][0]["record"]["iteration_id"] == 1
 
 
-def test_loopforge_start_from_bootstrap_turn_auto_installs_missing_dependency_and_retries(tmp_path, monkeypatch) -> None:
+def test_loopforge_start_from_bootstrap_turn_auto_installs_missing_dependency_and_retries(
+    tmp_path, monkeypatch
+) -> None:
     attempts = {"count": 0}
 
     class MissingDependencyExecutor:
@@ -4944,7 +5957,9 @@ def test_loopforge_start_from_bootstrap_turn_auto_installs_missing_dependency_an
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise ModuleNotFoundError("No module named 'sklearn'")
-            return ExperimentOutcome(primary_metric_value=0.19, notes=["Recovered after dependency install."])
+            return ExperimentOutcome(
+                primary_metric_value=0.19, notes=["Recovered after dependency install."]
+            )
 
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
@@ -4957,20 +5972,33 @@ def test_loopforge_start_from_bootstrap_turn_auto_installs_missing_dependency_an
     app = Loopforge(
         executor_factory_path="fake.module:factory",
         memory_root=tmp_path / "memory",
-        worker_backend=FakeWorkerBackend([
-            ExperimentCandidate(
-                hypothesis="Run baseline.",
-                action_type="baseline",
-                change_type="baseline",
-                instructions="Train baseline model.",
-            ),
-        ]),
+        worker_backend=FakeWorkerBackend(
+            [
+                ExperimentCandidate(
+                    hypothesis="Run baseline.",
+                    action_type="baseline",
+                    change_type="baseline",
+                    instructions="Train baseline model.",
+                ),
+            ]
+        ),
         narrator_backend=FakeNarrationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Recovered.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Recovered.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
-    monkeypatch.setattr(app, "_install_python_dependency", lambda package_name: (True, {"command": ["uv", "pip", "install", package_name]}))
+    monkeypatch.setattr(
+        app,
+        "_install_python_dependency",
+        lambda package_name: (
+            True,
+            {"command": ["uv", "pip", "install", package_name]},
+        ),
+    )
 
     bootstrap_turn = BootstrapTurn(
         assistant_message="Ready.",
@@ -5043,7 +6071,10 @@ def test_scan_repo_filters_private_and_test_actions(tmp_path) -> None:
     assert "predict_kills" in summary["actions"]
     assert "_predict_internal" not in summary["actions"]
     assert "test_predict_kills" not in summary["actions"]
-    assert "distributionmanagerpredictorwithaveryveryveryverylongname" not in summary["actions"]
+    assert (
+        "distributionmanagerpredictorwithaveryveryveryverylongname"
+        not in summary["actions"]
+    )
 
 
 def test_scan_repo_discovers_real_data_files(tmp_path) -> None:
@@ -5095,9 +6126,15 @@ def test_metric_results_and_guardrails_drive_summary_classification(tmp_path) ->
             }
         ),
         reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Primary metric improved but the guardrail failed.")]
+            [
+                ReflectionSummary(
+                    assessment="Primary metric improved but the guardrail failed."
+                )
+            ]
         ),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="Track this in memory.")]),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="Track this in memory.")]
+        ),
     )
     orchestrator.initialize(
         build_spec(
@@ -5130,7 +6167,10 @@ def test_metric_results_and_guardrails_drive_summary_classification(tmp_path) ->
 
     assert cycle.accepted_summary is not None
     assert cycle.accepted_summary.primary_metric_value == 0.74
-    assert cycle.accepted_summary.metric_results["recall_at_p90"].scorer_ref == "metrics.recall_at_p90"
+    assert (
+        cycle.accepted_summary.metric_results["recall_at_p90"].scorer_ref
+        == "metrics.recall_at_p90"
+    )
     assert cycle.accepted_summary.guardrail_failures == ["precision_floor"]
     assert cycle.accepted_summary.result == "regressed"
 
@@ -5155,16 +6195,24 @@ def test_orchestrator_calls_progress_fn_during_iteration(tmp_path) -> None:
             ]
         ),
         executor=RoutingExperimentExecutor(
-            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.5)])}
+            handlers={
+                "baseline": StaticActionExecutor(
+                    [ExperimentOutcome(primary_metric_value=0.5)]
+                )
+            }
         ),
         reflection_backend=FakeReflectionBackend(
             [ReflectionSummary(assessment="OK.", lessons=["Baseline done."])]
         ),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="baseline recorded")]),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="baseline recorded")]
+        ),
         narrator_backend=FakeNarrationBackend(),
         progress_fn=lambda stage, msg: progress_log.append((stage, msg)),
     )
-    orchestrator.initialize(build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1}))
+    orchestrator.initialize(
+        build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 1})
+    )
 
     orchestrator.run(iterations=1)
 
@@ -5177,7 +6225,9 @@ def test_orchestrator_calls_progress_fn_during_iteration(tmp_path) -> None:
     assert "narrate" in stages
 
 
-def test_orchestrator_raises_experiment_interrupted_on_keyboard_interrupt(tmp_path) -> None:
+def test_orchestrator_raises_experiment_interrupted_on_keyboard_interrupt(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "loop")
 
     class InterruptingWorker:
@@ -5187,11 +6237,15 @@ def test_orchestrator_raises_experiment_interrupted_on_keyboard_interrupt(tmp_pa
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
         worker_backend=InterruptingWorker(),
-        executor=RoutingExperimentExecutor(handlers={"baseline": StaticActionExecutor([])}),
+        executor=RoutingExperimentExecutor(
+            handlers={"baseline": StaticActionExecutor([])}
+        ),
         reflection_backend=FakeReflectionBackend([]),
         review_backend=FakeReviewBackend([]),
     )
-    orchestrator.initialize(build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 3}))
+    orchestrator.initialize(
+        build_spec(allowed_actions=["baseline"], stop_conditions={"max_iterations": 3})
+    )
 
     try:
         orchestrator.run(iterations=3)
@@ -5218,6 +6272,7 @@ def test_cli_interrupt_during_bootstrap_prompts_for_redirect(tmp_path) -> None:
         lines.append(str(msg))
 
     import loopforge.cli as cli_module
+
     original_loopforge = cli_module.Loopforge
 
     class InterruptingLoopforge(original_loopforge):
@@ -5255,6 +6310,7 @@ def test_cli_interrupt_during_experiment_prompts_for_redirect(tmp_path) -> None:
         lines.append(str(msg))
 
     import loopforge.cli as cli_module
+
     original_loopforge = cli_module.Loopforge
 
     class FakeLoopforgeWithInterrupt(original_loopforge):
@@ -5266,8 +6322,12 @@ def test_cli_interrupt_during_experiment_prompts_for_redirect(tmp_path) -> None:
                     recommended_spec=build_spec(),
                 ),
                 role_models=RoleModelConfig(
-                    planner="m", worker="m", reflection="m",
-                    review="m", consultation="m", narrator="m",
+                    planner="m",
+                    worker="m",
+                    reflection="m",
+                    review="m",
+                    consultation="m",
+                    narrator="m",
                 ),
                 ready_to_start=True,
             )
@@ -5302,7 +6362,11 @@ def test_stream_fn_not_called_when_completion_fn_provided() -> None:
     def fake_completion(**kwargs):
         return {
             "choices": [
-                {"message": {"content": '{"hypothesis": "test", "action_type": "baseline", "change_type": "baseline", "instructions": "run"}'}}
+                {
+                    "message": {
+                        "content": '{"hypothesis": "test", "action_type": "baseline", "change_type": "baseline", "instructions": "run"}'
+                    }
+                }
             ]
         }
 
@@ -5327,7 +6391,9 @@ def test_stream_fn_not_called_when_completion_fn_provided() -> None:
         next_iteration_id=1,
     )
     backend.propose_next_experiment(snapshot)
-    assert stream_calls == [], "stream_fn should not be called when completion_fn is provided"
+    assert stream_calls == [], (
+        "stream_fn should not be called when completion_fn is provided"
+    )
 
 
 def test_consultation_backend_tolerates_missing_focus_field() -> None:
@@ -5468,7 +6534,10 @@ def test_reflection_backend_normalizes_object_next_action_and_summary_field() ->
 
     reflection = backend.reflect(snapshot, candidate, outcome)
 
-    assert reflection.assessment == "Execution succeeded and produced useful inspection evidence."
+    assert (
+        reflection.assessment
+        == "Execution succeeded and produced useful inspection evidence."
+    )
     assert reflection.lessons == ["Avoid bulk multi-file stdout reads."]
     assert reflection.recommended_next_action == "inspect_repo"
 
@@ -5498,8 +6567,7 @@ def test_stream_completion_accumulates_chunks() -> None:
 
     chunks = [FakeChunk("Hello"), FakeChunk(" "), FakeChunk("world")]
 
-    import loopforge.core.backends as backends_module
-    original_completion = None
+    original_completion = None  # noqa: F841
 
     def fake_litellm_completion(**kwargs):
         assert kwargs.get("stream") is True
@@ -5507,12 +6575,17 @@ def test_stream_completion_accumulates_chunks() -> None:
 
     # Patch litellm.completion temporarily
     import types
+
     backend._stream_fn = lambda token: streamed.append(token)
 
     # Call _stream_completion directly with a patched litellm
     import unittest.mock
-    with unittest.mock.patch.dict("sys.modules", {"litellm": types.ModuleType("litellm")}):
+
+    with unittest.mock.patch.dict(
+        "sys.modules", {"litellm": types.ModuleType("litellm")}
+    ):
         import sys
+
         sys.modules["litellm"].completion = fake_litellm_completion
         result = backend._stream_completion([{"role": "user", "content": "hi"}])
 

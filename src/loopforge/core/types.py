@@ -136,8 +136,12 @@ class ExperimentSpec:
         return {
             "objective": self.objective,
             "primary_metric": self.primary_metric.to_dict(),
-            "secondary_metrics": [metric.to_dict() for metric in self.secondary_metrics],
-            "guardrail_metrics": [metric.to_dict() for metric in self.guardrail_metrics],
+            "secondary_metrics": [
+                metric.to_dict() for metric in self.secondary_metrics
+            ],
+            "guardrail_metrics": [
+                metric.to_dict() for metric in self.guardrail_metrics
+            ],
             "allowed_actions": self.allowed_actions,
             "constraints": self.constraints,
             "search_space": self.search_space,
@@ -150,8 +154,14 @@ class ExperimentSpec:
         return cls(
             objective=payload["objective"],
             primary_metric=MetricSpec.from_dict(payload["primary_metric"]),
-            secondary_metrics=[MetricSpec.from_dict(item) for item in payload.get("secondary_metrics", [])],
-            guardrail_metrics=[MetricSpec.from_dict(item) for item in payload.get("guardrail_metrics", [])],
+            secondary_metrics=[
+                MetricSpec.from_dict(item)
+                for item in payload.get("secondary_metrics", [])
+            ],
+            guardrail_metrics=[
+                MetricSpec.from_dict(item)
+                for item in payload.get("guardrail_metrics", [])
+            ],
             allowed_actions=payload["allowed_actions"],
             constraints=payload.get("constraints", {}),
             search_space=payload.get("search_space", {}),
@@ -163,6 +173,7 @@ class ExperimentSpec:
 @dataclass(frozen=True)
 class DataAssetSchema:
     """Quick schema snapshot of a data asset discovered during bootstrap."""
+
     asset_path: str
     columns: list[str] = field(default_factory=list)
     dtypes: dict[str, str] = field(default_factory=dict)
@@ -211,7 +222,9 @@ class AdapterSetup:
     handlers: dict[str, Any]
     capability_provider: Callable[[ExperimentSpec], CapabilityContext] | None = None
     discovery_provider: Callable[[str], CapabilityContext] | None = None
-    preflight_provider: Callable[[ExperimentSpec, CapabilityContext], list["PreflightCheck"]] | None = None
+    preflight_provider: (
+        Callable[[ExperimentSpec, CapabilityContext], list["PreflightCheck"]] | None
+    ) = None
 
 
 @dataclass(frozen=True)
@@ -264,7 +277,10 @@ class ExperimentCandidate:
             action_type=payload["action_type"],
             change_type=payload["change_type"],
             instructions=payload["instructions"],
-            execution_steps=[ExecutionStep.from_dict(item) for item in payload.get("execution_steps", [])],
+            execution_steps=[
+                ExecutionStep.from_dict(item)
+                for item in payload.get("execution_steps", [])
+            ],
             config_patch=payload.get("config_patch", {}),
             metadata=payload.get("metadata", {}),
         )
@@ -324,7 +340,10 @@ class ExperimentOutcome:
 
     def resolved_metric_results(self, spec: ExperimentSpec) -> dict[str, MetricResult]:
         resolved = dict(self.metric_results)
-        if spec.primary_metric.name not in resolved and self.primary_metric_value is not None:
+        if (
+            spec.primary_metric.name not in resolved
+            and self.primary_metric_value is not None
+        ):
             resolved[spec.primary_metric.name] = MetricResult(
                 name=spec.primary_metric.name,
                 value=self.primary_metric_value,
@@ -351,7 +370,9 @@ class ExperimentOutcome:
         for metric in spec.guardrail_metrics:
             result = resolved.get(metric.name)
             if result is not None and result.passed is None:
-                resolved[metric.name] = replace(result, passed=metric.resolve_passed(result))
+                resolved[metric.name] = replace(
+                    result, passed=metric.resolve_passed(result)
+                )
         return resolved
 
 
@@ -387,7 +408,11 @@ class OpsConsultation:
         focus = payload.get("focus")
         guidance = payload.get("guidance")
         if not isinstance(focus, str) or not focus.strip():
-            focus = str(payload.get("topic") or payload.get("problem") or "general execution help")
+            focus = str(
+                payload.get("topic")
+                or payload.get("problem")
+                or "general execution help"
+            )
         if not isinstance(guidance, str) or not guidance.strip():
             guidance = str(
                 payload.get("advice")
@@ -658,7 +683,9 @@ class ExperimentSpecProposal:
         return cls(
             objective=payload["objective"],
             recommended_spec=ExperimentSpec.from_dict(payload["recommended_spec"]),
-            questions=[SpecQuestion.from_dict(item) for item in payload.get("questions", [])],
+            questions=[
+                SpecQuestion.from_dict(item) for item in payload.get("questions", [])
+            ],
             notes=payload.get("notes", []),
         )
 
@@ -683,7 +710,9 @@ class RoleModelConfig:
             reflection=payload["reflection"],
             review=payload["review"],
             consultation=payload.get("consultation", payload["worker"]),
-            narrator=payload.get("narrator", payload.get("reflection", payload["worker"])),
+            narrator=payload.get(
+                "narrator", payload.get("reflection", payload["worker"])
+            ),
         )
 
 
@@ -735,7 +764,10 @@ class RunnerValidationResult:
             factory_path=payload.get("factory_path"),
             errors=payload.get("errors", []),
             warnings=payload.get("warnings", []),
-            preflight_checks=[PreflightCheck.from_dict(item) for item in payload.get("preflight_checks", [])],
+            preflight_checks=[
+                PreflightCheck.from_dict(item)
+                for item in payload.get("preflight_checks", [])
+            ],
             smoke_test_passed=payload.get("smoke_test_passed", False),
         )
 
@@ -769,7 +801,10 @@ class BootstrapTurn:
             assistant_message=payload["assistant_message"],
             proposal=ExperimentSpecProposal.from_dict(payload["proposal"]),
             role_models=RoleModelConfig.from_dict(payload["role_models"]),
-            preflight_checks=[PreflightCheck.from_dict(item) for item in payload.get("preflight_checks", [])],
+            preflight_checks=[
+                PreflightCheck.from_dict(item)
+                for item in payload.get("preflight_checks", [])
+            ],
             ready_to_start=payload.get("ready_to_start", False),
             missing_requirements=payload.get("missing_requirements", []),
             human_update=payload.get("human_update"),
@@ -838,7 +873,9 @@ class ExperimentInterrupted(Exception):
         self.results_so_far = results_so_far
         self.current_stage = current_stage
         self.snapshot = snapshot
-        super().__init__(f"Experiment interrupted during {current_stage} after {len(results_so_far)} iteration(s)")
+        super().__init__(
+            f"Experiment interrupted during {current_stage} after {len(results_so_far)} iteration(s)"
+        )
 
 
 def apply_human_interventions(
@@ -860,7 +897,11 @@ def apply_human_interventions(
         if disabled_actions:
             effective_spec = replace(
                 effective_spec,
-                allowed_actions=[action for action in effective_spec.allowed_actions if action not in disabled_actions],
+                allowed_actions=[
+                    action
+                    for action in effective_spec.allowed_actions
+                    if action not in disabled_actions
+                ],
             )
         enabled_actions = list(effects.get("enable_actions", []))
         if enabled_actions:

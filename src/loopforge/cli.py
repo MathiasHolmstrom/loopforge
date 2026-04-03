@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
 import json
@@ -26,33 +26,77 @@ from loopforge.core import (
     HumanIntervention,
     LiteLLMSpecBackend,
 )
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run or steer the experimentation loop.")
+    parser = argparse.ArgumentParser(
+        description="Run or steer the experimentation loop."
+    )
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("--spec", required=True, help="Path to a JSON experiment spec.")
-    run_parser.add_argument("--repo-root", default=".", help="Repository root used for relative execution steps.")
-    run_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory and summaries.")
-    run_parser.add_argument("--executor-factory", required=True, help="Import path package.module:function_name")
+    run_parser.add_argument(
+        "--spec", required=True, help="Path to a JSON experiment spec."
+    )
+    run_parser.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root used for relative execution steps.",
+    )
+    run_parser.add_argument(
+        "--memory-root",
+        default=".loopforge",
+        help="Directory used for loop memory and summaries.",
+    )
+    run_parser.add_argument(
+        "--executor-factory",
+        required=True,
+        help="Import path package.module:function_name",
+    )
     run_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
     run_parser.add_argument(
         "--worker-model",
         default=None,
         help="LiteLLM model id for the worker agent.",
     )
-    run_parser.add_argument("--reflection-model", help="LiteLLM model id for the reflection agent.")
-    run_parser.add_argument("--review-model", help="LiteLLM model id for the review agent.")
-    run_parser.add_argument("--consultation-model", help="LiteLLM model id for the operations consult agent.")
-    run_parser.add_argument("--narrator-model", help="LiteLLM model id for the human-facing narrator agent.")
-    run_parser.add_argument("--iterations", type=int, default=None, help="Override max iterations for this run.")
+    run_parser.add_argument(
+        "--reflection-model", help="LiteLLM model id for the reflection agent."
+    )
+    run_parser.add_argument(
+        "--review-model", help="LiteLLM model id for the review agent."
+    )
+    run_parser.add_argument(
+        "--consultation-model",
+        help="LiteLLM model id for the operations consult agent.",
+    )
+    run_parser.add_argument(
+        "--narrator-model", help="LiteLLM model id for the human-facing narrator agent."
+    )
+    run_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=None,
+        help="Override max iterations for this run.",
+    )
     run_parser.add_argument("--temperature", type=float, default=0.2)
 
     draft_parser = subparsers.add_parser("draft-spec")
-    draft_parser.add_argument("--objective", required=True, help="Experiment objective to plan for.")
-    draft_parser.add_argument("--repo-root", default=".", help="Repository root to scan when auto-synthesizing.")
-    draft_parser.add_argument("--memory-root", default=".loopforge", help="Directory passed to the adapter factory.")
-    draft_parser.add_argument("--executor-factory", help="Import path package.module:function_name")
+    draft_parser.add_argument(
+        "--objective", required=True, help="Experiment objective to plan for."
+    )
+    draft_parser.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root to scan when auto-synthesizing.",
+    )
+    draft_parser.add_argument(
+        "--memory-root",
+        default=".loopforge",
+        help="Directory passed to the adapter factory.",
+    )
+    draft_parser.add_argument(
+        "--executor-factory", help="Import path package.module:function_name"
+    )
     draft_parser.add_argument(
         "--planner-model",
         default=DEFAULT_OPENAI_MODEL,
@@ -62,10 +106,20 @@ def build_argument_parser() -> argparse.ArgumentParser:
     draft_parser.add_argument("--temperature", type=float, default=0.2)
 
     start_parser = subparsers.add_parser("start")
-    start_parser.add_argument("--message", required=False, help="Initial description of the problem to solve.")
-    start_parser.add_argument("--repo-root", default=".", help="Repository root to scan when auto-synthesizing.")
-    start_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory.")
-    start_parser.add_argument("--executor-factory", help="Import path package.module:function_name")
+    start_parser.add_argument(
+        "--message", required=False, help="Initial description of the problem to solve."
+    )
+    start_parser.add_argument(
+        "--repo-root",
+        default=".",
+        help="Repository root to scan when auto-synthesizing.",
+    )
+    start_parser.add_argument(
+        "--memory-root", default=".loopforge", help="Directory used for loop memory."
+    )
+    start_parser.add_argument(
+        "--executor-factory", help="Import path package.module:function_name"
+    )
     start_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
     start_parser.add_argument("--planner-model", default=None)
     start_parser.add_argument("--worker-model", default=None)
@@ -116,7 +170,9 @@ def _sanitize_human_text(text: str) -> str:
     for source, target in replacements.items():
         sanitized = sanitized.replace(source, target)
     encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    return sanitized.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    return sanitized.encode(encoding, errors="replace").decode(
+        encoding, errors="replace"
+    )
 
 
 def _friendly_requirement(requirement: str) -> str:
@@ -150,7 +206,9 @@ def _friendly_metric_label(metric) -> str:
     words = name.replace("_", " ").split()
     if not words:
         return name
-    return " ".join(word.upper() if word.isupper() else word.capitalize() for word in words)
+    return " ".join(
+        word.upper() if word.isupper() else word.capitalize() for word in words
+    )
 
 
 def _summarize_actions(actions: list[str], *, generic_autonomous: bool = False) -> str:
@@ -166,10 +224,14 @@ def _summarize_actions(actions: list[str], *, generic_autonomous: bool = False) 
 
 def _print_plan_summary(turn, *, print_fn=print) -> None:
     spec = turn.proposal.recommended_spec
-    generic_autonomous = spec.metadata.get("execution_backend_kind") == "generic_agentic"
+    generic_autonomous = (
+        spec.metadata.get("execution_backend_kind") == "generic_agentic"
+    )
     print_fn("\n--- Experiment plan ---")
     print_fn(f"  Goal       : {_sanitize_human_text(spec.objective)}")
-    print_fn(f"  Metric     : {_friendly_metric_label(spec.primary_metric)} ({spec.primary_metric.goal})")
+    print_fn(
+        f"  Metric     : {_friendly_metric_label(spec.primary_metric)} ({spec.primary_metric.goal})"
+    )
     if spec.guardrail_metrics:
         print_fn(
             f"  Guardrails : {', '.join(_friendly_metric_label(metric) for metric in spec.guardrail_metrics[:3])}"
@@ -178,7 +240,9 @@ def _print_plan_summary(turn, *, print_fn=print) -> None:
         print_fn(
             f"  Also track : {', '.join(_friendly_metric_label(metric) for metric in spec.secondary_metrics[:3])}"
         )
-    print_fn(f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}")
+    print_fn(
+        f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}"
+    )
     print_fn("")
 
 
@@ -314,7 +378,9 @@ def _make_iteration_callback(print_fn=print):
     return callback
 
 
-def _planning_status_message(planner_tag: str, *, first_run: bool, replan_reason: str) -> str | None:
+def _planning_status_message(
+    planner_tag: str, *, first_run: bool, replan_reason: str
+) -> str | None:
     if first_run:
         return f"\n{planner_tag} Analysing repository and planning experiment..."
     if replan_reason == "feedback":
@@ -386,7 +452,9 @@ def run_interactive_start(
         temperature=temperature,
         progress_fn=progress_fn,
     )
-    user_goal = _prompt_non_empty("What problem are we solving? ", input_fn=input_fn, print_fn=print_fn)
+    user_goal = _prompt_non_empty(
+        "What problem are we solving? ", input_fn=input_fn, print_fn=print_fn
+    )
     answers: dict[str, Any] = {}
     replan_reason = "initial"
     first_run = True
@@ -429,7 +497,7 @@ def run_interactive_start(
                     replan_reason = "initial"
                     continue
                 if redirect.lower().startswith("restart "):
-                    restarted_goal = redirect[len("restart "):].strip()
+                    restarted_goal = redirect[len("restart ") :].strip()
                     if restarted_goal:
                         user_goal = restarted_goal
                     answers = {}
@@ -437,22 +505,34 @@ def run_interactive_start(
                     replan_reason = "initial"
                     continue
                 pending_required = (
-                    [q for q in turn.proposal.questions if q.required and q.key not in answers]
+                    [
+                        q
+                        for q in turn.proposal.questions
+                        if q.required and q.key not in answers
+                    ]
                     if turn is not None
                     else []
                 )
                 if redirect and len(pending_required) == 1:
-                    answers[pending_required[0].key] = _resolve_question_answer(pending_required[0], redirect)
+                    answers[pending_required[0].key] = _resolve_question_answer(
+                        pending_required[0], redirect
+                    )
                     turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
                     replan_reason = ""
                     continue
                 pending_optional = (
-                    [q for q in turn.proposal.questions if not q.required and q.key not in answers]
+                    [
+                        q
+                        for q in turn.proposal.questions
+                        if not q.required and q.key not in answers
+                    ]
                     if turn is not None
                     else []
                 )
                 if redirect and len(pending_optional) == 1:
-                    answers[pending_optional[0].key] = _resolve_question_answer(pending_optional[0], redirect)
+                    answers[pending_optional[0].key] = _resolve_question_answer(
+                        pending_optional[0], redirect
+                    )
                     turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
                     replan_reason = ""
                     continue
@@ -472,7 +552,9 @@ def run_interactive_start(
                 print_fn(f"\n(Access guide written to {turn.access_guide_path})")
 
             # Show blockers if any
-            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            failed_checks = [
+                c for c in (turn.preflight_checks or []) if c.status == "failed"
+            ]
             if failed_checks:
                 _print_blocked_summary(turn, print_fn=print_fn)
 
@@ -490,7 +572,7 @@ def run_interactive_start(
                     print_fn(f"\n{question.prompt}")
                     for i, opt in enumerate(question.options, 1):
                         print_fn(f"  {i}. {opt}")
-                    print_fn(f"  Or type your own answer.")
+                    print_fn("  Or type your own answer.")
                     if question.suggested_answer:
                         print_fn(f"  (default: {question.suggested_answer})")
                     raw = input_fn("Your choice: ").strip()
@@ -503,12 +585,18 @@ def run_interactive_start(
                     answers[question.key] = _resolve_question_answer(question, raw)
             turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
             # Re-show blockers if still blocked after answering
-            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            failed_checks = [
+                c for c in (turn.preflight_checks or []) if c.status == "failed"
+            ]
             if failed_checks and not turn.ready_to_start:
                 _print_blocked_summary(turn, print_fn=print_fn)
             continue
 
-        optional_questions = [q for q in turn.proposal.questions if not q.required and q.key not in answers]
+        optional_questions = [
+            q
+            for q in turn.proposal.questions
+            if not q.required and q.key not in answers
+        ]
         if optional_questions:
             question = optional_questions[0]
             if question.options:
@@ -533,7 +621,9 @@ def run_interactive_start(
             elif answers[question.key]:
                 turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
                 # Re-show blockers if still blocked
-                failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+                failed_checks = [
+                    c for c in (turn.preflight_checks or []) if c.status == "failed"
+                ]
                 if failed_checks and not turn.ready_to_start:
                     _print_blocked_summary(turn, print_fn=print_fn)
                 continue
@@ -570,12 +660,16 @@ def run_interactive_start(
                     reset_state=not resume_existing_run,
                 )
             except ExperimentInterrupted as exc:
-                print_fn(f"\n--- Interrupted after {len(exc.results_so_far)} iteration(s) ---")
+                print_fn(
+                    f"\n--- Interrupted after {len(exc.results_so_far)} iteration(s) ---"
+                )
                 for i, cycle in enumerate(exc.results_so_far, 1):
                     if cycle.human_update:
                         print_fn(f"\n  Iteration {i}: {cycle.human_update}")
                 try:
-                    redirect = input_fn("\nNew instructions (or 'quit' to stop): ").strip()
+                    redirect = input_fn(
+                        "\nNew instructions (or 'quit' to stop): "
+                    ).strip()
                 except (KeyboardInterrupt, EOFError):
                     print_fn("\nAborted.")
                     return 0
@@ -596,7 +690,9 @@ def run_interactive_start(
             except KeyboardInterrupt:
                 print_fn("\n\n--- Interrupted during experiment ---")
                 try:
-                    redirect = input_fn("New instructions (or 'quit' to stop): ").strip()
+                    redirect = input_fn(
+                        "New instructions (or 'quit' to stop): "
+                    ).strip()
                 except (KeyboardInterrupt, EOFError):
                     print_fn("\nAborted.")
                     return 0
@@ -610,12 +706,16 @@ def run_interactive_start(
             _print_result_summary(result, print_fn=print_fn)
             return 0
         # If it looks like a question, answer it directly — no full re-plan
-        if response.rstrip().endswith("?") or response.lower().startswith(("what ", "why ", "how ", "can ", "do ", "is ", "are ")):
+        if response.rstrip().endswith("?") or response.lower().startswith(
+            ("what ", "why ", "how ", "can ", "do ", "is ", "are ")
+        ):
             answers.setdefault("discussion", [])
             answers["discussion"].append(response)
             try:
                 cap_ctx = app._cached_capability_context or CapabilityContext()
-                quick_reply = app.narrator_backend.answer_question(response, turn, cap_ctx)
+                quick_reply = app.narrator_backend.answer_question(
+                    response, turn, cap_ctx
+                )
                 print_fn(f"\n{narrator_tag} {quick_reply}\n")
             except Exception:
                 answers["user_feedback"] = response
@@ -630,7 +730,9 @@ def run_interactive_start(
             if turn.human_update:
                 print_fn(f"\n{narrator_tag} {turn.human_update}")
             # Re-show blockers or plan
-            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            failed_checks = [
+                c for c in (turn.preflight_checks or []) if c.status == "failed"
+            ]
             if failed_checks:
                 _print_blocked_summary(turn, print_fn=print_fn)
             elif turn.ready_to_start:
@@ -657,7 +759,9 @@ def run_from_spec(
     iterations: int | None = None,
     temperature: float = 0.2,
 ) -> list[dict[str, Any]]:
-    spec = ExperimentSpec.from_dict(json.loads(Path(spec_path).read_text(encoding="utf-8")))
+    spec = ExperimentSpec.from_dict(
+        json.loads(Path(spec_path).read_text(encoding="utf-8"))
+    )
     role_models = default_role_models(
         planner_model=worker_model,
         worker_model=worker_model,
@@ -693,11 +797,16 @@ def run_from_spec(
         memory_root=memory_root,
         executor_factory_path=executor_factory_path,
     )
-    blocking_checks = [check.detail for check in preflight_checks if check.required and check.status == "failed"]
+    blocking_checks = [
+        check.detail
+        for check in preflight_checks
+        if check.required and check.status == "failed"
+    ]
     if blocking_checks:
         raise ValueError("; ".join(blocking_checks))
     orchestrator.initialize(spec=spec, reset_state=True)
     return cycle_results_to_payload(orchestrator.run(iterations=iterations))
+
 
 def draft_spec(
     *,
@@ -774,7 +883,11 @@ def main(argv: list[str] | None = None) -> int:
                 temperature=args.temperature,
             )
         except ValueError as exc:
-            print(json.dumps({"status": "blocked", "error": str(exc)}, indent=2, sort_keys=True))
+            print(
+                json.dumps(
+                    {"status": "blocked", "error": str(exc)}, indent=2, sort_keys=True
+                )
+            )
             return 1
         print(json.dumps(results, indent=2, sort_keys=True))
         return 0

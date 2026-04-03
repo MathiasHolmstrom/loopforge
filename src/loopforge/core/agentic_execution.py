@@ -77,7 +77,13 @@ def _inline_python_command_args(command: str) -> list[str] | None:
         return None
     if command_index >= len(tokens) - 1:
         return None
-    return [tokens[0], *tokens[1:command_index], "-c", tokens[command_index + 1], *tokens[command_index + 2:]]
+    return [
+        tokens[0],
+        *tokens[1:command_index],
+        "-c",
+        tokens[command_index + 1],
+        *tokens[command_index + 2 :],
+    ]
 
 
 def _classify_shell_failure(stdout: str, stderr: str) -> tuple[str, bool, list[str]]:
@@ -85,7 +91,10 @@ def _classify_shell_failure(stdout: str, stderr: str) -> tuple[str, bool, list[s
     if (
         "permissionerror" in lower_error
         and "access is denied" in lower_error
-        and any(token in lower_error for token in ("socketpair", "multiprocessing", "_ssock", "_csock"))
+        and any(
+            token in lower_error
+            for token in ("socketpair", "multiprocessing", "_ssock", "_csock")
+        )
     ):
         return (
             "MultiprocessingPermissionError",
@@ -95,7 +104,9 @@ def _classify_shell_failure(stdout: str, stderr: str) -> tuple[str, bool, list[s
                 "Switch to a serial execution path that avoids socketpair/resource-tracker setup if the repo supports it.",
             ],
         )
-    if "can't open file" in lower_error or ("no such file or directory" in lower_error and ".py" in lower_error):
+    if "can't open file" in lower_error or (
+        "no such file or directory" in lower_error and ".py" in lower_error
+    ):
         return (
             "MissingScriptFile",
             True,
@@ -151,11 +162,17 @@ def _coerce_float(value: Any) -> float | None:
 def _known_metric_specs(spec: ExperimentSpec) -> dict[str, Any]:
     return {
         metric.name: metric
-        for metric in (spec.primary_metric, *spec.secondary_metrics, *spec.guardrail_metrics)
+        for metric in (
+            spec.primary_metric,
+            *spec.secondary_metrics,
+            *spec.guardrail_metrics,
+        )
     }
 
 
-def _coerce_metric_result(name: str, raw_value: Any, spec: ExperimentSpec) -> MetricResult | None:
+def _coerce_metric_result(
+    name: str, raw_value: Any, spec: ExperimentSpec
+) -> MetricResult | None:
     known_metrics = _known_metric_specs(spec)
     metric_spec = known_metrics.get(name)
     if isinstance(raw_value, dict):
@@ -171,9 +188,9 @@ def _coerce_metric_result(name: str, raw_value: Any, spec: ExperimentSpec) -> Me
             name=name,
             value=value,
             passed=passed,
-            scorer_ref=str(scorer_ref) if isinstance(scorer_ref, str) and scorer_ref.strip() else (
-                metric_spec.scorer_ref if metric_spec is not None else None
-            ),
+            scorer_ref=str(scorer_ref)
+            if isinstance(scorer_ref, str) and scorer_ref.strip()
+            else (metric_spec.scorer_ref if metric_spec is not None else None),
             details=details if isinstance(details, dict) else {},
         )
     value = _coerce_float(raw_value)
@@ -186,7 +203,9 @@ def _coerce_metric_result(name: str, raw_value: Any, spec: ExperimentSpec) -> Me
     )
 
 
-def _extract_metric_payload_from_mapping(payload: dict[str, Any], spec: ExperimentSpec) -> dict[str, Any]:
+def _extract_metric_payload_from_mapping(
+    payload: dict[str, Any], spec: ExperimentSpec
+) -> dict[str, Any]:
     metric_results: dict[str, MetricResult] = {}
     secondary_metrics: dict[str, float] = {}
     guardrail_metrics: dict[str, float] = {}
@@ -196,7 +215,9 @@ def _extract_metric_payload_from_mapping(payload: dict[str, Any], spec: Experime
 
     raw_metric_results = payload.get("metric_results")
     if not isinstance(raw_metric_results, dict):
-        raw_metric_results = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        raw_metric_results = (
+            payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+        )
     for name, raw_value in raw_metric_results.items():
         result = _coerce_metric_result(str(name), raw_value, spec)
         if result is not None:
@@ -223,7 +244,9 @@ def _extract_metric_payload_from_mapping(payload: dict[str, Any], spec: Experime
                 MetricResult(
                     name=str(name),
                     value=value,
-                    scorer_ref=known_metrics.get(str(name)).scorer_ref if str(name) in known_metrics else None,
+                    scorer_ref=known_metrics.get(str(name)).scorer_ref
+                    if str(name) in known_metrics
+                    else None,
                 ),
             )
 
@@ -258,7 +281,9 @@ def _extract_metric_payload_from_mapping(payload: dict[str, Any], spec: Experime
     }
 
 
-def _extract_metric_payload_from_text(text: str, spec: ExperimentSpec) -> dict[str, Any]:
+def _extract_metric_payload_from_text(
+    text: str, spec: ExperimentSpec
+) -> dict[str, Any]:
     stripped = text.strip()
     if not stripped:
         return {
@@ -268,7 +293,10 @@ def _extract_metric_payload_from_text(text: str, spec: ExperimentSpec) -> dict[s
             "guardrail_metrics": {},
         }
 
-    json_candidates = [stripped, *[line.strip() for line in stripped.splitlines() if line.strip()]]
+    json_candidates = [
+        stripped,
+        *[line.strip() for line in stripped.splitlines() if line.strip()],
+    ]
     for candidate in reversed(json_candidates):
         try:
             parsed = json.loads(candidate)
@@ -276,7 +304,10 @@ def _extract_metric_payload_from_text(text: str, spec: ExperimentSpec) -> dict[s
             continue
         if isinstance(parsed, dict):
             metric_payload = _extract_metric_payload_from_mapping(parsed, spec)
-            if metric_payload["metric_results"] or metric_payload["primary_metric_value"] is not None:
+            if (
+                metric_payload["metric_results"]
+                or metric_payload["primary_metric_value"] is not None
+            ):
                 return metric_payload
 
     metric_results: dict[str, MetricResult] = {}
@@ -294,7 +325,10 @@ def _extract_metric_payload_from_text(text: str, spec: ExperimentSpec) -> dict[s
                 continue
             name, _, value = candidate.partition(separator)
             metric_name = name.strip()
-            if metric_name not in known_metrics and metric_name != "primary_metric_value":
+            if (
+                metric_name not in known_metrics
+                and metric_name != "primary_metric_value"
+            ):
                 continue
             numeric = _coerce_float(value)
             if numeric is None:
@@ -319,13 +353,17 @@ def _extract_metric_payload_from_text(text: str, spec: ExperimentSpec) -> dict[s
     primary_metric = metric_results.get(spec.primary_metric.name)
     return {
         "metric_results": metric_results,
-        "primary_metric_value": primary_metric.value if primary_metric is not None else None,
+        "primary_metric_value": primary_metric.value
+        if primary_metric is not None
+        else None,
         "secondary_metrics": secondary_metrics,
         "guardrail_metrics": guardrail_metrics,
     }
 
 
-def _extract_metric_payload(step_results: list[dict[str, Any]], spec: ExperimentSpec) -> dict[str, Any]:
+def _extract_metric_payload(
+    step_results: list[dict[str, Any]], spec: ExperimentSpec
+) -> dict[str, Any]:
     metric_results: dict[str, MetricResult] = {}
     secondary_metrics: dict[str, float] = {}
     guardrail_metrics: dict[str, float] = {}
@@ -371,14 +409,29 @@ def _validate_steps_pre_execution(
             try:
                 workdir = _ensure_within_repo(_step_workdir(step, repo_root), repo_root)
             except Exception:
-                return False, index, f"Step {index} uses cwd outside the repo root: {step.cwd}"
+                return (
+                    False,
+                    index,
+                    f"Step {index} uses cwd outside the repo root: {step.cwd}",
+                )
             for script in _referenced_python_scripts(step.command):
                 script_path = Path(script)
-                candidate_path = (workdir / script_path) if not script_path.is_absolute() else script_path
-                if not candidate_path.exists() and candidate_path.resolve() not in planned_files:
-                    return False, index, (
-                        f"Step {index} references {candidate_path} which does not exist "
-                        f"and is not created by an earlier write_file step."
+                candidate_path = (
+                    (workdir / script_path)
+                    if not script_path.is_absolute()
+                    else script_path
+                )
+                if (
+                    not candidate_path.exists()
+                    and candidate_path.resolve() not in planned_files
+                ):
+                    return (
+                        False,
+                        index,
+                        (
+                            f"Step {index} references {candidate_path} which does not exist "
+                            f"and is not created by an earlier write_file step."
+                        ),
                     )
     return True, 0, ""
 
@@ -400,7 +453,9 @@ def _run_steps(
         except Exception:
             return ExperimentOutcome(
                 status="blocked",
-                notes=[f"Step {index} targeted a working directory outside the repo root."],
+                notes=[
+                    f"Step {index} targeted a working directory outside the repo root."
+                ],
                 failure_type="UnsafePath",
                 failure_summary=f"Refused to run outside the repo root via cwd: {step.cwd}",
                 recoverable=False,
@@ -416,7 +471,9 @@ def _run_steps(
                     failure_type="MissingStepPath",
                     failure_summary=f"Step {index} did not include a path.",
                     recoverable=True,
-                    recovery_actions=["Provide a repo-relative path for the file step and retry."],
+                    recovery_actions=[
+                        "Provide a repo-relative path for the file step and retry."
+                    ],
                     execution_details={"step_results": step_results},
                 ), step_results
             try:
@@ -436,20 +493,29 @@ def _run_steps(
             else:
                 with target_path.open("a", encoding="utf-8") as handle:
                     handle.write(step.content or "")
-            step_results.append({
-                "index": index,
-                "kind": step.kind,
-                "path": str(target_path),
-                "bytes_written": len((step.content or "").encode("utf-8")),
-            })
+            step_results.append(
+                {
+                    "index": index,
+                    "kind": step.kind,
+                    "path": str(target_path),
+                    "bytes_written": len((step.content or "").encode("utf-8")),
+                }
+            )
             planned_files.add(target_path.resolve())
             continue
 
         # Shell step — check for missing scripts first
         for script in _referenced_python_scripts(step.command):
             script_path = Path(script)
-            candidate_path = (workdir / script_path) if not script_path.is_absolute() else script_path
-            if not candidate_path.exists() and candidate_path.resolve() not in planned_files:
+            candidate_path = (
+                (workdir / script_path)
+                if not script_path.is_absolute()
+                else script_path
+            )
+            if (
+                not candidate_path.exists()
+                and candidate_path.resolve() not in planned_files
+            ):
                 return ExperimentOutcome(
                     status="recoverable_failure",
                     notes=[f"Step {index} references missing script: {candidate_path}"],
@@ -486,10 +552,16 @@ def _run_steps(
                     check=False,
                 )
         except subprocess.TimeoutExpired as exc:
-            step_results.append({
-                "index": index, "kind": step.kind, "command": step.command,
-                "cwd": str(workdir), "timeout_seconds": timeout_seconds, "status": "timeout",
-            })
+            step_results.append(
+                {
+                    "index": index,
+                    "kind": step.kind,
+                    "command": step.command,
+                    "cwd": str(workdir),
+                    "timeout_seconds": timeout_seconds,
+                    "status": "timeout",
+                }
+            )
             return ExperimentOutcome(
                 status="recoverable_failure",
                 notes=[f"Step {index} timed out: {step.command}"],
@@ -500,15 +572,17 @@ def _run_steps(
                 execution_details={"step_results": step_results},
             ), step_results
         except PermissionError as exc:
-            step_results.append({
-                "index": index,
-                "kind": step.kind,
-                "command": step.command,
-                "cwd": str(workdir),
-                "timeout_seconds": timeout_seconds,
-                "status": "permission_error",
-                "stderr": str(exc),
-            })
+            step_results.append(
+                {
+                    "index": index,
+                    "kind": step.kind,
+                    "command": step.command,
+                    "cwd": str(workdir),
+                    "timeout_seconds": timeout_seconds,
+                    "status": "permission_error",
+                    "stderr": str(exc),
+                }
+            )
             return ExperimentOutcome(
                 status="recoverable_failure",
                 notes=[f"Step {index} could not start because the OS denied access."],
@@ -524,19 +598,30 @@ def _run_steps(
 
         stdout = completed.stdout[-max_captured_chars:]
         stderr = completed.stderr[-max_captured_chars:]
-        step_results.append({
-            "index": index, "kind": step.kind, "command": step.command,
-            "cwd": str(workdir), "timeout_seconds": timeout_seconds,
-            "returncode": completed.returncode, "stdout": stdout, "stderr": stderr,
-        })
+        step_results.append(
+            {
+                "index": index,
+                "kind": step.kind,
+                "command": step.command,
+                "cwd": str(workdir),
+                "timeout_seconds": timeout_seconds,
+                "returncode": completed.returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+        )
 
         if completed.returncode != 0 and not step.allow_failure:
-            failure_type, recoverable, recovery_actions = _classify_shell_failure(stdout, stderr)
+            failure_type, recoverable, recovery_actions = _classify_shell_failure(
+                stdout, stderr
+            )
             return ExperimentOutcome(
                 status="recoverable_failure" if recoverable else "blocked",
                 notes=[f"Step {index} failed: {step.command}"],
                 failure_type=failure_type,
-                failure_summary=stderr.strip() or stdout.strip() or f"Exit code {completed.returncode}.",
+                failure_summary=stderr.strip()
+                or stdout.strip()
+                or f"Exit code {completed.returncode}.",
                 recoverable=recoverable,
                 recovery_actions=recovery_actions,
                 execution_details={"step_results": step_results},
@@ -586,7 +671,9 @@ class GenericExecutionPlanExecutor:
     def _steps_equal(left: list[ExecutionStep], right: list[ExecutionStep]) -> bool:
         return [step.to_dict() for step in left] == [step.to_dict() for step in right]
 
-    def execute(self, candidate: ExperimentCandidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
+    def execute(
+        self, candidate: ExperimentCandidate, snapshot: MemorySnapshot
+    ) -> ExperimentOutcome:
         if not candidate.execution_steps:
             return ExperimentOutcome(
                 status="recoverable_failure",
@@ -594,7 +681,9 @@ class GenericExecutionPlanExecutor:
                 failure_type="MissingExecutionSteps",
                 failure_summary="The worker proposed an agentic step without concrete execution steps.",
                 recoverable=True,
-                recovery_actions=["Propose concrete shell steps for the next iteration."],
+                recovery_actions=[
+                    "Propose concrete shell steps for the next iteration."
+                ],
                 execution_details={"step_results": []},
             )
 
@@ -603,15 +692,27 @@ class GenericExecutionPlanExecutor:
 
         for attempt in range(1 + self.max_retries):
             # Pre-validate before running
-            valid, failed_idx, reason = _validate_steps_pre_execution(current_steps, self.repo_root)
-            if not valid and self.fix_backend is not None and attempt < self.max_retries:
+            valid, failed_idx, reason = _validate_steps_pre_execution(
+                current_steps, self.repo_root
+            )
+            if (
+                not valid
+                and self.fix_backend is not None
+                and attempt < self.max_retries
+            ):
                 fixer_label = self._fix_backend_label()
                 self.progress_fn(
                     f"fix_attempt_{attempt}",
                     f"[{fixer_label}] Pre-validation failed at step {failed_idx}: {reason}",
                 )
                 fixed_steps = self._ask_for_fix(
-                    snapshot, candidate, current_steps, failed_idx, reason, [], attempt + 1,
+                    snapshot,
+                    candidate,
+                    current_steps,
+                    failed_idx,
+                    reason,
+                    [],
+                    attempt + 1,
                 )
                 if fixed_steps:
                     self.progress_fn(
@@ -631,24 +732,33 @@ class GenericExecutionPlanExecutor:
                 self.progress_fn(f"retry_{attempt}", f"Retry attempt {attempt + 1}...")
 
             failure_outcome, step_results = _run_steps(
-                current_steps, self.repo_root,
-                self.default_timeout_seconds, self.max_captured_chars,
+                current_steps,
+                self.repo_root,
+                self.default_timeout_seconds,
+                self.max_captured_chars,
             )
-            all_attempt_results.append({
-                "attempt": attempt + 1,
-                "steps": [s.to_dict() for s in current_steps],
-                "step_results": step_results,
-                "success": failure_outcome is None,
-            })
+            all_attempt_results.append(
+                {
+                    "attempt": attempt + 1,
+                    "steps": [s.to_dict() for s in current_steps],
+                    "step_results": step_results,
+                    "success": failure_outcome is None,
+                }
+            )
 
             if failure_outcome is None:
-                metric_payload = _extract_metric_payload(step_results, snapshot.effective_spec)
+                metric_payload = _extract_metric_payload(
+                    step_results, snapshot.effective_spec
+                )
                 notes = [
                     f"Executed {len(current_steps)} step(s) successfully"
                     + (f" (after {attempt} fix(es))" if attempt > 0 else "")
                     + "."
                 ]
-                if metric_payload["metric_results"] or metric_payload["primary_metric_value"] is not None:
+                if (
+                    metric_payload["metric_results"]
+                    or metric_payload["primary_metric_value"] is not None
+                ):
                     notes.append("Captured metric output from execution stdout.")
                 # Success!
                 return ExperimentOutcome(

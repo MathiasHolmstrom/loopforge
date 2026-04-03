@@ -55,7 +55,9 @@ def _snapshot(
     )
 
 
-def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(
+    tmp_path, monkeypatch
+) -> None:
     asset_path = tmp_path / "matches.csv"
     asset_path.write_text("kills\n1\n", encoding="utf-8")
 
@@ -76,7 +78,9 @@ def test_probe_data_asset_timeout_returns_without_waiting_for_probe_completion(t
     assert elapsed < 0.15
 
 
-def test_probe_data_asset_skips_new_probe_while_timed_out_probe_is_still_running(tmp_path, monkeypatch) -> None:
+def test_probe_data_asset_skips_new_probe_while_timed_out_probe_is_still_running(
+    tmp_path, monkeypatch
+) -> None:
     first_asset = tmp_path / "first.csv"
     second_asset = tmp_path / "second.csv"
     first_asset.write_text("kills\n1\n", encoding="utf-8")
@@ -124,16 +128,24 @@ def test_probe_data_asset_skips_reprobe_for_same_asset_while_previous_timeout_is
     second_schema = bootstrap_module._probe_data_asset(str(asset_path), tmp_path)
 
     assert first_schema.load_error == "Probe timed out after 0.01s"
-    assert second_schema.load_error == "Probe skipped because a previous timed-out probe is still running for this asset."
+    assert (
+        second_schema.load_error
+        == "Probe skipped because a previous timed-out probe is still running for this asset."
+    )
     time.sleep(0.25)
 
 
-def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tmp_path) -> None:
+def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(
+    tmp_path,
+) -> None:
     spec = build_spec(allowed_actions=["run_experiment", "fix_failure"])
     snapshot = _snapshot(
         spec,
         CapabilityContext(
-            environment_facts={"execution_shell": "cmd.exe", "shell_family": "windows_cmd"}
+            environment_facts={
+                "execution_shell": "cmd.exe",
+                "shell_family": "windows_cmd",
+            }
         ),
     )
     candidate = ExperimentCandidate(
@@ -155,7 +167,9 @@ def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tm
             self.model = "anthropic/claude-opus-4-6-v1"
             self.seen_commands: list[str] = []
 
-        def fix_execution_plan(self, candidate, failed_step_index, failure_summary, step_results):
+        def fix_execution_plan(
+            self, candidate, failed_step_index, failure_summary, step_results
+        ):
             self.seen_commands.append(candidate.execution_steps[0].command)
             if len(self.seen_commands) == 1:
                 return [
@@ -182,23 +196,34 @@ def test_generic_execution_fix_uses_latest_revised_plan_on_subsequent_repairs(tm
     ).execute(candidate, snapshot)
 
     assert outcome.status == "success"
-    assert fix_backend.seen_commands == ["python missing_script.py", "head missing_script.py"]
+    assert fix_backend.seen_commands == [
+        "python missing_script.py",
+        "head missing_script.py",
+    ]
 
 
-def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_commands(tmp_path) -> None:
+def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_commands(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    (repo_root / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (repo_root / "pyproject.toml").write_text(
+        "[project]\nname = 'demo'\n", encoding="utf-8"
+    )
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Generic executor is ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["inspect_repo", "fix_failure"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -238,19 +263,27 @@ def test_loopforge_generic_executor_preserves_stdout_for_multiline_python_c_comm
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Inspection succeeded.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Inspection succeeded.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
     )
 
     result = app.start(user_goal="Inspect the repo.")
 
     assert result["status"] == "started"
-    step_result = result["results"][0]["record"]["outcome"]["execution_details"]["step_results"][0]
+    step_result = result["results"][0]["record"]["outcome"]["execution_details"][
+        "step_results"
+    ][0]
     assert step_result["returncode"] == 0
     assert "pyproject.toml" in step_result["stdout"]
 
 
-def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_path) -> None:
+def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(
+    tmp_path,
+) -> None:
     spec = build_spec(
         allowed_actions=["run_experiment"],
         primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
@@ -283,7 +316,9 @@ def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_p
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "success"
     assert outcome.primary_metric_value == 0.19
@@ -293,7 +328,9 @@ def test_generic_execution_plan_executor_captures_metrics_from_json_stdout(tmp_p
     assert "Captured metric output" in outcome.notes[-1]
 
 
-def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable_failure(tmp_path) -> None:
+def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable_failure(
+    tmp_path,
+) -> None:
     spec = build_spec(allowed_actions=["run_experiment"])
     snapshot = _snapshot(spec)
     candidate = ExperimentCandidate(
@@ -313,7 +350,9 @@ def test_generic_execution_plan_executor_treats_permission_denied_as_recoverable
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "recoverable_failure"
     assert outcome.failure_type == "ShellPermissionDenied"
@@ -337,7 +376,9 @@ def test_generic_execution_plan_executor_runs_shell_steps(tmp_path) -> None:
         ],
     )
 
-    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(candidate, snapshot)
+    outcome = GenericExecutionPlanExecutor(repo_root=tmp_path).execute(
+        candidate, snapshot
+    )
 
     assert outcome.status == "success"
     assert "Executed" in outcome.notes[0] and "step" in outcome.notes[0]

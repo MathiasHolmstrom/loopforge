@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from collections.abc import Mapping
@@ -71,7 +71,9 @@ DATA_SCIENCE_METRICS_REASONING = (
 
 
 class WorkerBackend(Protocol):
-    def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate: ...
+    def propose_next_experiment(
+        self, snapshot: MemorySnapshot
+    ) -> ExperimentCandidate: ...
 
 
 class SpecBackend(Protocol):
@@ -117,7 +119,9 @@ class AccessAdvisorBackend(Protocol):
 
 
 class RunnerAuthoringBackend(Protocol):
-    def author_runner(self, request: RunnerAuthoringRequest) -> RunnerAuthoringResult: ...
+    def author_runner(
+        self, request: RunnerAuthoringRequest
+    ) -> RunnerAuthoringResult: ...
 
 
 class ReviewBackend(Protocol):
@@ -202,6 +206,7 @@ class _LiteLLMJsonBackend:
         completion_fn = self._completion_fn
         if completion_fn is None:
             from litellm import completion as litellm_completion
+
             completion_fn = litellm_completion
         response = completion_fn(
             model=self.model,
@@ -211,13 +216,25 @@ class _LiteLLMJsonBackend:
         )
         return self._extract_content(response)
 
-    def _complete_json(self, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _complete_json(
+        self, system_prompt: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
         messages = [
-            {"role": "system", "content": f"{system_prompt} Return a valid JSON object only."},
-            {"role": "user", "content": json.dumps(payload, indent=2, sort_keys=True, default=self._json_default)},
+            {
+                "role": "system",
+                "content": f"{system_prompt} Return a valid JSON object only.",
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    payload, indent=2, sort_keys=True, default=self._json_default
+                ),
+            },
         ]
         if self._stream_fn and self._completion_fn is None:
-            content = self._stream_completion(messages, response_format={"type": "json_object"})
+            content = self._stream_completion(
+                messages, response_format={"type": "json_object"}
+            )
             return json.loads(content)
         completion_fn = self._completion_fn
         if completion_fn is None:
@@ -295,9 +312,13 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
         elif latest_record.candidate.action_type in allowed_actions:
             recommended_next_action = latest_record.candidate.action_type
         else:
-            recommended_next_action = forced_next_action or (allowed_actions[0] if allowed_actions else "explore")
+            recommended_next_action = forced_next_action or (
+                allowed_actions[0] if allowed_actions else "explore"
+            )
     else:
-        recommended_next_action = forced_next_action or (allowed_actions[0] if allowed_actions else "explore")
+        recommended_next_action = forced_next_action or (
+            allowed_actions[0] if allowed_actions else "explore"
+        )
     return {
         "name": "guided_observation",
         "allowed_actions": allowed_actions,
@@ -314,7 +335,9 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
             for record in snapshot.recent_records
             if record.outcome.status != "success"
         ],
-        "recent_action_types": [summary.action_type for summary in snapshot.recent_summaries],
+        "recent_action_types": [
+            summary.action_type for summary in snapshot.recent_summaries
+        ],
         "forced_next_action": forced_next_action,
         "recommended_next_action": recommended_next_action,
     }
@@ -339,10 +362,15 @@ def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
         "shell_family": env.get("shell_family"),
         "python_executable": env.get("python_executable"),
         "execution_backend_kind": env.get("execution_backend_kind"),
-        "verified_execution_lane": bool(env.get("python_executable")) and bool(env.get("repo_root")),
+        "verified_execution_lane": bool(env.get("python_executable"))
+        and bool(env.get("repo_root")),
         "must_reuse_verified_lane": True,
-        "available_bootstrap_handoff_files": sorted(item.path for item in snapshot.markdown_memory),
-        "execution_runbook": _markdown_content_by_name(snapshot, "execution_runbook.md"),
+        "available_bootstrap_handoff_files": sorted(
+            item.path for item in snapshot.markdown_memory
+        ),
+        "execution_runbook": _markdown_content_by_name(
+            snapshot, "execution_runbook.md"
+        ),
         "experiment_guide": _markdown_content_by_name(snapshot, "experiment_guide.md"),
     }
 
@@ -355,7 +383,10 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
             action_type=payload["action_type"],
             change_type=payload["change_type"],
             instructions=payload["instructions"],
-            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
+            execution_steps=[
+                ExecutionStep.from_dict(step)
+                for step in payload.get("execution_steps", [])
+            ],
             config_patch=payload.get("config_patch", {}),
             metadata=payload.get("metadata", {}),
         )
@@ -395,12 +426,22 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
                 "execution_handoff": execution_handoff,
-                "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
-                "recent_records": [record.to_dict() for record in snapshot.recent_records],
-                "recent_summaries": [summary.to_dict() for summary in snapshot.recent_summaries],
-                "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
+                "best_summary": snapshot.best_summary.to_dict()
+                if snapshot.best_summary is not None
+                else None,
+                "recent_records": [
+                    record.to_dict() for record in snapshot.recent_records
+                ],
+                "recent_summaries": [
+                    summary.to_dict() for summary in snapshot.recent_summaries
+                ],
+                "recent_human_interventions": [
+                    item.to_dict() for item in snapshot.recent_human_interventions
+                ],
                 "lessons_learned": snapshot.lessons_learned,
-                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "markdown_memory": [
+                    item.to_dict() for item in snapshot.markdown_memory
+                ],
                 "iteration_policy": iteration_policy,
                 "next_iteration_id": snapshot.next_iteration_id,
                 "instructions": {
@@ -421,7 +462,9 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 },
             },
         )
-        payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=iteration_policy)
+        payload = self._normalise_candidate_payload(
+            payload, snapshot, iteration_policy=iteration_policy
+        )
         return self._candidate_from_payload(payload)
 
     def continue_experiment(
@@ -453,7 +496,9 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "previous_hypothesis": previous_candidate.hypothesis,
                 "previous_instructions": previous_candidate.instructions,
                 "previous_outcome_notes": previous_outcome.notes,
-                "previous_step_results": previous_outcome.execution_details.get("step_results", []),
+                "previous_step_results": previous_outcome.execution_details.get(
+                    "step_results", []
+                ),
                 "instructions": {
                     "return_fields": [
                         "hypothesis",
@@ -469,7 +514,9 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 },
             },
         )
-        payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=build_iteration_policy(snapshot))
+        payload = self._normalise_candidate_payload(
+            payload, snapshot, iteration_policy=build_iteration_policy(snapshot)
+        )
         return self._candidate_from_payload(payload)
 
     @staticmethod
@@ -480,7 +527,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         iteration_policy: dict[str, Any],
     ) -> dict[str, Any]:
         candidate_payload = dict(payload or {})
-        generic_autonomous = bool(iteration_policy.get("generic_autonomous"))
+        generic_autonomous = bool(iteration_policy.get("generic_autonomous"))  # noqa: F841
         # Structural: ensure required string fields exist (visible if agent failed to specify)
         action_type = candidate_payload.get("action_type")
         if not isinstance(action_type, str) or not action_type.strip():
@@ -643,10 +690,9 @@ CONSULTATION_TRIGGER_TOKENS = (
 
 
 def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
-    if (
-        snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
-        and _has_markdown_name(snapshot, "execution_runbook.md")
-    ):
+    if snapshot.capability_context.environment_facts.get(
+        "execution_backend_kind"
+    ) == "generic_agentic" and _has_markdown_name(snapshot, "execution_runbook.md"):
         return False
     # Only trigger for genuine ops/infra topics — not generic data science work
     search_space = [
@@ -661,7 +707,9 @@ def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
     return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
 
 
-def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation) -> MemorySnapshot:
+def _inject_consultation(
+    snapshot: MemorySnapshot, consultation: OpsConsultation
+) -> MemorySnapshot:
     updated_notes = list(snapshot.capability_context.notes)
     updated_notes.append(f"Helper consult focus: {consultation.focus}")
     updated_notes.append(f"Helper consult guidance: {consultation.guidance}")
@@ -670,7 +718,9 @@ def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation
     if consultation.commands:
         updated_notes.append("Suggested commands: " + "; ".join(consultation.commands))
     if consultation.required_env_vars:
-        updated_notes.append("Required env vars: " + ", ".join(consultation.required_env_vars))
+        updated_notes.append(
+            "Required env vars: " + ", ".join(consultation.required_env_vars)
+        )
     if consultation.risks:
         updated_notes.append("Operational risks: " + "; ".join(consultation.risks))
     updated_environment_facts = dict(snapshot.capability_context.environment_facts)
@@ -700,8 +750,13 @@ class ConsultingWorkerBackend:
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
         consultation = None
         delegated_snapshot = snapshot
-        if self.consultation_backend is not None and should_request_ops_consult(snapshot):
-            self.progress_fn("helper_consult", f"[{self.helper_label}] Codex is asking helper agent for advice...")
+        if self.consultation_backend is not None and should_request_ops_consult(
+            snapshot
+        ):
+            self.progress_fn(
+                "helper_consult",
+                f"[{self.helper_label}] Codex is asking helper agent for advice...",
+            )
             try:
                 consultation = self.consultation_backend.consult(snapshot)
             except Exception as exc:
@@ -710,8 +765,15 @@ class ConsultingWorkerBackend:
                     guidance=f"Consultation backend failed: {exc}",
                     should_consult=False,
                 )
-            if consultation.should_consult and consultation.guidance.strip() and "unavailable" not in consultation.guidance.lower() and "no concrete guidance" not in consultation.guidance.lower():
-                self.progress_fn("helper_consult_detail", self._format_consultation(consultation))
+            if (
+                consultation.should_consult
+                and consultation.guidance.strip()
+                and "unavailable" not in consultation.guidance.lower()
+                and "no concrete guidance" not in consultation.guidance.lower()
+            ):
+                self.progress_fn(
+                    "helper_consult_detail", self._format_consultation(consultation)
+                )
             if consultation.should_consult:
                 delegated_snapshot = _inject_consultation(snapshot, consultation)
         candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
@@ -728,7 +790,9 @@ class ConsultingWorkerBackend:
         previous_candidate: ExperimentCandidate,
         previous_outcome: ExperimentOutcome,
     ) -> ExperimentCandidate:
-        return self.worker_backend.continue_experiment(snapshot, previous_candidate, previous_outcome)
+        return self.worker_backend.continue_experiment(
+            snapshot, previous_candidate, previous_outcome
+        )
 
     @staticmethod
     def _format_consultation(consultation: OpsConsultation) -> str:
@@ -739,7 +803,9 @@ class ConsultingWorkerBackend:
         if consultation.commands:
             lines.append(f"  Commands   : {' ; '.join(consultation.commands[:3])}")
         if consultation.required_env_vars:
-            lines.append(f"  Env        : {', '.join(consultation.required_env_vars[:5])}")
+            lines.append(
+                f"  Env        : {', '.join(consultation.required_env_vars[:5])}"
+            )
         if consultation.risks:
             lines.append(f"  Risks      : {' ; '.join(consultation.risks[:3])}")
         return "\n".join(lines)
@@ -793,7 +859,9 @@ class LiteLLMSpecBackend(_LiteLLMJsonBackend):
         return ExperimentSpecProposal(
             objective=payload["objective"],
             recommended_spec=ExperimentSpec.from_dict(payload["recommended_spec"]),
-            questions=[SpecQuestion.from_dict(item) for item in payload.get("questions", [])],
+            questions=[
+                SpecQuestion.from_dict(item) for item in payload.get("questions", [])
+            ],
             notes=raw_notes,
         )
 
@@ -824,7 +892,9 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                 "capability_context": capability_context.to_dict(),
                 "answer_history": answer_history or {},
                 "bootstrap_memory": bootstrap_memory or {},
-                "role_models": role_models.to_dict() if role_models is not None else None,
+                "role_models": role_models.to_dict()
+                if role_models is not None
+                else None,
                 "instructions": {
                     "return_fields": [
                         "assistant_message",
@@ -891,7 +961,9 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                 "I scanned the repo and prepared an initial bootstrap proposal.",
             ),
             proposal=ExperimentSpecProposal.from_dict(proposal_payload),
-            role_models=RoleModelConfig.from_dict(payload.get("role_models", resolved_role_models.to_dict())),
+            role_models=RoleModelConfig.from_dict(
+                payload.get("role_models", resolved_role_models.to_dict())
+            ),
             ready_to_start=payload.get("ready_to_start", False),
         )
 
@@ -947,22 +1019,25 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                 "Write only what the worker needs to get started. Be specific — include file paths, function names, "
                 "column names, and code patterns. No preamble."
             ),
-            user_message=json.dumps({
-                "experiment_spec": turn.proposal.recommended_spec.to_dict(),
-                "capability_context": capability_context.to_dict(),
-                "user_answers": answers or {},
-                "planner_notes": turn.proposal.notes,
-                "sections_to_cover": [
-                    "Data loading: exact function/file to call, what it returns",
-                    "Schema: key columns, types, what they represent",
-                    "Target: column to predict, any transformations needed",
-                    "Features: what feature engineering to apply, existing utilities to reuse",
-                    "Metrics: how each metric is computed, scorer references",
-                    "Splits: CV strategy, grouping keys to prevent leakage",
-                    "Derivations: any columns that need to be created from existing data",
-                    "User decisions: anything confirmed during planning",
-                ],
-            }, indent=2),
+            user_message=json.dumps(
+                {
+                    "experiment_spec": turn.proposal.recommended_spec.to_dict(),
+                    "capability_context": capability_context.to_dict(),
+                    "user_answers": answers or {},
+                    "planner_notes": turn.proposal.notes,
+                    "sections_to_cover": [
+                        "Data loading: exact function/file to call, what it returns",
+                        "Schema: key columns, types, what they represent",
+                        "Target: column to predict, any transformations needed",
+                        "Features: what feature engineering to apply, existing utilities to reuse",
+                        "Metrics: how each metric is computed, scorer references",
+                        "Splits: CV strategy, grouping keys to prevent leakage",
+                        "Derivations: any columns that need to be created from existing data",
+                        "User decisions: anything confirmed during planning",
+                    ],
+                },
+                indent=2,
+            ),
         )
 
     @staticmethod
@@ -973,15 +1048,27 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         capability_context: CapabilityContext,
     ) -> dict[str, Any]:
         proposal_payload = dict(payload) if isinstance(payload, Mapping) else {}
-        if not isinstance(proposal_payload.get("objective"), str) or not proposal_payload.get("objective", "").strip():
+        if (
+            not isinstance(proposal_payload.get("objective"), str)
+            or not proposal_payload.get("objective", "").strip()
+        ):
             proposal_payload["objective"] = user_goal
         raw_recommended_spec = proposal_payload.get("recommended_spec")
-        recommended_spec = dict(raw_recommended_spec) if isinstance(raw_recommended_spec, Mapping) else {}
-        if not isinstance(recommended_spec.get("objective"), str) or not recommended_spec.get("objective", "").strip():
+        recommended_spec = (
+            dict(raw_recommended_spec)
+            if isinstance(raw_recommended_spec, Mapping)
+            else {}
+        )
+        if (
+            not isinstance(recommended_spec.get("objective"), str)
+            or not recommended_spec.get("objective", "").strip()
+        ):
             recommended_spec["objective"] = proposal_payload["objective"]
         # Normalise metrics — structural only, never inject domain decisions
-        recommended_spec["primary_metric"] = LiteLLMBootstrapBackend._normalise_metric_payload(
-            recommended_spec.get("primary_metric"),
+        recommended_spec["primary_metric"] = (
+            LiteLLMBootstrapBackend._normalise_metric_payload(
+                recommended_spec.get("primary_metric"),
+            )
         )
         recommended_spec["secondary_metrics"] = [
             LiteLLMBootstrapBackend._normalise_metric_payload(metric_payload)
@@ -995,11 +1082,20 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         allowed_actions = recommended_spec.get("allowed_actions", [])
         if not isinstance(allowed_actions, list):
             allowed_actions = [str(allowed_actions)] if allowed_actions else []
-        normalized_actions = [str(action) for action in allowed_actions if str(action).strip()]
-        if capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic":
-            generic_actions = capability_context.environment_facts.get("generic_autonomous_actions", [])
+        normalized_actions = [
+            str(action) for action in allowed_actions if str(action).strip()
+        ]
+        if (
+            capability_context.environment_facts.get("execution_backend_kind")
+            == "generic_agentic"
+        ):
+            generic_actions = capability_context.environment_facts.get(
+                "generic_autonomous_actions", []
+            )
             if isinstance(generic_actions, list):
-                merged_actions = [str(action) for action in generic_actions if str(action).strip()]
+                merged_actions = [
+                    str(action) for action in generic_actions if str(action).strip()
+                ]
                 for action in normalized_actions:
                     if action not in merged_actions:
                         merged_actions.append(action)
@@ -1026,7 +1122,9 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         return proposal_payload
 
     @staticmethod
-    def _normalise_metric_payload(payload: dict[str, Any] | str | None) -> dict[str, Any]:
+    def _normalise_metric_payload(
+        payload: dict[str, Any] | str | None,
+    ) -> dict[str, Any]:
         """Ensure structurally required fields exist so the dataclass won't crash."""
         if isinstance(payload, str):
             payload = {"name": payload}
@@ -1061,7 +1159,9 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         return recommended_spec
 
 
-LiteLLMBootstrapBackend.build_experiment_guide = LiteLLMRunnerAuthoringBackend.build_experiment_guide
+LiteLLMBootstrapBackend.build_experiment_guide = (
+    LiteLLMRunnerAuthoringBackend.build_experiment_guide
+)
 LiteLLMBootstrapBackend._normalise_bootstrap_proposal = staticmethod(
     LiteLLMRunnerAuthoringBackend._normalise_bootstrap_proposal
 )
@@ -1086,9 +1186,15 @@ class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
                 payload={
                     "effective_spec": snapshot.effective_spec.to_dict(),
                     "capability_context": snapshot.capability_context.to_dict(),
-                    "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
-                    "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
-                    "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                    "recent_human_interventions": [
+                        item.to_dict() for item in snapshot.recent_human_interventions
+                    ],
+                    "best_summary": snapshot.best_summary.to_dict()
+                    if snapshot.best_summary is not None
+                    else None,
+                    "markdown_memory": [
+                        item.to_dict() for item in snapshot.markdown_memory
+                    ],
                     "instructions": {
                         "return_fields": [
                             "focus",
@@ -1117,7 +1223,9 @@ class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
             if isinstance(nested_payload, Mapping):
                 payload = dict(nested_payload)
         try:
-            return OpsConsultation.from_dict(dict(payload) if isinstance(payload, Mapping) else {})
+            return OpsConsultation.from_dict(
+                dict(payload) if isinstance(payload, Mapping) else {}
+            )
         except Exception as exc:
             return OpsConsultation(
                 focus="helper consultation unavailable",
@@ -1180,7 +1288,13 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
             stripped = value.strip()
             return stripped or None
         if isinstance(value, Mapping):
-            for key in ("action_type", "recommended_next_action", "next_action", "action", "name"):
+            for key in (
+                "action_type",
+                "recommended_next_action",
+                "next_action",
+                "action",
+                "name",
+            ):
                 nested = value.get(key)
                 if isinstance(nested, str) and nested.strip():
                     return nested.strip()
@@ -1209,7 +1323,14 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
             reflection_payload = dict(raw_payload)
 
         assessment = None
-        for key in ("assessment", "summary", "analysis", "reflection", "message", "text"):
+        for key in (
+            "assessment",
+            "summary",
+            "analysis",
+            "reflection",
+            "message",
+            "text",
+        ):
             value = reflection_payload.get(key)
             if isinstance(value, str) and value.strip():
                 assessment = value.strip()
@@ -1233,7 +1354,9 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
                     f"Suggested next action: {recommended_next_action}."
                 )
             else:
-                assessment = "[fallback] Reflection agent did not provide an assessment."
+                assessment = (
+                    "[fallback] Reflection agent did not provide an assessment."
+                )
 
         return {
             "assessment": assessment,
@@ -1262,12 +1385,25 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
                 "capability_context": snapshot.capability_context.to_dict(),
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
-                "recent_records": [record.to_dict() for record in snapshot.recent_records],
-                "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
-                "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
-                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "recent_records": [
+                    record.to_dict() for record in snapshot.recent_records
+                ],
+                "best_summary": snapshot.best_summary.to_dict()
+                if snapshot.best_summary is not None
+                else None,
+                "recent_human_interventions": [
+                    item.to_dict() for item in snapshot.recent_human_interventions
+                ],
+                "markdown_memory": [
+                    item.to_dict() for item in snapshot.markdown_memory
+                ],
                 "instructions": {
-                    "return_fields": ["assessment", "lessons", "risks", "recommended_next_action"],
+                    "return_fields": [
+                        "assessment",
+                        "lessons",
+                        "risks",
+                        "recommended_next_action",
+                    ],
                     "assessment_requirements": [
                         "assessment is required and must be a non-empty string",
                         "recommended_next_action must be a short action label string, not an object",
@@ -1307,15 +1443,26 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
                 "reflection": reflection.to_dict(),
-                "recent_records": [record.to_dict() for record in snapshot.recent_records],
-                "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
-                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "recent_records": [
+                    record.to_dict() for record in snapshot.recent_records
+                ],
+                "best_summary": snapshot.best_summary.to_dict()
+                if snapshot.best_summary is not None
+                else None,
+                "markdown_memory": [
+                    item.to_dict() for item in snapshot.markdown_memory
+                ],
             },
         )
         if payload.get("status") not in {"accepted", "rejected", "pending_human"}:
             payload["status"] = "pending_human"
-        if not isinstance(payload.get("reason"), str) or not payload.get("reason", "").strip():
-            payload["reason"] = "[fallback] Review agent returned incomplete response; escalating to human."
+        if (
+            not isinstance(payload.get("reason"), str)
+            or not payload.get("reason", "").strip()
+        ):
+            payload["reason"] = (
+                "[fallback] Review agent returned incomplete response; escalating to human."
+            )
         return ReviewDecision(
             status=payload["status"],
             reason=payload["reason"],
@@ -1379,11 +1526,14 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
         turn: BootstrapTurn,
         capability_context: CapabilityContext,
     ) -> str:
-        context = json.dumps({
-            "current_plan": turn.proposal.to_dict(),
-            "capability_context": capability_context.to_dict(),
-            "preflight_checks": [c.to_dict() for c in turn.preflight_checks],
-        }, indent=2)
+        context = json.dumps(
+            {
+                "current_plan": turn.proposal.to_dict(),
+                "capability_context": capability_context.to_dict(),
+                "preflight_checks": [c.to_dict() for c in turn.preflight_checks],
+            },
+            indent=2,
+        )
         return self._complete_text(
             system_prompt=(
                 "You are a skilled data scientist discussing an experiment plan with the user. "
@@ -1417,7 +1567,9 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             ),
             payload={
                 "current_spec": turn.proposal.recommended_spec.to_dict(),
-                "blockers": [c.to_dict() for c in turn.preflight_checks if c.status == "failed"],
+                "blockers": [
+                    c.to_dict() for c in turn.preflight_checks if c.status == "failed"
+                ],
                 "missing_requirements": turn.missing_requirements,
                 "user_feedback": feedback,
                 "capability_context": capability_context.to_dict(),
@@ -1464,12 +1616,16 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
-                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "markdown_memory": [
+                    item.to_dict() for item in snapshot.markdown_memory
+                ],
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
                 "reflection": reflection.to_dict(),
                 "review": review.to_dict(),
-                "accepted_summary": accepted_summary.to_dict() if accepted_summary is not None else None,
+                "accepted_summary": accepted_summary.to_dict()
+                if accepted_summary is not None
+                else None,
                 "instructions": {
                     "return_fields": ["message"],
                     "style": [

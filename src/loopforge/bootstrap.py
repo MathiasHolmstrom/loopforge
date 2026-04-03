@@ -41,10 +41,8 @@ from loopforge.core import (
     RoleModelConfig,
     RoutingExperimentExecutor,
     MemorySnapshot,
-    MarkdownMemoryNote,
     RunnerAuthoringBackend,
     RunnerAuthoringRequest,
-    RunnerAuthoringResult,
     RunnerValidationResult,
     SpecQuestion,
     _noop_progress,
@@ -114,7 +112,9 @@ def _resolve_helper_model(preferred_model: str, fallback_model: str) -> str:
     if preferred_model.startswith("anthropic/") and not _can_use_anthropic_helpers():
         return fallback_model
     # Route through Bedrock proxy
-    if preferred_model.startswith("anthropic/") and os.getenv("ANTHROPIC_BEDROCK_BASE_URL"):
+    if preferred_model.startswith("anthropic/") and os.getenv(
+        "ANTHROPIC_BEDROCK_BASE_URL"
+    ):
         model_name = preferred_model.removeprefix("anthropic/")
         return f"bedrock/us.anthropic.{model_name}"
     return preferred_model
@@ -152,7 +152,9 @@ def load_factory(factory_path: str) -> Any:
     module_path = Path(module_name)
     if module_name.endswith(".py") or module_path.exists():
         resolved_path = module_path.resolve()
-        module_key = f"loopforge_generated_{resolved_path.stem}_{abs(hash(str(resolved_path)))}"
+        module_key = (
+            f"loopforge_generated_{resolved_path.stem}_{abs(hash(str(resolved_path)))}"
+        )
         if module_key in sys.modules:
             module = sys.modules[module_key]
         else:
@@ -190,7 +192,10 @@ def _slugify_runner_name(value: str) -> str:
 def _authored_runner_paths(memory_root: Path, repo_root: Path) -> tuple[Path, Path]:
     runners_dir = memory_root / "runners"
     stem = _slugify_runner_name(repo_root.name)
-    return runners_dir / f"{stem}_runner.py", runners_dir / f"{stem}_runner_manifest.json"
+    return (
+        runners_dir / f"{stem}_runner.py",
+        runners_dir / f"{stem}_runner_manifest.json",
+    )
 
 
 MAX_RUNNER_AUTHORING_ATTEMPTS = 3
@@ -217,9 +222,15 @@ def _validate_runner_factory(
     checks: list[PreflightCheck] = []
     try:
         spec = build_bootstrap_spec(objective)
-        adapter_setup = load_adapter_setup(factory_path=factory_path, spec=spec, memory_root=memory_root)
+        adapter_setup = load_adapter_setup(
+            factory_path=factory_path, spec=spec, memory_root=memory_root
+        )
     except Exception as exc:
-        return RunnerValidationResult(success=False, factory_path=factory_path, errors=[f"Runner import failed: {exc}"])
+        return RunnerValidationResult(
+            success=False,
+            factory_path=factory_path,
+            errors=[f"Runner import failed: {exc}"],
+        )
     if adapter_setup is None:
         return RunnerValidationResult(
             success=False,
@@ -235,7 +246,9 @@ def _validate_runner_factory(
             capability_context = adapter_setup.capability_provider(spec)
         else:
             capability_context = CapabilityContext()
-            errors.append("Runner did not expose a discovery_provider or capability_provider.")
+            errors.append(
+                "Runner did not expose a discovery_provider or capability_provider."
+            )
     except Exception as exc:
         return RunnerValidationResult(
             success=False,
@@ -246,7 +259,9 @@ def _validate_runner_factory(
         errors.append("Runner did not expose a preflight_provider.")
     else:
         try:
-            checks = _coerce_preflight_checks(adapter_setup.preflight_provider(spec, capability_context))
+            checks = _coerce_preflight_checks(
+                adapter_setup.preflight_provider(spec, capability_context)
+            )
         except Exception as exc:
             errors.append(f"Runner preflight failed to execute: {exc}")
         else:
@@ -290,7 +305,11 @@ def _smoke_validate_runner(
 ) -> str | None:
     if not adapter_setup.handlers:
         return "Runner smoke test failed: no handlers were exposed."
-    handler_name = "baseline" if "baseline" in adapter_setup.handlers else next(iter(adapter_setup.handlers))
+    handler_name = (
+        "baseline"
+        if "baseline" in adapter_setup.handlers
+        else next(iter(adapter_setup.handlers))
+    )
     spec = ExperimentSpec(
         objective=objective,
         primary_metric=PrimaryMetric(name="primary_metric", goal="maximize"),
@@ -362,12 +381,25 @@ def default_role_models(
     except KeyError as exc:
         raise ValueError(f"Unknown model profile: {profile!r}") from exc
     fallback = defaults["worker"]
-    resolved_planner = _resolve_helper_model(planner_model or defaults["planner"], fallback)
-    resolved_worker = _resolve_helper_model(worker_model or defaults["worker"], fallback)
-    resolved_reflection = _resolve_helper_model(reflection_model or defaults["reflection"] or resolved_worker, resolved_worker)
-    resolved_review = _resolve_helper_model(review_model or defaults["review"] or resolved_reflection, resolved_reflection)
-    resolved_consultation = _resolve_helper_model(consultation_model or defaults["consultation"], resolved_worker)
-    resolved_narrator = _resolve_helper_model(narrator_model or defaults["narrator"] or resolved_reflection, resolved_reflection)
+    resolved_planner = _resolve_helper_model(
+        planner_model or defaults["planner"], fallback
+    )
+    resolved_worker = _resolve_helper_model(
+        worker_model or defaults["worker"], fallback
+    )
+    resolved_reflection = _resolve_helper_model(
+        reflection_model or defaults["reflection"] or resolved_worker, resolved_worker
+    )
+    resolved_review = _resolve_helper_model(
+        review_model or defaults["review"] or resolved_reflection, resolved_reflection
+    )
+    resolved_consultation = _resolve_helper_model(
+        consultation_model or defaults["consultation"], resolved_worker
+    )
+    resolved_narrator = _resolve_helper_model(
+        narrator_model or defaults["narrator"] or resolved_reflection,
+        resolved_reflection,
+    )
     return RoleModelConfig(
         planner=resolved_planner,
         worker=resolved_worker,
@@ -425,7 +457,9 @@ def _looks_like_local_asset_path(asset_path: str) -> bool:
     if not stripped:
         return False
     lowered = stripped.lower()
-    if "://" in lowered or lowered.startswith(("s3:", "dbfs:", "jdbc:", "snowflake:", "databricks:")):
+    if "://" in lowered or lowered.startswith(
+        ("s3:", "dbfs:", "jdbc:", "snowflake:", "databricks:")
+    ):
         return False
     if any(token in stripped for token in ("\n", "\r")):
         return False
@@ -474,7 +508,9 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
 
     def _do_probe() -> DataAssetSchema:
         if not resolved.exists():
-            return DataAssetSchema(asset_path=asset_path, load_error=f"File not found: {resolved}")
+            return DataAssetSchema(
+                asset_path=asset_path, load_error=f"File not found: {resolved}"
+            )
 
         size_mb = resolved.stat().st_size / (1024 * 1024)
         suffix = resolved.suffix.lower()
@@ -490,7 +526,9 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
         try:
             import pandas as pd
         except ImportError:
-            return DataAssetSchema(asset_path=asset_path, load_error="pandas not available for data probe")
+            return DataAssetSchema(
+                asset_path=asset_path, load_error="pandas not available for data probe"
+            )
 
         try:
             total_rows_verified: int | None = None
@@ -528,9 +566,13 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
                 if len(df) < probe_limit:
                     total_rows_verified = len(df)
             else:
-                return DataAssetSchema(asset_path=asset_path, load_error=f"Unsupported format: {suffix}")
+                return DataAssetSchema(
+                    asset_path=asset_path, load_error=f"Unsupported format: {suffix}"
+                )
         except Exception as exc:
-            return DataAssetSchema(asset_path=asset_path, load_error=f"Load failed: {exc}")
+            return DataAssetSchema(
+                asset_path=asset_path, load_error=f"Load failed: {exc}"
+            )
 
         sample_values = {}
         for col in df.columns[:30]:
@@ -567,14 +609,18 @@ def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
         )
     _ACTIVE_DATA_PROBES.pop(probe_key, None)
     if "error" in result_holder:
-        return DataAssetSchema(asset_path=asset_path, load_error=f"Probe error: {result_holder['error']}")
+        return DataAssetSchema(
+            asset_path=asset_path, load_error=f"Probe error: {result_holder['error']}"
+        )
     return result_holder.get("result") or DataAssetSchema(
         asset_path=asset_path,
         load_error="Probe failed without returning a schema result.",
     )
 
 
-def probe_data_assets(capability_context: CapabilityContext, repo_root: Path) -> CapabilityContext:
+def probe_data_assets(
+    capability_context: CapabilityContext, repo_root: Path
+) -> CapabilityContext:
     """Run a quick schema probe on all discovered data assets. Non-blocking with hard timeout."""
     if not capability_context.available_data_assets:
         return capability_context
@@ -601,7 +647,11 @@ def probe_data_assets(capability_context: CapabilityContext, repo_root: Path) ->
             notes.append(
                 f"Data probe ({schema.asset_path}): {len(schema.columns)} columns, "
                 f"{_probe_rows_note(schema)}. Columns: {', '.join(schema.columns[:15])}"
-                + (f" ... and {len(schema.columns) - 15} more" if len(schema.columns) > 15 else "")
+                + (
+                    f" ... and {len(schema.columns) - 15} more"
+                    if len(schema.columns) > 15
+                    else ""
+                )
             )
     return replace(capability_context, data_schemas=schemas, notes=notes)
 
@@ -656,9 +706,16 @@ def discover_capabilities_for_objective(
         context = adapter_setup.capability_provider(build_bootstrap_spec(objective))
     else:
         context = CapabilityContext()
-    discovered_assets = [asset for asset in scan_result.get("data_assets", []) if asset not in context.available_data_assets]
+    discovered_assets = [
+        asset
+        for asset in scan_result.get("data_assets", [])
+        if asset not in context.available_data_assets
+    ]
     if discovered_assets:
-        context = replace(context, available_data_assets=[*context.available_data_assets, *discovered_assets])
+        context = replace(
+            context,
+            available_data_assets=[*context.available_data_assets, *discovered_assets],
+        )
     # Quick data probe — non-blocking, hard timeout per asset
     context = probe_data_assets(context, Path(repo_root))
     # Augment with fresh column scan so the agent always sees what columns exist in the code
@@ -695,7 +752,11 @@ def run_preflight_checks(
 
     invalid_metric_goals = [
         metric.name
-        for metric in [spec.primary_metric, *spec.secondary_metrics, *spec.guardrail_metrics]
+        for metric in [
+            spec.primary_metric,
+            *spec.secondary_metrics,
+            *spec.guardrail_metrics,
+        ]
         if metric.goal not in {"maximize", "minimize"}
     ]
     if invalid_metric_goals:
@@ -734,14 +795,18 @@ def run_preflight_checks(
             )
         )
 
-    guidance_required = capability_context.environment_facts.get("execution_guidance_required")
+    guidance_required = capability_context.environment_facts.get(
+        "execution_guidance_required"
+    )
     if guidance_required:
         checks.append(
             PreflightCheck(
                 name="execution_strategy_unresolved",
                 status="failed",
                 detail=str(
-                    capability_context.environment_facts.get("execution_guidance_detail")
+                    capability_context.environment_facts.get(
+                        "execution_guidance_detail"
+                    )
                     or "Loopforge still needs one high-level hint about how to reach the real data or execution backend."
                 ),
                 scope="bootstrap",
@@ -749,14 +814,34 @@ def run_preflight_checks(
         )
         return checks
 
-    if executor_factory_path is None or capability_context.environment_facts.get("autonomous_execution_supported") is False:
-        if executor_factory_path is None and capability_context.environment_facts.get("autonomous_execution_supported") is not False:
+    if (
+        executor_factory_path is None
+        or capability_context.environment_facts.get("autonomous_execution_supported")
+        is False
+    ):
+        if (
+            executor_factory_path is None
+            and capability_context.environment_facts.get(
+                "autonomous_execution_supported"
+            )
+            is not False
+        ):
             repo_root_raw = capability_context.environment_facts.get("repo_root")
-            repo_root_path = Path(repo_root_raw) if isinstance(repo_root_raw, str) and repo_root_raw.strip() else Path.cwd()
-            python_executable = capability_context.environment_facts.get("python_executable", sys.executable)
+            repo_root_path = (
+                Path(repo_root_raw)
+                if isinstance(repo_root_raw, str) and repo_root_raw.strip()
+                else Path.cwd()
+            )
+            python_executable = capability_context.environment_facts.get(
+                "python_executable", sys.executable
+            )
             try:
                 probe = subprocess.run(
-                    [str(python_executable), "-c", "import os,sys;print('loopforge_execution_probe_ok');print(os.getcwd());print(sys.executable)"],
+                    [
+                        str(python_executable),
+                        "-c",
+                        "import os,sys;print('loopforge_execution_probe_ok');print(os.getcwd());print(sys.executable)",
+                    ],
                     cwd=repo_root_path,
                     capture_output=True,
                     text=True,
@@ -776,8 +861,13 @@ def run_preflight_checks(
                     )
                 )
                 return checks
-            if probe.returncode != 0 or "loopforge_execution_probe_ok" not in probe.stdout:
-                failure_summary = (probe.stderr or probe.stdout or f"Exit code {probe.returncode}.").strip()
+            if (
+                probe.returncode != 0
+                or "loopforge_execution_probe_ok" not in probe.stdout
+            ):
+                failure_summary = (
+                    probe.stderr or probe.stdout or f"Exit code {probe.returncode}."
+                ).strip()
                 checks.append(
                     PreflightCheck(
                         name="generic_agentic_execution_probe",
@@ -831,7 +921,11 @@ def run_preflight_checks(
         memory_root=memory_root_path,
     )
     if adapter_setup is not None and adapter_setup.preflight_provider is not None:
-        checks.extend(_coerce_preflight_checks(adapter_setup.preflight_provider(spec, capability_context)))
+        checks.extend(
+            _coerce_preflight_checks(
+                adapter_setup.preflight_provider(spec, capability_context)
+            )
+        )
     elif capability_context.available_data_assets:
         checks.append(
             PreflightCheck(
@@ -863,7 +957,9 @@ def _non_local_data_assets(capability_context: CapabilityContext) -> list[str]:
     return [
         asset
         for asset in capability_context.available_data_assets
-        if isinstance(asset, str) and asset.strip() and not _looks_like_local_asset_path(asset)
+        if isinstance(asset, str)
+        and asset.strip()
+        and not _looks_like_local_asset_path(asset)
     ]
 
 
@@ -894,7 +990,9 @@ def _detect_execution_guidance_gap(
         if hint not in (None, ""):
             return None
     answer_text = _summarise_bootstrap_answers(answers).lower()
-    if answer_text and any(token in answer_text for token in REMOTE_EXECUTION_HINT_TOKENS):
+    if answer_text and any(
+        token in answer_text for token in REMOTE_EXECUTION_HINT_TOKENS
+    ):
         return None
 
     remote_assets = _non_local_data_assets(capability_context)
@@ -918,7 +1016,9 @@ def _detect_execution_guidance_gap(
         evidence.append(f"non-local data assets were detected ({preview})")
     if matched_tokens:
         token_preview = ", ".join(matched_tokens[:4])
-        evidence.append(f"the repo/objective points at an external backend ({token_preview})")
+        evidence.append(
+            f"the repo/objective points at an external backend ({token_preview})"
+        )
     joined_evidence = " and ".join(evidence)
     return (
         "Loopforge inferred most of the repo structure, but it cannot yet verify the real execution lane because "
@@ -940,10 +1040,14 @@ def _build_execution_guidance_question(
             backend_examples.append(asset.strip())
     if not backend_examples:
         for token in REMOTE_EXECUTION_HINT_TOKENS:
-            haystack = " ".join(capability_context.notes).lower() + "\n" + json.dumps(
-                capability_context.environment_facts,
-                sort_keys=True,
-            ).lower()
+            haystack = (
+                " ".join(capability_context.notes).lower()
+                + "\n"
+                + json.dumps(
+                    capability_context.environment_facts,
+                    sort_keys=True,
+                ).lower()
+            )
             if token in haystack:
                 backend_examples.append(token)
         backend_examples = backend_examples[:2]
@@ -971,14 +1075,21 @@ def _ensure_execution_guidance_question(
 ) -> list[SpecQuestion]:
     if detail is None:
         return questions
-    if isinstance(answers, dict) and any(value not in (None, "") for value in answers.values()):
+    if isinstance(answers, dict) and any(
+        value not in (None, "") for value in answers.values()
+    ):
         if any(question.required for question in questions):
             return questions
     if any(question.key == EXECUTION_GUIDANCE_QUESTION_KEY for question in questions):
         return questions
     if any(question.required for question in questions):
         return questions
-    return [*questions, _build_execution_guidance_question(capability_context=capability_context, detail=detail)]
+    return [
+        *questions,
+        _build_execution_guidance_question(
+            capability_context=capability_context, detail=detail
+        ),
+    ]
 
 
 def missing_requirements_from_bootstrap(
@@ -1006,7 +1117,11 @@ def apply_answers_to_bootstrap_turn(
     *,
     answers: dict[str, Any] | None,
 ) -> BootstrapTurn:
-    answer_map = {str(key): value for key, value in (answers or {}).items() if value not in (None, "")}
+    answer_map = {
+        str(key): value
+        for key, value in (answers or {}).items()
+        if value not in (None, "")
+    }
     spec = turn.proposal.recommended_spec
     merged_metadata = dict(spec.metadata)
     merged_metadata["bootstrap_answers"] = {
@@ -1019,20 +1134,26 @@ def apply_answers_to_bootstrap_turn(
         if note not in answer_notes:
             answer_notes.append(note)
     updated_spec = replace(spec, metadata=merged_metadata)
-    updated_proposal = replace(turn.proposal, recommended_spec=updated_spec, notes=answer_notes)
+    updated_proposal = replace(
+        turn.proposal, recommended_spec=updated_spec, notes=answer_notes
+    )
     missing_requirements = missing_requirements_from_bootstrap(
         questions=updated_proposal.questions,
         answers=answer_map,
         preflight_checks=turn.preflight_checks,
     )
     required_question_keys = {
-        question.key
-        for question in updated_proposal.questions
-        if question.required
+        question.key for question in updated_proposal.questions if question.required
     }
-    resolved_required_questions = bool(required_question_keys) and required_question_keys.issubset(answer_map.keys())
-    had_answer_blocker = any(req.startswith("answer:") for req in turn.missing_requirements)
-    ready_to_start = (turn.ready_to_start or had_answer_blocker or resolved_required_questions) and not missing_requirements
+    resolved_required_questions = bool(
+        required_question_keys
+    ) and required_question_keys.issubset(answer_map.keys())
+    had_answer_blocker = any(
+        req.startswith("answer:") for req in turn.missing_requirements
+    )
+    ready_to_start = (
+        turn.ready_to_start or had_answer_blocker or resolved_required_questions
+    ) and not missing_requirements
     return replace(
         turn,
         proposal=updated_proposal,
@@ -1066,8 +1187,11 @@ def _is_internal_bootstrap_question(question: SpecQuestion) -> bool:
 
 
 def sanitise_bootstrap_questions(questions: list[SpecQuestion]) -> list[SpecQuestion]:
-    return [question for question in questions if not _is_internal_bootstrap_question(question)]
-
+    return [
+        question
+        for question in questions
+        if not _is_internal_bootstrap_question(question)
+    ]
 
 
 def refine_bootstrap_questions(
@@ -1119,7 +1243,14 @@ def build_execution_runbook(
     shell_name = str(env.get("execution_shell", "unknown"))
     python_executable = str(env.get("python_executable", sys.executable))
     runner_kind = str(env.get("runner_kind", "unknown"))
-    probe_check = next((check for check in preflight_checks if check.name == "generic_agentic_execution_probe"), None)
+    probe_check = next(
+        (
+            check
+            for check in preflight_checks
+            if check.name == "generic_agentic_execution_probe"
+        ),
+        None,
+    )
     lines = [
         "# Execution Runbook",
         "",
@@ -1136,29 +1267,31 @@ def build_execution_runbook(
                 "## Verified Execution Lane",
                 f"- Bootstrap verification: {probe_check.status}",
                 f"- Detail: {probe_check.detail}",
-                f"- Preferred command shape: \"{python_executable}\" path\\to\\script.py",
+                f'- Preferred command shape: "{python_executable}" path\\to\\script.py',
                 "",
             ]
         )
     lines.extend(
         [
-        "## Ground Rules",
-        "- Treat this file as the execution handoff from bootstrap. Prefer these instructions over rediscovering obvious repo mechanics.",
-        "- Bootstrap has already verified the execution lane above. Reuse that verified repo root and Python executable instead of inventing new activation commands, shell setup, or extra cd chains.",
-        "- Aim for one end-to-end iteration that writes/runs code and prints metrics, not a long chain of disconnected inspection-only retries.",
-        "- Fix one blocker at a time. Do not redesign the whole plan when a single command or import fails.",
-        "- If you want to run a repo-local script that does not exist yet, create it first with a write step, then run it.",
+            "## Ground Rules",
+            "- Treat this file as the execution handoff from bootstrap. Prefer these instructions over rediscovering obvious repo mechanics.",
+            "- Bootstrap has already verified the execution lane above. Reuse that verified repo root and Python executable instead of inventing new activation commands, shell setup, or extra cd chains.",
+            "- Aim for one end-to-end iteration that writes/runs code and prints metrics, not a long chain of disconnected inspection-only retries.",
+            "- Fix one blocker at a time. Do not redesign the whole plan when a single command or import fails.",
+            "- If you want to run a repo-local script that does not exist yet, create it first with a write step, then run it.",
         ]
     )
     if env.get("shell_family") == "windows_cmd":
         lines.extend(
             [
                 "- Shell commands run through cmd.exe on Windows. Do not use Unix tools like `head`, `grep`, `find -maxdepth`, or `ls -la`.",
-                "- Prefer `write_file` + `\"<python_executable>\" script.py`, or short cmd-compatible commands. Python-native inspection is usually the safest choice.",
+                '- Prefer `write_file` + `"<python_executable>" script.py`, or short cmd-compatible commands. Python-native inspection is usually the safest choice.',
             ]
         )
     else:
-        lines.append("- Shell commands should stay portable and repo-local. Prefer Python-native inspection when shell portability is uncertain.")
+        lines.append(
+            "- Shell commands should stay portable and repo-local. Prefer Python-native inspection when shell portability is uncertain."
+        )
 
     lines.extend(
         [
@@ -1189,17 +1322,21 @@ def build_execution_runbook(
     return "\n".join(lines).rstrip() + "\n"
 
 
-
 def resolve_repo_root_from_objective(objective: str, current_root: Path) -> Path:
     """If the objective mentions a repo name, try to find it as a sibling or child directory."""
     import re
+
     resolved = current_root.resolve()
     # Extract potential repo names — hyphenated or underscored multi-word names
-    candidates = re.findall(r'[a-zA-Z][a-zA-Z0-9_-]{2,}(?:-[a-zA-Z0-9_]+)+', objective)
+    candidates = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}(?:-[a-zA-Z0-9_]+)+", objective)
     # Also try single words that look like repo names (before "repo" keyword)
-    repo_match = re.search(r'(?:inside|in|from|of)\s+(\S+?)(?:\s+repo|\s+repository)?(?:\s|$)', objective, re.IGNORECASE)
+    repo_match = re.search(
+        r"(?:inside|in|from|of)\s+(\S+?)(?:\s+repo|\s+repository)?(?:\s|$)",
+        objective,
+        re.IGNORECASE,
+    )
     if repo_match:
-        candidates.insert(0, repo_match.group(1).strip().rstrip('.'))
+        candidates.insert(0, repo_match.group(1).strip().rstrip("."))
     for name in candidates:
         # Check sibling directory
         sibling = resolved.parent / name
@@ -1267,25 +1404,47 @@ class Loopforge:
             narrator_model=narrator_model,
             profile=model_profile,
         )
+
         def _extra(model: str) -> dict[str, Any]:
             if model.startswith("bedrock/") and self._bedrock_kwargs:
                 return {"extra_kwargs": self._bedrock_kwargs}
             return {}
 
         self.bootstrap_backend = bootstrap_backend or LiteLLMBootstrapBackend(
-            model=self.role_models.planner, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.planner),
+            model=self.role_models.planner,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.planner),
         )
         primary_worker_backend = worker_backend or LiteLLMWorkerBackend(
-            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
+            model=self.role_models.worker,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.worker),
         )
-        self.runner_authoring_backend = runner_authoring_backend or LiteLLMRunnerAuthoringBackend(
-            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
+        self.runner_authoring_backend = (
+            runner_authoring_backend
+            or LiteLLMRunnerAuthoringBackend(
+                model=self.role_models.worker,
+                temperature=temperature,
+                stream_fn=stream_fn,
+                **_extra(self.role_models.worker),
+            )
         )
         self.consultation_backend = consultation_backend or LiteLLMConsultationBackend(
-            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
+            model=self.role_models.consultation,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.consultation),
         )
-        self.access_advisor_backend = access_advisor_backend or LiteLLMAccessAdvisorBackend(
-            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
+        self.access_advisor_backend = (
+            access_advisor_backend
+            or LiteLLMAccessAdvisorBackend(
+                model=self.role_models.consultation,
+                temperature=temperature,
+                stream_fn=stream_fn,
+                **_extra(self.role_models.consultation),
+            )
         )
         self.worker_backend = ConsultingWorkerBackend(
             worker_backend=primary_worker_backend,
@@ -1294,22 +1453,36 @@ class Loopforge:
             helper_label=self.role_models.consultation,
         )
         self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
-            model=self.role_models.reflection, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.reflection),
+            model=self.role_models.reflection,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.reflection),
         )
         self.review_backend = review_backend or LiteLLMReviewBackend(
-            model=self.role_models.review, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.review),
+            model=self.role_models.review,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.review),
         )
         self.narrator_backend = narrator_backend or LiteLLMNarrationBackend(
-            model=self.role_models.narrator, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.narrator),
+            model=self.role_models.narrator,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.narrator),
         )
         self.execution_fix_backend = LiteLLMExecutionFixBackend(
-            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
+            model=self.role_models.consultation,
+            temperature=temperature,
+            stream_fn=stream_fn,
+            **_extra(self.role_models.consultation),
         )
 
     def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
         if self.explicit_executor_factory_path:
             self.executor_factory_path = self.explicit_executor_factory_path
-            return ExecutionBackendResolution(kind="supported", factory_path=self.explicit_executor_factory_path)
+            return ExecutionBackendResolution(
+                kind="supported", factory_path=self.explicit_executor_factory_path
+            )
         cached_authored_runner = self._load_cached_authored_runner(objective)
         if cached_authored_runner is not None:
             return cached_authored_runner
@@ -1324,7 +1497,9 @@ class Loopforge:
     def resolve_executor_factory_path(self, objective: str) -> str | None:
         return self.resolve_execution_backend(objective).factory_path
 
-    def _fallback_capability_provider(self, _effective_spec: ExperimentSpec) -> CapabilityContext:
+    def _fallback_capability_provider(
+        self, _effective_spec: ExperimentSpec
+    ) -> CapabilityContext:
         return self._cached_capability_context or CapabilityContext()
 
     def resolve_runtime_binding(
@@ -1346,14 +1521,20 @@ class Loopforge:
                 capability_context=capability_context,
             )
 
-        adapter_result = load_factory(resolved_factory_path)(spec=spec, memory_root=self.memory_root)
+        adapter_result = load_factory(resolved_factory_path)(
+            spec=spec, memory_root=self.memory_root
+        )
         if isinstance(adapter_result, AdapterSetup):
             handlers = adapter_result.handlers
             capability_provider = adapter_result.capability_provider
         else:
             handlers = adapter_result
             capability_provider = None
-        capability_context = capability_provider(spec) if capability_provider is not None else CapabilityContext()
+        capability_context = (
+            capability_provider(spec)
+            if capability_provider is not None
+            else CapabilityContext()
+        )
         return RuntimeBinding(
             executor_factory_path=resolved_factory_path,
             handlers=handlers,
@@ -1395,8 +1576,12 @@ class Loopforge:
         )
         return orchestrator, runtime
 
-    def _load_cached_authored_runner(self, objective: str) -> ExecutionBackendResolution | None:
-        runner_path, manifest_path = _authored_runner_paths(self.memory_root, self.repo_root)
+    def _load_cached_authored_runner(
+        self, objective: str
+    ) -> ExecutionBackendResolution | None:
+        runner_path, manifest_path = _authored_runner_paths(
+            self.memory_root, self.repo_root
+        )
         if not runner_path.exists() or not manifest_path.exists():
             return None
         try:
@@ -1420,7 +1605,9 @@ class Loopforge:
                 pass
             return None
         self.executor_factory_path = f"{runner_path}:build_adapter"
-        return ExecutionBackendResolution(kind="supported", factory_path=self.executor_factory_path)
+        return ExecutionBackendResolution(
+            kind="supported", factory_path=self.executor_factory_path
+        )
 
     def _author_runner(
         self,
@@ -1431,14 +1618,18 @@ class Loopforge:
         cached = self._load_cached_authored_runner(user_goal)
         if cached is not None:
             return cached
-        runner_path, manifest_path = _authored_runner_paths(self.memory_root, self.repo_root)
+        runner_path, manifest_path = _authored_runner_paths(
+            self.memory_root, self.repo_root
+        )
         runner_path.parent.mkdir(parents=True, exist_ok=True)
         previous_errors: list[str] = []
         last_validation: RunnerValidationResult | None = None
         temp_paths: list[Path] = []
         try:
             for attempt_number in range(1, MAX_RUNNER_AUTHORING_ATTEMPTS + 1):
-                temp_path = runner_path.with_name(f"{runner_path.stem}_candidate_{attempt_number}.py")
+                temp_path = runner_path.with_name(
+                    f"{runner_path.stem}_candidate_{attempt_number}.py"
+                )
                 temp_paths.append(temp_path)
                 request = RunnerAuthoringRequest(
                     user_goal=user_goal,
@@ -1456,7 +1647,9 @@ class Loopforge:
                         kind="planning_only",
                         reason=f"Runner authoring failed before validation: {exc}",
                     )
-                temp_path.write_text(authored.module_source.rstrip() + "\n", encoding="utf-8")
+                temp_path.write_text(
+                    authored.module_source.rstrip() + "\n", encoding="utf-8"
+                )
                 validation = _validate_runner_factory(
                     factory_path=f"{temp_path}:build_adapter",
                     objective=user_goal,
@@ -1464,7 +1657,9 @@ class Loopforge:
                 )
                 last_validation = validation
                 if validation.success:
-                    runner_path.write_text(temp_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    runner_path.write_text(
+                        temp_path.read_text(encoding="utf-8"), encoding="utf-8"
+                    )
                     manifest_path.write_text(
                         json.dumps(
                             {
@@ -1482,7 +1677,9 @@ class Loopforge:
                         encoding="utf-8",
                     )
                     self.executor_factory_path = f"{runner_path}:build_adapter"
-                    return ExecutionBackendResolution(kind="supported", factory_path=self.executor_factory_path)
+                    return ExecutionBackendResolution(
+                        kind="supported", factory_path=self.executor_factory_path
+                    )
                 previous_errors = list(validation.errors)
             reason = "Loopforge tried to author a repo-specific runner, but validation failed."
             if last_validation is not None and last_validation.errors:
@@ -1516,9 +1713,18 @@ class Loopforge:
         # Don't load prior session memory during bootstrap — it pollutes new objectives
         # with irrelevant context from previous runs. Memory is only used during iterations.
         bootstrap_memory = {}
-        capability_key = (str(self.repo_root.resolve()), executor_factory_path, user_goal.strip())
-        if self._cached_capability_context is None or self._cached_capability_key != capability_key:
-            self.progress_fn("discover_capabilities", "Scanning repository capabilities...")
+        capability_key = (
+            str(self.repo_root.resolve()),
+            executor_factory_path,
+            user_goal.strip(),
+        )
+        if (
+            self._cached_capability_context is None
+            or self._cached_capability_key != capability_key
+        ):
+            self.progress_fn(
+                "discover_capabilities", "Scanning repository capabilities..."
+            )
             self._cached_capability_context = discover_capabilities_for_objective(
                 objective=user_goal,
                 memory_root=self.memory_root,
@@ -1527,8 +1733,14 @@ class Loopforge:
             )
             self._cached_capability_key = capability_key
         capability_context = self._cached_capability_context
-        if resolution.kind == "planning_only" and self.explicit_executor_factory_path is None:
-            self.progress_fn("author_runner", "Authoring repo-specific runner from discovered context...")
+        if (
+            resolution.kind == "planning_only"
+            and self.explicit_executor_factory_path is None
+        ):
+            self.progress_fn(
+                "author_runner",
+                "Authoring repo-specific runner from discovered context...",
+            )
             authored_resolution = self._author_runner(
                 user_goal,
                 capability_context,
@@ -1543,7 +1755,11 @@ class Loopforge:
                     executor_factory_path=executor_factory_path,
                     repo_root=self.repo_root,
                 )
-                capability_key = (str(self.repo_root.resolve()), executor_factory_path, user_goal.strip())
+                capability_key = (
+                    str(self.repo_root.resolve()),
+                    executor_factory_path,
+                    user_goal.strip(),
+                )
                 self._cached_capability_context = capability_context
                 self._cached_capability_key = capability_key
             elif authored_resolution.reason:
@@ -1556,7 +1772,11 @@ class Loopforge:
                 capability_context=capability_context,
                 answers=answers,
             )
-        if resolution.kind == "planning_only" and resolution.reason and guidance_gap_detail is None:
+        if (
+            resolution.kind == "planning_only"
+            and resolution.reason
+            and guidance_gap_detail is None
+        ):
             merged_actions = dict(capability_context.available_actions)
             for action in GENERIC_AUTONOMOUS_ACTIONS:
                 merged_actions.setdefault(action, "generic_autonomous_executor")
@@ -1594,7 +1814,9 @@ class Loopforge:
                 ],
             )
             self._cached_capability_context = capability_context
-        self.progress_fn("propose_plan", f"[{self.role_models.planner}] Drafting experiment plan...")
+        self.progress_fn(
+            "propose_plan", f"[{self.role_models.planner}] Drafting experiment plan..."
+        )
         try:
             turn = self.bootstrap_backend.propose_bootstrap_turn(
                 user_goal=user_goal,
@@ -1618,14 +1840,18 @@ class Loopforge:
                     turn.proposal.recommended_spec,
                     metadata={
                         **turn.proposal.recommended_spec.metadata,
-                        "execution_backend_kind": capability_context.environment_facts.get("execution_backend_kind"),
+                        "execution_backend_kind": capability_context.environment_facts.get(
+                            "execution_backend_kind"
+                        ),
                         "autonomous_execution_supported": capability_context.environment_facts.get(
                             "autonomous_execution_supported"
                         ),
                     },
                 ),
                 questions=_ensure_execution_guidance_question(
-                    questions=refine_bootstrap_questions(turn.proposal.questions, answers=answers),
+                    questions=refine_bootstrap_questions(
+                        turn.proposal.questions, answers=answers
+                    ),
                     capability_context=capability_context,
                     answers=answers,
                     detail=guidance_gap_detail,
@@ -1635,13 +1861,19 @@ class Loopforge:
         # Auto-fix incomplete metrics — the agent often describes metrics in prose but
         # leaves the JSON fields empty. Extract from the agent's own message.
         spec = turn.proposal.recommended_spec
-        all_metrics = [spec.primary_metric, *spec.secondary_metrics, *spec.guardrail_metrics]
+        all_metrics = [
+            spec.primary_metric,
+            *spec.secondary_metrics,
+            *spec.guardrail_metrics,
+        ]
         has_incomplete = any(
             m.name == "[unspecified]" or m.goal not in ("maximize", "minimize")
             for m in all_metrics
         )
         if has_incomplete:
-            self.progress_fn("fix_metrics", "Extracting metric details from agent's analysis...")
+            self.progress_fn(
+                "fix_metrics", "Extracting metric details from agent's analysis..."
+            )
             try:
                 fixes = self.narrator_backend.fix_incomplete_metrics(
                     current_spec=spec.to_dict(),
@@ -1649,12 +1881,21 @@ class Loopforge:
                 )
                 if fixes:
                     spec_dict = spec.to_dict()
-                    for key in ("primary_metric", "secondary_metrics", "guardrail_metrics"):
+                    for key in (
+                        "primary_metric",
+                        "secondary_metrics",
+                        "guardrail_metrics",
+                    ):
                         if key in fixes:
                             spec_dict[key] = fixes[key]
                     try:
                         patched_spec = ExperimentSpec.from_dict(spec_dict)
-                        turn = replace(turn, proposal=replace(turn.proposal, recommended_spec=patched_spec))
+                        turn = replace(
+                            turn,
+                            proposal=replace(
+                                turn.proposal, recommended_spec=patched_spec
+                            ),
+                        )
                     except Exception:
                         pass
             except Exception:
@@ -1687,7 +1928,9 @@ class Loopforge:
                 agent_markdown_dir = self.memory_root / "agent_markdown"
                 agent_markdown_dir.mkdir(parents=True, exist_ok=True)
                 guide_path = agent_markdown_dir / "ops_access_guide.md"
-                guide_path.write_text(access_guide.markdown.rstrip() + "\n", encoding="utf-8")
+                guide_path.write_text(
+                    access_guide.markdown.rstrip() + "\n", encoding="utf-8"
+                )
                 access_guide_path = str(guide_path)
             except Exception:
                 pass
@@ -1713,11 +1956,15 @@ class Loopforge:
         except Exception:
             pass
         # Write experiment guide when ready (or close to ready)
-        if ready_to_start or not [r for r in missing_requirements if r.startswith("answer:")]:
+        if ready_to_start or not [
+            r for r in missing_requirements if r.startswith("answer:")
+        ]:
             try:
                 self.progress_fn("experiment_guide", "Writing experiment guide...")
                 guide_text = self.bootstrap_backend.build_experiment_guide(
-                    resolved_turn, capability_context, answers,
+                    resolved_turn,
+                    capability_context,
+                    answers,
                 )
                 agent_markdown_dir = self.memory_root / "agent_markdown"
                 agent_markdown_dir.mkdir(parents=True, exist_ok=True)
@@ -1725,9 +1972,13 @@ class Loopforge:
                 guide_path.write_text(guide_text.rstrip() + "\n", encoding="utf-8")
             except Exception:
                 pass
-        self.progress_fn("narrate", f"[{self.role_models.narrator}] Preparing summary...")
+        self.progress_fn(
+            "narrate", f"[{self.role_models.narrator}] Preparing summary..."
+        )
         try:
-            human_update = self.narrator_backend.summarize_bootstrap(resolved_turn, capability_context)
+            human_update = self.narrator_backend.summarize_bootstrap(
+                resolved_turn, capability_context
+            )
         except Exception:
             human_update = resolved_turn.assistant_message
         if resolved_turn.access_guide_path:
@@ -1739,7 +1990,9 @@ class Loopforge:
         return replace(resolved_turn, human_update=human_update)
 
     @staticmethod
-    def _apply_metric_goal_fixes(turn: BootstrapTurn, fixes: dict[str, str]) -> BootstrapTurn:
+    def _apply_metric_goal_fixes(
+        turn: BootstrapTurn, fixes: dict[str, str]
+    ) -> BootstrapTurn:
         """Apply goal fixes from the LLM to metrics in the spec."""
         spec = turn.proposal.recommended_spec
         primary = spec.primary_metric
@@ -1753,10 +2006,19 @@ class Loopforge:
             replace(m, goal=fixes[m.name]) if m.name in fixes else m
             for m in spec.guardrail_metrics
         ]
-        patched_spec = replace(spec, primary_metric=primary, secondary_metrics=secondary, guardrail_metrics=guardrails)
-        return replace(turn, proposal=replace(turn.proposal, recommended_spec=patched_spec))
+        patched_spec = replace(
+            spec,
+            primary_metric=primary,
+            secondary_metrics=secondary,
+            guardrail_metrics=guardrails,
+        )
+        return replace(
+            turn, proposal=replace(turn.proposal, recommended_spec=patched_spec)
+        )
 
-    def apply_feedback(self, turn: BootstrapTurn, feedback: str) -> BootstrapTurn | None:
+    def apply_feedback(
+        self, turn: BootstrapTurn, feedback: str
+    ) -> BootstrapTurn | None:
         """Interpret user feedback and patch the existing plan. Returns None if full replan needed."""
         cap_ctx = self._cached_capability_context or CapabilityContext()
         try:
@@ -1783,7 +2045,9 @@ class Loopforge:
             return None  # Malformed patch — fall through to replan
         patched_proposal = replace(turn.proposal, recommended_spec=patched_spec)
         # Re-run preflight checks on the patched spec
-        executor_factory_path = self.resolve_executor_factory_path(patched_spec.objective)
+        executor_factory_path = self.resolve_executor_factory_path(
+            patched_spec.objective
+        )
         preflight_checks = run_preflight_checks(
             spec=patched_spec,
             capability_context=cap_ctx,
@@ -1824,7 +2088,9 @@ class Loopforge:
             reset_state=True,
         )
 
-    def _install_python_dependency(self, package_name: str) -> tuple[bool, dict[str, Any]]:
+    def _install_python_dependency(
+        self, package_name: str
+    ) -> tuple[bool, dict[str, Any]]:
         attempts = [
             ["uv", "pip", "install", package_name],
             [sys.executable, "-m", "pip", "install", package_name],
@@ -1866,7 +2132,10 @@ class Loopforge:
             if install_name in self._attempted_dependency_installs:
                 return None
             self._attempted_dependency_installs.add(install_name)
-            self.progress_fn("dependency_recovery", f"Installing missing dependency {install_name}...")
+            self.progress_fn(
+                "dependency_recovery",
+                f"Installing missing dependency {install_name}...",
+            )
             installed, install_result = self._install_python_dependency(install_name)
             if not installed:
                 return ExperimentOutcome(
@@ -1875,11 +2144,15 @@ class Loopforge:
                         f"Execution failed because Python dependency {module_name!r} is missing.",
                         f"Automatic install attempt failed for {install_name}.",
                     ],
-                    next_ideas=["Inspect the environment, install the dependency manually if needed, then retry."],
+                    next_ideas=[
+                        "Inspect the environment, install the dependency manually if needed, then retry."
+                    ],
                     failure_type=exc.__class__.__name__,
                     failure_summary=str(exc).strip() or exc.__class__.__name__,
                     recoverable=True,
-                    recovery_actions=[f"Install dependency {install_name} and retry the same step."],
+                    recovery_actions=[
+                        f"Install dependency {install_name} and retry the same step."
+                    ],
                     execution_details={"install_attempt": install_result},
                 )
             try:
@@ -1891,11 +2164,16 @@ class Loopforge:
                         f"Installed dependency {install_name} automatically, but the retried execution still failed.",
                         f"Retry failure: {retry_exc}",
                     ],
-                    next_ideas=["Inspect the new failure and continue from it in the next iteration."],
+                    next_ideas=[
+                        "Inspect the new failure and continue from it in the next iteration."
+                    ],
                     failure_type=retry_exc.__class__.__name__,
-                    failure_summary=str(retry_exc).strip() or retry_exc.__class__.__name__,
+                    failure_summary=str(retry_exc).strip()
+                    or retry_exc.__class__.__name__,
                     recoverable=True,
-                    recovery_actions=["Use the updated environment and new failure details to choose the next fix."],
+                    recovery_actions=[
+                        "Use the updated environment and new failure details to choose the next fix."
+                    ],
                     execution_details={"install_attempt": install_result},
                 )
 
@@ -1930,7 +2208,9 @@ class Loopforge:
         )
         orchestrator.initialize(spec=spec, reset_state=reset_state)
         try:
-            results = orchestrator.run(iterations=iterations, iteration_callback=iteration_callback)
+            results = orchestrator.run(
+                iterations=iterations, iteration_callback=iteration_callback
+            )
         except (ExperimentInterrupted, KeyboardInterrupt):
             raise
         except Exception as exc:
@@ -1952,7 +2232,10 @@ class Loopforge:
                 "error": {
                     "type": blocked_outcome.failure_type or "ExecutionBlocked",
                     "message": summarise_runtime_exception(
-                        RuntimeError(blocked_outcome.failure_summary or "Execution hit a non-recoverable blocker.")
+                        RuntimeError(
+                            blocked_outcome.failure_summary
+                            or "Execution hit a non-recoverable blocker."
+                        )
                     ),
                     "detail": blocked_outcome.failure_summary or "",
                 },

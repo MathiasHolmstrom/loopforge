@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -30,7 +30,9 @@ class FileMemoryStore:
         self._updates_path = self.root / "agent_updates.jsonl"
         self._human_notes_path = self.root / "human_notes.jsonl"
         self._lessons_path = self._agent_markdown_dir / "lessons_learned.md"
-        self._experiment_journal_path = self._agent_markdown_dir / "experiment_journal.md"
+        self._experiment_journal_path = (
+            self._agent_markdown_dir / "experiment_journal.md"
+        )
         self._artifact_index_path = self._artifacts_dir / "index.json"
         self._legacy_markdown_paths = {
             "objective": self.root / "objective.md",
@@ -46,7 +48,10 @@ class FileMemoryStore:
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._agent_markdown_dir.mkdir(parents=True, exist_ok=True)
         self._objective_path.write_text(spec.objective.strip() + "\n", encoding="utf-8")
-        self._spec_path.write_text(json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self._spec_path.write_text(
+            json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         for path, default_contents in [
             (self._records_path, ""),
             (self._summaries_path, ""),
@@ -62,7 +67,9 @@ class FileMemoryStore:
             self._best_result_path.unlink(missing_ok=True)
 
     def load_spec(self) -> ExperimentSpec:
-        return ExperimentSpec.from_dict(json.loads(self._spec_path.read_text(encoding="utf-8")))
+        return ExperimentSpec.from_dict(
+            json.loads(self._spec_path.read_text(encoding="utf-8"))
+        )
 
     def load_snapshot(
         self,
@@ -75,7 +82,9 @@ class FileMemoryStore:
         summaries = self._read_summaries()
         human_interventions = self._read_human_interventions()
         effective_spec = apply_human_interventions(spec, human_interventions)
-        lessons = self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"])
+        lessons = self._read_markdown_text(
+            self._lessons_path, self._legacy_markdown_paths["lessons"]
+        )
         return MemorySnapshot(
             spec=spec,
             effective_spec=effective_spec,
@@ -90,20 +99,34 @@ class FileMemoryStore:
             next_iteration_id=len(records) + 1,
         )
 
-    def load_bootstrap_context(self, summary_window: int = 5, human_window: int = 10) -> dict[str, Any]:
+    def load_bootstrap_context(
+        self, summary_window: int = 5, human_window: int = 10
+    ) -> dict[str, Any]:
         summaries = self._read_summaries()
         best_summary = self._read_best_summary()
         human_interventions = self._read_human_interventions()
-        lessons = self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"])
-        objective_text = self._read_markdown_text(self._objective_path, self._legacy_markdown_paths["objective"])
+        lessons = self._read_markdown_text(
+            self._lessons_path, self._legacy_markdown_paths["lessons"]
+        )
+        objective_text = self._read_markdown_text(
+            self._objective_path, self._legacy_markdown_paths["objective"]
+        )
         objective = objective_text.strip() if objective_text else None
         return {
             "previous_objective": objective,
-            "best_summary": best_summary.to_dict() if best_summary is not None else None,
-            "recent_summaries": [summary.to_dict() for summary in summaries[-summary_window:]],
-            "recent_human_interventions": [item.to_dict() for item in human_interventions[-human_window:]],
+            "best_summary": best_summary.to_dict()
+            if best_summary is not None
+            else None,
+            "recent_summaries": [
+                summary.to_dict() for summary in summaries[-summary_window:]
+            ],
+            "recent_human_interventions": [
+                item.to_dict() for item in human_interventions[-human_window:]
+            ],
             "lessons_learned": lessons.strip(),
-            "markdown_memory": [item.to_dict() for item in self._read_markdown_memory()],
+            "markdown_memory": [
+                item.to_dict() for item in self._read_markdown_memory()
+            ],
         }
 
     def has_persisted_state(self) -> bool:
@@ -188,7 +211,9 @@ class FileMemoryStore:
     def _read_best_summary(self) -> IterationSummary | None:
         if not self._best_result_path.exists():
             return None
-        return IterationSummary.from_dict(json.loads(self._best_result_path.read_text(encoding="utf-8")))
+        return IterationSummary.from_dict(
+            json.loads(self._best_result_path.read_text(encoding="utf-8"))
+        )
 
     @staticmethod
     def _read_markdown_text(primary_path: Path, legacy_path: Path | None = None) -> str:
@@ -203,17 +228,23 @@ class FileMemoryStore:
             return
         existing_lessons = [
             line[2:].strip()
-            for line in self._read_markdown_text(self._lessons_path, self._legacy_markdown_paths["lessons"]).splitlines()
+            for line in self._read_markdown_text(
+                self._lessons_path, self._legacy_markdown_paths["lessons"]
+            ).splitlines()
             if line.startswith("- ")
         ]
         merged_lessons = list(existing_lessons)
         for lesson in lessons:
             if lesson not in merged_lessons:
                 merged_lessons.append(lesson)
-        self._lessons_path.write_text("".join(f"- {lesson}\n" for lesson in merged_lessons), encoding="utf-8")
+        self._lessons_path.write_text(
+            "".join(f"- {lesson}\n" for lesson in merged_lessons), encoding="utf-8"
+        )
 
     def _append_artifacts(self, summary: IterationSummary) -> None:
-        existing_payload = json.loads(self._artifact_index_path.read_text(encoding="utf-8"))
+        existing_payload = json.loads(
+            self._artifact_index_path.read_text(encoding="utf-8")
+        )
         existing_payload.append(
             {
                 "iteration_id": summary.iteration_id,
@@ -231,7 +262,11 @@ class FileMemoryStore:
             return []
         notes: list[MarkdownMemoryNote] = []
         seen_paths: set[str] = set()
-        for path in sorted(self._agent_markdown_dir.rglob("*.md")) if self._agent_markdown_dir.exists() else []:
+        for path in (
+            sorted(self._agent_markdown_dir.rglob("*.md"))
+            if self._agent_markdown_dir.exists()
+            else []
+        ):
             if not path.is_file():
                 continue
             content = path.read_text(encoding="utf-8").strip()
@@ -273,7 +308,9 @@ class FileMemoryStore:
         if summary.recovery_actions:
             lines.append("- Recovery actions: " + "; ".join(summary.recovery_actions))
         if summary.guardrail_failures:
-            lines.append("- Guardrail failures: " + ", ".join(summary.guardrail_failures))
+            lines.append(
+                "- Guardrail failures: " + ", ".join(summary.guardrail_failures)
+            )
         if summary.lessons:
             lines.append("- Lessons: " + "; ".join(summary.lessons))
         if summary.do_not_repeat:
@@ -282,4 +319,3 @@ class FileMemoryStore:
             lines.append("- Next ideas: " + "; ".join(summary.next_ideas))
         with self._experiment_journal_path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n\n")
-

@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import sys
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -38,10 +37,16 @@ def _installable_python_dependency(exc: Exception) -> tuple[str, str] | None:
     return package_name, f"uv pip install {install_name}"
 
 
-def detect_builtin_executor_factory(repo_root: Path | str, objective: str) -> str | None:
+def detect_builtin_executor_factory(
+    repo_root: Path | str, objective: str
+) -> str | None:
     root = Path(repo_root).resolve()
     objective_lower = objective.lower()
-    if "lol" in objective_lower and "kill" in objective_lower and (root / "examples" / "lol" / "pipeline_transformer_example.py").exists():
+    if (
+        "lol" in objective_lower
+        and "kill" in objective_lower
+        and (root / "examples" / "lol" / "pipeline_transformer_example.py").exists()
+    ):
         return "loopforge.pilot_adapters:build_lol_kills_adapter"
     loopforge_root = Path(__file__).resolve().parents[2]
     if (
@@ -53,7 +58,9 @@ def detect_builtin_executor_factory(repo_root: Path | str, objective: str) -> st
     return None
 
 
-def build_lol_kills_adapter(spec: ExperimentSpec, memory_root: Path | str) -> AdapterSetup:
+def build_lol_kills_adapter(
+    spec: ExperimentSpec, memory_root: Path | str
+) -> AdapterSetup:
     handler = _LoLKillsHandler(spec=spec, memory_root=Path(memory_root))
     return AdapterSetup(
         handlers={
@@ -62,13 +69,21 @@ def build_lol_kills_adapter(spec: ExperimentSpec, memory_root: Path | str) -> Ad
             "slice_analysis": handler,
             "targeted_tune": handler,
         },
-        capability_provider=lambda effective_spec: _lol_capability_context(_resolve_player_performance_repo()),
-        discovery_provider=lambda objective: _lol_capability_context(_resolve_player_performance_repo()),
-        preflight_provider=lambda effective_spec, capability_context: _lol_preflight(_resolve_player_performance_repo()),
+        capability_provider=lambda effective_spec: _lol_capability_context(
+            _resolve_player_performance_repo()
+        ),
+        discovery_provider=lambda objective: _lol_capability_context(
+            _resolve_player_performance_repo()
+        ),
+        preflight_provider=lambda effective_spec, capability_context: _lol_preflight(
+            _resolve_player_performance_repo()
+        ),
     )
 
 
-def build_nba_points_adapter(spec: ExperimentSpec, memory_root: Path | str) -> AdapterSetup:
+def build_nba_points_adapter(
+    spec: ExperimentSpec, memory_root: Path | str
+) -> AdapterSetup:
     handler = _NBAPointsPilotHandler(memory_root=Path(memory_root))
     return AdapterSetup(
         handlers={
@@ -92,9 +107,13 @@ def _resolve_player_performance_repo() -> Path:
         Path(__file__).resolve().parents[2].parent / "player-performance-ratings",
     ]
     for candidate in candidates:
-        if (candidate / "examples" / "lol" / "pipeline_transformer_example.py").exists():
+        if (
+            candidate / "examples" / "lol" / "pipeline_transformer_example.py"
+        ).exists():
             return candidate
-    raise FileNotFoundError("Could not find player-performance-ratings repo with the LoL example files.")
+    raise FileNotFoundError(
+        "Could not find player-performance-ratings repo with the LoL example files."
+    )
 
 
 def _add_repo_to_path(repo_root: Path) -> None:
@@ -112,7 +131,11 @@ def _lol_preflight(repo_root: Path) -> list[PreflightCheck]:
         ),
         PreflightCheck(
             name="lol_dataset_available",
-            status="passed" if (repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet").exists() else "failed",
+            status="passed"
+            if (
+                repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet"
+            ).exists()
+            else "failed",
             detail="LoL sample dataset is available.",
         ),
     ]
@@ -165,9 +188,21 @@ def _lol_capability_context(repo_root: Path) -> CapabilityContext:
         },
         available_data_assets=[str(data_asset)],
         available_metrics={
-            "kills_mae": {"goal": "minimize", "preferred_role": "primary", "target": "kills"},
-            "kills_rmse": {"goal": "minimize", "preferred_role": "secondary", "target": "kills"},
-            "kills_mean_bias_abs": {"goal": "minimize", "preferred_role": "guardrail", "target": "kills"},
+            "kills_mae": {
+                "goal": "minimize",
+                "preferred_role": "primary",
+                "target": "kills",
+            },
+            "kills_rmse": {
+                "goal": "minimize",
+                "preferred_role": "secondary",
+                "target": "kills",
+            },
+            "kills_mean_bias_abs": {
+                "goal": "minimize",
+                "preferred_role": "guardrail",
+                "target": "kills",
+            },
         },
         environment_facts={
             "autonomous_execution_supported": True,
@@ -195,7 +230,9 @@ class _LoLKillsHandler:
         repo_root = _resolve_player_performance_repo()
         action = candidate.action_type
         if action == "baseline":
-            result = _evaluate_lol_kills_configuration(repo_root=repo_root, params=_baseline_lol_params())
+            result = _evaluate_lol_kills_configuration(
+                repo_root=repo_root, params=_baseline_lol_params()
+            )
             notes = [
                 f"Baseline MAE on validation rows: {result['metrics']['kills_mae']:.4f}",
                 f"Baseline RMSE on validation rows: {result['metrics']['kills_rmse']:.4f}",
@@ -203,10 +240,16 @@ class _LoLKillsHandler:
             return _build_lol_outcome(
                 result=result,
                 notes=notes,
-                artifact_path=_write_artifact(self.memory_root, "lol_kills_baseline", result),
+                artifact_path=_write_artifact(
+                    self.memory_root, "lol_kills_baseline", result
+                ),
             )
         if action in {"eda", "slice_analysis"}:
-            result = _evaluate_lol_kills_configuration(repo_root=repo_root, params=_baseline_lol_params(), include_diagnostics=True)
+            result = _evaluate_lol_kills_configuration(
+                repo_root=repo_root,
+                params=_baseline_lol_params(),
+                include_diagnostics=True,
+            )
             notes = [
                 f"Worst position slice: {result['diagnostics']['worst_position']['position']} ({result['diagnostics']['worst_position']['mae']:.4f} MAE)",
                 f"Worst kills bucket: {result['diagnostics']['worst_bucket']['bucket']} ({result['diagnostics']['worst_bucket']['mae']:.4f} MAE)",
@@ -219,17 +262,29 @@ class _LoLKillsHandler:
                 result=result,
                 notes=notes,
                 next_ideas=next_ideas,
-                artifact_path=_write_artifact(self.memory_root, "lol_kills_eda", result),
+                artifact_path=_write_artifact(
+                    self.memory_root, "lol_kills_eda", result
+                ),
             )
         if action == "targeted_tune":
             search_space = [
                 _baseline_lol_params(),
-                {**_baseline_lol_params(), "kills_learning_rate": 0.05, "kills_num_leaves": 31},
-                {**_baseline_lol_params(), "kills_learning_rate": 0.03, "kills_num_leaves": 63},
+                {
+                    **_baseline_lol_params(),
+                    "kills_learning_rate": 0.05,
+                    "kills_num_leaves": 31,
+                },
+                {
+                    **_baseline_lol_params(),
+                    "kills_learning_rate": 0.03,
+                    "kills_num_leaves": 63,
+                },
                 {**_baseline_lol_params(), "lag_length": 5, "rolling_window": 30},
             ]
             if candidate.config_patch:
-                search_space.append({**_baseline_lol_params(), **candidate.config_patch})
+                search_space.append(
+                    {**_baseline_lol_params(), **candidate.config_patch}
+                )
             trials = [
                 _evaluate_lol_kills_configuration(repo_root=repo_root, params=params)
                 for params in search_space
@@ -242,7 +297,11 @@ class _LoLKillsHandler:
             return _build_lol_outcome(
                 result=best,
                 notes=notes,
-                artifact_path=_write_artifact(self.memory_root, "lol_kills_tuned", {"trials": trials, "best": best}),
+                artifact_path=_write_artifact(
+                    self.memory_root,
+                    "lol_kills_tuned",
+                    {"trials": trials, "best": best},
+                ),
                 code_or_config_changes=[f"Best params: {best['params']}"],
             )
         raise ValueError(f"Unsupported LoL action: {action}")
@@ -284,7 +343,9 @@ def _load_lol_modules(repo_root: Path) -> dict[str, Any]:
     }
 
 
-def _prepare_lol_frames(repo_root: Path, params: dict[str, Any]) -> tuple[Any, Any, Any, Any, Any]:
+def _prepare_lol_frames(
+    repo_root: Path, params: dict[str, Any]
+) -> tuple[Any, Any, Any, Any, Any]:
     modules = _load_lol_modules(repo_root)
     import pandas as pd
 
@@ -296,12 +357,18 @@ def _prepare_lol_frames(repo_root: Path, params: dict[str, Any]) -> tuple[Any, A
         league="league",
         position="position",
     )
-    df = pd.read_parquet(repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet")
+    df = pd.read_parquet(
+        repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet"
+    )
     df = (
         df.loc[lambda x: x.position != "team"]
         .assign(team_count=df.groupby("gameid")["teamname"].transform("nunique"))
         .loc[lambda x: x.team_count == 2]
-        .assign(player_count=df.groupby(["gameid", "teamname"])["playername"].transform("nunique"))
+        .assign(
+            player_count=df.groupby(["gameid", "teamname"])["playername"].transform(
+                "nunique"
+            )
+        )
         .loc[lambda x: x.player_count == 5]
         .drop_duplicates(subset=["gameid", "playername", "teamname"])
         .sort_values(["date", "gameid", "teamname", "playername"])
@@ -322,7 +389,11 @@ def _prepare_lol_frames(repo_root: Path, params: dict[str, Any]) -> tuple[Any, A
         column_names=column_names,
     )
     lag_generators = [
-        modules["LagTransformer"](features=["kills", "deaths", "result"], lag_length=params["lag_length"], granularity=["playername"]),
+        modules["LagTransformer"](
+            features=["kills", "deaths", "result"],
+            lag_length=params["lag_length"],
+            granularity=["playername"],
+        ),
         modules["RollingWindowTransformer"](
             features=["kills", "deaths", "result"],
             window=params["rolling_window"],
@@ -331,7 +402,11 @@ def _prepare_lol_frames(repo_root: Path, params: dict[str, Any]) -> tuple[Any, A
         ),
     ]
     feature_generator = modules["FeatureGeneratorPipeline"](
-        feature_generators=[rating_generator_player_kills, rating_generator_result, *lag_generators],
+        feature_generators=[
+            rating_generator_player_kills,
+            rating_generator_result,
+            *lag_generators,
+        ],
         column_names=column_names,
     )
     historical_df = feature_generator.fit_transform(df)
@@ -385,12 +460,17 @@ def _evaluate_lol_kills_configuration(
     params: dict[str, Any],
     include_diagnostics: bool = False,
 ) -> dict[str, Any]:
-    import numpy as np
     from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-    _, column_names, _, historical_df, validation_df = _prepare_lol_frames(repo_root, params)
+    _, column_names, _, historical_df, validation_df = _prepare_lol_frames(
+        repo_root, params
+    )
     mae = float(mean_absolute_error(validation_df["kills"], validation_df["kills_oof"]))
-    rmse = float(math.sqrt(mean_squared_error(validation_df["kills"], validation_df["kills_oof"])))
+    rmse = float(
+        math.sqrt(
+            mean_squared_error(validation_df["kills"], validation_df["kills_oof"])
+        )
+    )
     mean_bias = float((validation_df["kills_oof"] - validation_df["kills"]).mean())
     result = {
         "params": dict(params),
@@ -417,7 +497,9 @@ def _evaluate_lol_kills_configuration(
             .apply(lambda x: float(mean_absolute_error(x["kills"], x["kills_oof"])))
             .sort_values(ascending=False)
         )
-        worst_rows = diag_df.assign(abs_error=(diag_df["kills_oof"] - diag_df["kills"]).abs()).nlargest(5, "abs_error")
+        worst_rows = diag_df.assign(
+            abs_error=(diag_df["kills_oof"] - diag_df["kills"]).abs()
+        ).nlargest(5, "abs_error")
         result["diagnostics"] = {
             "worst_position": {
                 "position": str(position_slice.index[0]),
@@ -427,10 +509,19 @@ def _evaluate_lol_kills_configuration(
                 "bucket": str(bucket_slice.index[0]),
                 "mae": float(bucket_slice.iloc[0]),
             },
-            "position_mae": {str(idx): float(val) for idx, val in position_slice.items()},
+            "position_mae": {
+                str(idx): float(val) for idx, val in position_slice.items()
+            },
             "bucket_mae": {str(idx): float(val) for idx, val in bucket_slice.items()},
             "worst_rows": worst_rows[
-                [column_names.match_id, column_names.player_id, "position", "kills", "kills_oof", "abs_error"]
+                [
+                    column_names.match_id,
+                    column_names.player_id,
+                    "position",
+                    "kills",
+                    "kills_oof",
+                    "abs_error",
+                ]
             ].to_dict(orient="records"),
         }
     return result
@@ -468,7 +559,10 @@ def _write_artifact(memory_root: Path, stem: str, payload: dict[str, Any]) -> st
     artifact_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     artifact_path = artifact_dir / f"{stem}_{timestamp}.json"
-    artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
+    artifact_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n",
+        encoding="utf-8",
+    )
     return str(artifact_path)
 
 
@@ -494,8 +588,16 @@ def _nba_capability_context() -> CapabilityContext:
             "targeted_tune": "Run a bounded NBA points parameter search.",
         },
         available_metrics={
-            "mae": {"goal": "minimize", "preferred_role": "primary", "target": "points"},
-            "ordinal_loss": {"goal": "minimize", "preferred_role": "guardrail", "target": "points"},
+            "mae": {
+                "goal": "minimize",
+                "preferred_role": "primary",
+                "target": "points",
+            },
+            "ordinal_loss": {
+                "goal": "minimize",
+                "preferred_role": "guardrail",
+                "target": "points",
+            },
         },
         environment_facts={
             "autonomous_execution_supported": True,
@@ -509,7 +611,9 @@ def _nba_capability_context() -> CapabilityContext:
 
 
 def _nba_preflight() -> list[PreflightCheck]:
-    pilot_path = Path(__file__).resolve().parents[2] / "experiments" / "nba_points_real_pilot.py"
+    pilot_path = (
+        Path(__file__).resolve().parents[2] / "experiments" / "nba_points_real_pilot.py"
+    )
     return [
         PreflightCheck(
             name="nba_pilot_available",
@@ -524,7 +628,13 @@ class _NBAPointsPilotHandler:
         self.memory_root = memory_root
 
     def execute(self, candidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
-        from experiments.nba_points_real_pilot import baseline_params, evaluate_configuration, load_modules, load_nba_dataframe, run_diagnostics
+        from experiments.nba_points_real_pilot import (
+            baseline_params,
+            evaluate_configuration,
+            load_modules,
+            load_nba_dataframe,
+            run_diagnostics,
+        )
 
         repo_root = _resolve_player_performance_repo()
         if candidate.action_type in {"eda", "slice_analysis"}:
@@ -536,7 +646,9 @@ class _NBAPointsPilotHandler:
                     for key, value in diagnostics["diagnostic_metrics"].items()
                     if key != "mae"
                 },
-                artifacts=[_write_artifact(self.memory_root, "nba_points_eda", diagnostics)],
+                artifacts=[
+                    _write_artifact(self.memory_root, "nba_points_eda", diagnostics)
+                ],
                 notes=[f"Primary issue: {diagnostics['primary_issue']}"],
             )
         modules = load_modules(repo_root)
@@ -554,6 +666,14 @@ class _NBAPointsPilotHandler:
         return ExperimentOutcome(
             primary_metric_value=float(metrics["mae"]),
             secondary_metrics={"ordinal_loss": float(metrics["ordinal_loss"])},
-            artifacts=[_write_artifact(self.memory_root, "nba_points_run", {"params": params, "metrics": metrics})],
-            notes=[f"Ran NBA points {candidate.action_type} with MAE {metrics['mae']:.4f}."],
+            artifacts=[
+                _write_artifact(
+                    self.memory_root,
+                    "nba_points_run",
+                    {"params": params, "metrics": metrics},
+                )
+            ],
+            notes=[
+                f"Ran NBA points {candidate.action_type} with MAE {metrics['mae']:.4f}."
+            ],
         )

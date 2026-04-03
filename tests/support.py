@@ -59,8 +59,12 @@ class FakeNarrationBackend:
         self.bootstrap_calls.append((turn, capability_context))
         return f"bootstrap:{turn.proposal.objective}"
 
-    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
-        self.iteration_calls.append((snapshot, candidate, outcome, reflection, review, accepted_summary))
+    def summarize_iteration(
+        self, snapshot, candidate, outcome, reflection, review, accepted_summary
+    ):
+        self.iteration_calls.append(
+            (snapshot, candidate, outcome, reflection, review, accepted_summary)
+        )
         return f"iteration:{candidate.action_type}:{review.status}"
 
 
@@ -93,7 +97,9 @@ class FakeAccessAdvisorBackend:
             required_permissions=["Workspace access", "Job run permission"],
             commands=["databricks auth profiles", "databricks bundle validate"],
             steps=["Export env vars", "Validate access", "Run the bundle"],
-            markdown=("# Access Guide\n\n## Environment Variables\n- DATABRICKS_HOST\n- DATABRICKS_TOKEN\n"),
+            markdown=(
+                "# Access Guide\n\n## Environment Variables\n- DATABRICKS_HOST\n- DATABRICKS_TOKEN\n"
+            ),
         )
 
 
@@ -101,7 +107,9 @@ class RaisingNarrationBackend:
     def summarize_bootstrap(self, turn, capability_context):
         raise RuntimeError("invalid bearer token")
 
-    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+    def summarize_iteration(
+        self, snapshot, candidate, outcome, reflection, review, accepted_summary
+    ):
         raise RuntimeError("invalid bearer token")
 
 
@@ -158,8 +166,16 @@ def build_adapter_setup(
 ) -> AdapterSetup:
     return AdapterSetup(
         handlers=handlers or {},
-        capability_provider=((lambda effective_spec: capability_context) if capability_context is not None else None),
-        discovery_provider=((lambda objective: discovery_context) if discovery_context is not None else None),
+        capability_provider=(
+            (lambda effective_spec: capability_context)
+            if capability_context is not None
+            else None
+        ),
+        discovery_provider=(
+            (lambda objective: discovery_context)
+            if discovery_context is not None
+            else None
+        ),
         preflight_provider=(
             (lambda effective_spec, discovered_context: list(preflight_checks))
             if preflight_checks is not None
@@ -183,7 +199,12 @@ def patch_litellm_test_backends(
 
     class StubWorker:
         def __init__(
-            self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
         ) -> None:
             self.model = model
 
@@ -192,7 +213,12 @@ def patch_litellm_test_backends(
 
     class StubReflection:
         def __init__(
-            self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
         ) -> None:
             self.model = model
 
@@ -201,7 +227,12 @@ def patch_litellm_test_backends(
 
     class StubReview:
         def __init__(
-            self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
         ) -> None:
             self.model = model
 
@@ -210,7 +241,12 @@ def patch_litellm_test_backends(
 
     class StubNarration:
         def __init__(
-            self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None, **kwargs
+            self,
+            model: str,
+            completion_fn=None,
+            temperature: float = 0.2,
+            extra_kwargs=None,
+            **kwargs,
         ) -> None:
             self.model = model
 

@@ -1,11 +1,16 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Protocol
 
-from loopforge.core.backends import NarrationBackend, ReflectionBackend, ReviewBackend, WorkerBackend
+from loopforge.core.backends import (
+    NarrationBackend,
+    ReflectionBackend,
+    ReviewBackend,
+    WorkerBackend,
+)
 from loopforge.core.memory import FileMemoryStore
 from loopforge.core.runtime import is_generic_autonomous
 from loopforge.core.types import (
@@ -32,7 +37,9 @@ IterationCallback = Callable[[IterationCycleResult], None]
 
 
 class ActionExecutor(Protocol):
-    def execute(self, candidate: ExperimentCandidate, snapshot: MemorySnapshot) -> ExperimentOutcome: ...
+    def execute(
+        self, candidate: ExperimentCandidate, snapshot: MemorySnapshot
+    ) -> ExperimentOutcome: ...
 
 
 ExecutionRecoveryHandler = Callable[
@@ -52,7 +59,9 @@ class RoutingExperimentExecutor:
         self.plan_executor = plan_executor
         self.recovery_handler = recovery_handler
 
-    def execute(self, candidate: ExperimentCandidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
+    def execute(
+        self, candidate: ExperimentCandidate, snapshot: MemorySnapshot
+    ) -> ExperimentOutcome:
         generic_autonomous = is_generic_autonomous(snapshot=snapshot)
         if candidate.execution_steps and self.plan_executor is not None:
             return self.plan_executor.execute(candidate, snapshot)
@@ -100,7 +109,9 @@ class RoutingExperimentExecutor:
                     ],
                     execution_details={"candidate": candidate.to_dict()},
                 )
-            raise ValueError(f"No executor registered for action_type={candidate.action_type!r}.") from exc
+            raise ValueError(
+                f"No executor registered for action_type={candidate.action_type!r}."
+            ) from exc
         try:
             return handler.execute(candidate, snapshot)
         except Exception as exc:
@@ -163,7 +174,9 @@ class ExperimentOrchestrator:
 
         # ── Worker proposes ──
         worker_tag = f"[{self.role_models.worker}] " if self.role_models else ""
-        self.progress_fn("worker_propose", f"{worker_tag}Worker proposing next experiment...")
+        self.progress_fn(
+            "worker_propose", f"{worker_tag}Worker proposing next experiment..."
+        )
         candidate = self.worker_backend.propose_next_experiment(snapshot)
         self.progress_fn("worker_detail", self._format_candidate(candidate))
 
@@ -174,7 +187,9 @@ class ExperimentOrchestrator:
             if candidate.execution_steps:
                 self.progress_fn("executor_run", "Executing autonomous agent plan...")
             else:
-                self.progress_fn("executor_run", f"Executing {candidate.action_type}...")
+                self.progress_fn(
+                    "executor_run", f"Executing {candidate.action_type}..."
+                )
             try:
                 outcome = self.executor.execute(candidate, snapshot)
             except Exception as exc:
@@ -189,10 +204,17 @@ class ExperimentOrchestrator:
                     "outcome": outcome.to_dict(),
                 }
             )
-            outcome = self._attach_intra_iteration_attempts(outcome, intra_iteration_attempts)
-            self.progress_fn("executor_detail", self._format_outcome(outcome, snapshot.effective_spec))
+            outcome = self._attach_intra_iteration_attempts(
+                outcome, intra_iteration_attempts
+            )
+            self.progress_fn(
+                "executor_detail",
+                self._format_outcome(outcome, snapshot.effective_spec),
+            )
 
-            if outcome.status == "success" and self._outcome_has_metrics(outcome, snapshot.effective_spec):
+            if outcome.status == "success" and self._outcome_has_metrics(
+                outcome, snapshot.effective_spec
+            ):
                 break
 
             if outcome.status == "success":
@@ -300,13 +322,17 @@ class ExperimentOrchestrator:
         review_tag = f"[{self.role_models.review}] " if self.role_models else ""
         self.progress_fn("review", f"{review_tag}Reviewing iteration...")
         try:
-            review = self.review_backend.review(snapshot, candidate, outcome, reflection)
+            review = self.review_backend.review(
+                snapshot, candidate, outcome, reflection
+            )
         except Exception as exc:
             review = self._fallback_review(outcome, exc)
         self.progress_fn("review_detail", self._format_review(review))
         record = IterationRecord(
             iteration_id=snapshot.next_iteration_id,
-            parent_iteration_id=snapshot.latest_summary.iteration_id if snapshot.latest_summary is not None else None,
+            parent_iteration_id=snapshot.latest_summary.iteration_id
+            if snapshot.latest_summary is not None
+            else None,
             candidate=candidate,
             outcome=outcome,
             reflection=reflection,
@@ -345,7 +371,9 @@ class ExperimentOrchestrator:
                     message=human_update,
                 )
             )
-        return IterationCycleResult(record=record, accepted_summary=accepted_summary, human_update=human_update)
+        return IterationCycleResult(
+            record=record, accepted_summary=accepted_summary, human_update=human_update
+        )
 
     def run(
         self,
@@ -355,8 +383,12 @@ class ExperimentOrchestrator:
         snapshot = self._load_snapshot()
         max_iterations = iterations
         if max_iterations is None:
-            max_iterations = int(snapshot.effective_spec.stop_conditions.get("max_iterations", 30))
-        max_autonomous_hours = snapshot.effective_spec.stop_conditions.get("max_autonomous_hours", 6)
+            max_iterations = int(
+                snapshot.effective_spec.stop_conditions.get("max_iterations", 30)
+            )
+        max_autonomous_hours = snapshot.effective_spec.stop_conditions.get(
+            "max_autonomous_hours", 6
+        )
         max_runtime_seconds = None
         if max_autonomous_hours is not None:
             max_runtime_seconds = float(max_autonomous_hours) * 60 * 60
@@ -365,9 +397,14 @@ class ExperimentOrchestrator:
         results: list[IterationCycleResult] = []
         started_at = self.monotonic_fn()
         for i in range(max_iterations):
-            if max_runtime_seconds is not None and (self.monotonic_fn() - started_at) >= max_runtime_seconds:
+            if (
+                max_runtime_seconds is not None
+                and (self.monotonic_fn() - started_at) >= max_runtime_seconds
+            ):
                 break
-            self.progress_fn("iteration_start", f"Starting iteration {i + 1}/{max_iterations}...")
+            self.progress_fn(
+                "iteration_start", f"Starting iteration {i + 1}/{max_iterations}..."
+            )
             try:
                 cycle_result = self.run_iteration()
             except KeyboardInterrupt:
@@ -415,8 +452,13 @@ class ExperimentOrchestrator:
                         step_summaries.append("run inline Python inspection")
                     elif "python " in cmd and ".py" in cmd:
                         import re
-                        script_match = re.search(r'python\s+(\S+\.py)', cmd)
-                        step_summaries.append(f"run {script_match.group(1)}" if script_match else "run Python script")
+
+                        script_match = re.search(r"python\s+(\S+\.py)", cmd)
+                        step_summaries.append(
+                            f"run {script_match.group(1)}"
+                            if script_match
+                            else "run Python script"
+                        )
                     elif cmd:
                         short = cmd[:80] + "..." if len(cmd) > 80 else cmd
                         step_summaries.append(short)
@@ -438,7 +480,7 @@ class ExperimentOrchestrator:
         if metrics_parts:
             lines.append(f"  Metrics    : {' | '.join(metrics_parts)}")
         elif outcome.status == "success":
-            lines.append(f"  Result     : completed successfully (no metrics reported)")
+            lines.append("  Result     : completed successfully (no metrics reported)")
         # Failure info
         if outcome.status != "success":
             summary = outcome.failure_summary or "execution failed"
@@ -473,7 +515,11 @@ class ExperimentOrchestrator:
                 action_type = next_action.get("action_type", "")
                 reason = next_action.get("reason", next_action.get("hypothesis", ""))
                 if reason:
-                    lines.append(f"  Next       : {action_type} — {reason}" if action_type else f"  Next       : {reason}")
+                    lines.append(
+                        f"  Next       : {action_type} — {reason}"
+                        if action_type
+                        else f"  Next       : {reason}"
+                    )
                 elif action_type:
                     lines.append(f"  Next       : {action_type}")
             elif isinstance(next_action, str):
@@ -509,7 +555,9 @@ class ExperimentOrchestrator:
     ) -> MemorySnapshot:
         synthetic_record = IterationRecord(
             iteration_id=snapshot.next_iteration_id,
-            parent_iteration_id=snapshot.latest_summary.iteration_id if snapshot.latest_summary is not None else None,
+            parent_iteration_id=snapshot.latest_summary.iteration_id
+            if snapshot.latest_summary is not None
+            else None,
             candidate=candidate,
             outcome=outcome,
             reflection=ReflectionSummary(
@@ -521,7 +569,9 @@ class ExperimentOrchestrator:
                 should_update_memory=False,
             ),
         )
-        return replace(snapshot, recent_records=[*snapshot.recent_records, synthetic_record])
+        return replace(
+            snapshot, recent_records=[*snapshot.recent_records, synthetic_record]
+        )
 
     def _block_metricless_iteration(
         self,
@@ -593,20 +643,30 @@ class ExperimentOrchestrator:
             capability_context=capability_context,
         )
 
-    def _build_summary(self, snapshot: MemorySnapshot, record: IterationRecord) -> IterationSummary:
+    def _build_summary(
+        self, snapshot: MemorySnapshot, record: IterationRecord
+    ) -> IterationSummary:
         metric_results = record.outcome.resolved_metric_results(snapshot.effective_spec)
         primary_result = metric_results.get(snapshot.effective_spec.primary_metric.name)
-        guardrail_failures = self._guardrail_failures(snapshot.effective_spec, metric_results)
+        guardrail_failures = self._guardrail_failures(
+            snapshot.effective_spec, metric_results
+        )
         result = self._classify_result(
             action_type=record.candidate.action_type,
             capability_context=snapshot.capability_context,
             primary_metric=snapshot.effective_spec.primary_metric,
-            candidate_value=primary_result.value if primary_result is not None else None,
-            best_value=snapshot.best_summary.primary_metric_value if snapshot.best_summary is not None else None,
+            candidate_value=primary_result.value
+            if primary_result is not None
+            else None,
+            best_value=snapshot.best_summary.primary_metric_value
+            if snapshot.best_summary is not None
+            else None,
             guardrail_failures=guardrail_failures,
             outcome_status=record.outcome.status,
         )
-        secondary_metric_names = {metric.name for metric in snapshot.effective_spec.secondary_metrics}
+        secondary_metric_names = {
+            metric.name for metric in snapshot.effective_spec.secondary_metrics
+        }
         secondary_metrics = {
             name: result.value
             for name, result in metric_results.items()
@@ -621,7 +681,9 @@ class ExperimentOrchestrator:
             instructions=record.candidate.instructions,
             config_patch=record.candidate.config_patch,
             primary_metric_name=snapshot.effective_spec.primary_metric.name,
-            primary_metric_value=primary_result.value if primary_result is not None else None,
+            primary_metric_value=primary_result.value
+            if primary_result is not None
+            else None,
             secondary_metrics=secondary_metrics,
             result=result,
             artifacts=record.outcome.artifacts,
@@ -655,12 +717,16 @@ class ExperimentOrchestrator:
             return "inconclusive"
         if guardrail_failures:
             return "regressed"
-        inconclusive_actions = set(capability_context.environment_facts.get("inconclusive_actions", []))
+        inconclusive_actions = set(
+            capability_context.environment_facts.get("inconclusive_actions", [])
+        )
         if action_type in inconclusive_actions:
             return "inconclusive"
         if best_value is None:
             return "improved"
-        if primary_metric.is_improvement(candidate=candidate_value, incumbent=best_value):
+        if primary_metric.is_improvement(
+            candidate=candidate_value, incumbent=best_value
+        ):
             return "improved"
         return "regressed"
 
@@ -683,7 +749,9 @@ class ExperimentOrchestrator:
         return primary is not None and primary.value is not None
 
     @staticmethod
-    def _merge_outcomes(base: ExperimentOutcome, continuation: ExperimentOutcome) -> ExperimentOutcome:
+    def _merge_outcomes(
+        base: ExperimentOutcome, continuation: ExperimentOutcome
+    ) -> ExperimentOutcome:
         """Merge a continuation outcome into the base, preferring the continuation's metrics."""
         merged_metrics = dict(base.metric_results)
         merged_metrics.update(continuation.metric_results)
@@ -704,15 +772,25 @@ class ExperimentOrchestrator:
         failure_type = exc.__class__.__name__
         failure_summary = str(exc).strip() or failure_type
         lower_summary = failure_summary.lower()
-        recoverable = isinstance(exc, (ImportError, ModuleNotFoundError, FileNotFoundError)) or any(
+        recoverable = isinstance(
+            exc, (ImportError, ModuleNotFoundError, FileNotFoundError)
+        ) or any(
             token in lower_summary
-            for token in ("no module named", "file not found", "path not found", "command not found")
+            for token in (
+                "no module named",
+                "file not found",
+                "path not found",
+                "command not found",
+            )
         )
         recovery_actions: list[str] = []
         if (
             "permissionerror" in lower_summary
             and "access is denied" in lower_summary
-            and any(token in lower_summary for token in ("socketpair", "multiprocessing", "_ssock", "_csock"))
+            and any(
+                token in lower_summary
+                for token in ("socketpair", "multiprocessing", "_ssock", "_csock")
+            )
         ):
             recoverable = True
             failure_type = "MultiprocessingPermissionError"
@@ -723,11 +801,17 @@ class ExperimentOrchestrator:
                 ]
             )
         if "no module named" in lower_summary:
-            recovery_actions.append("Install or sync the missing Python dependency, then retry the iteration.")
+            recovery_actions.append(
+                "Install or sync the missing Python dependency, then retry the iteration."
+            )
         if "file not found" in lower_summary or "path not found" in lower_summary:
-            recovery_actions.append("Resolve the missing file or path from repo/config context, then retry.")
+            recovery_actions.append(
+                "Resolve the missing file or path from repo/config context, then retry."
+            )
         if not recovery_actions:
-            recovery_actions.append("Inspect the execution error, make the smallest fix, and retry.")
+            recovery_actions.append(
+                "Inspect the execution error, make the smallest fix, and retry."
+            )
         return ExperimentOutcome(
             status="recoverable_failure" if recoverable else "blocked",
             notes=[f"Execution failed during the iteration: {failure_summary}"],
@@ -739,11 +823,15 @@ class ExperimentOrchestrator:
         )
 
     @staticmethod
-    def _fallback_reflection(outcome: ExperimentOutcome, exc: Exception) -> ReflectionSummary:
+    def _fallback_reflection(
+        outcome: ExperimentOutcome, exc: Exception
+    ) -> ReflectionSummary:
         if outcome.status == "success":
             return ReflectionSummary(
                 assessment=f"The run completed, but reflection generation failed: {exc}",
-                lessons=["Inspect the raw outcome directly because reflection generation failed."],
+                lessons=[
+                    "Inspect the raw outcome directly because reflection generation failed."
+                ],
                 risks=[str(exc).strip()] if str(exc).strip() else [],
             )
         return ReflectionSummary(

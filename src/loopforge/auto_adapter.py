@@ -9,13 +9,67 @@ from typing import Any
 from loopforge.core.types import CapabilityContext
 
 
-METRIC_TOKENS = ("metric", "score", "loss", "auc", "precision", "recall", "accuracy", "f1", "rmse", "mae")
-DATA_TOKENS = ("data", "dataset", "table", "feature", "artifact", "model", "schema", "ddl", "migration")
-EXCLUDED_DIRS = {".git", ".hg", ".venv", ".pytest_cache", "__pycache__", "node_modules", ".loopforge"}
+METRIC_TOKENS = (
+    "metric",
+    "score",
+    "loss",
+    "auc",
+    "precision",
+    "recall",
+    "accuracy",
+    "f1",
+    "rmse",
+    "mae",
+)
+DATA_TOKENS = (
+    "data",
+    "dataset",
+    "table",
+    "feature",
+    "artifact",
+    "model",
+    "schema",
+    "ddl",
+    "migration",
+)
+EXCLUDED_DIRS = {
+    ".git",
+    ".hg",
+    ".venv",
+    ".pytest_cache",
+    "__pycache__",
+    "node_modules",
+    ".loopforge",
+}
 DATA_FILE_SUFFIXES = {".csv", ".parquet", ".json", ".jsonl", ".xlsx", ".xls"}
 # Patterns that indicate a string is a DataFrame column reference
-COLUMN_ACCESS_FUNCS = {"col", "alias", "over", "sort", "select", "with_columns", "group_by", "filter"}
-COLUMN_NOISE = {"utf-8", "utf8", "r", "w", "rb", "wb", "a", "", ".", ",", "/", "\\", "ok", "true", "false"}
+COLUMN_ACCESS_FUNCS = {
+    "col",
+    "alias",
+    "over",
+    "sort",
+    "select",
+    "with_columns",
+    "group_by",
+    "filter",
+}
+COLUMN_NOISE = {
+    "utf-8",
+    "utf8",
+    "r",
+    "w",
+    "rb",
+    "wb",
+    "a",
+    "",
+    ".",
+    ",",
+    "/",
+    "\\",
+    "ok",
+    "true",
+    "false",
+}
 
 
 def _iter_python_files(repo_root: Path) -> list[Path]:
@@ -40,7 +94,9 @@ def _iter_data_files(repo_root: Path) -> list[Path]:
     return files
 
 
-def _record_symbol(name: str, path: Path, repo_root: Path, bucket: dict[str, dict[str, Any]]) -> None:
+def _record_symbol(
+    name: str, path: Path, repo_root: Path, bucket: dict[str, dict[str, Any]]
+) -> None:
     if name in bucket:
         return
     bucket[name] = {
@@ -94,8 +150,11 @@ def _extract_column_refs(tree: ast.AST) -> set[str]:
                         columns.add(arg.value)
                     elif isinstance(arg, ast.List):
                         for elt in arg.elts:
-                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            if isinstance(elt, ast.Constant) and isinstance(
+                                elt.value, str
+                            ):
                                 columns.add(elt.value)
+
     # Filter noise — keep only plausible column names (lowercase/snake_case, no class names)
     def _looks_like_column(name: str) -> bool:
         if name.lower() in COLUMN_NOISE:
@@ -120,7 +179,10 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     for path in _iter_python_files(root):
         relative_path = str(path.relative_to(root)).replace("\\", "/")
         lower_path = relative_path.lower()
-        if any(token in lower_path for token in DATA_TOKENS) and relative_path not in data_assets:
+        if (
+            any(token in lower_path for token in DATA_TOKENS)
+            and relative_path not in data_assets
+        ):
             data_assets.append(relative_path)
         try:
             source = path.read_text(encoding="utf-8")
@@ -132,11 +194,13 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
             if not isinstance(name, str):
                 continue
             lowered = name.lower()
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
-                token in lowered for token in METRIC_TOKENS
-            ):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ) and any(token in lowered for token in METRIC_TOKENS):
                 _record_symbol(name, path, root, metrics)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_candidate_action_name(name):
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef)
+            ) and _is_candidate_action_name(name):
                 _record_symbol(name, path, root, actions)
         # Extract column references from data manipulation code
         cols = _extract_column_refs(tree)
@@ -149,17 +213,25 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
             data_assets.append(relative_path)
 
     if metrics:
-        notes.append(f"Discovered {len(metrics)} candidate metric symbols from Python sources.")
+        notes.append(
+            f"Discovered {len(metrics)} candidate metric symbols from Python sources."
+        )
     if actions:
-        notes.append(f"Discovered {len(actions)} candidate action symbols from Python sources.")
+        notes.append(
+            f"Discovered {len(actions)} candidate action symbols from Python sources."
+        )
     if data_assets:
-        notes.append(f"Discovered {len(data_assets)} candidate data-related files from repo paths.")
+        notes.append(
+            f"Discovered {len(data_assets)} candidate data-related files from repo paths."
+        )
 
     # Summarize discovered columns for the agent (cap at 50 to avoid noise)
     all_columns = sorted({col for cols in column_refs.values() for col in cols})
     if all_columns:
         if len(all_columns) <= 50:
-            notes.append(f"DataFrame columns referenced in code: {', '.join(all_columns)}")
+            notes.append(
+                f"DataFrame columns referenced in code: {', '.join(all_columns)}"
+            )
         else:
             notes.append(
                 f"DataFrame columns referenced in code ({len(all_columns)} total, showing first 50): "
@@ -188,10 +260,15 @@ def build_repo_scan_context(repo_root: Path | str) -> CapabilityContext:
     ]
     notes.extend(summary["notes"])
     if discovered_actions:
-        previews = [f"{name} ({item['path']})" for name, item in list(discovered_actions.items())[:10]]
+        previews = [
+            f"{name} ({item['path']})"
+            for name, item in list(discovered_actions.items())[:10]
+        ]
         notes.append("Public callables discovered in code: " + ", ".join(previews))
     return CapabilityContext(
-        available_actions={name: item["path"] for name, item in discovered_actions.items()},
+        available_actions={
+            name: item["path"] for name, item in discovered_actions.items()
+        },
         available_data_assets=list(summary["data_assets"]),
         available_metrics={
             name: {
@@ -231,7 +308,9 @@ def synthesize_auto_adapter(
     adapter_path = generated_dir / f"{module_stem}_adapter.py"
     summary_path = generated_dir / f"{module_stem}_summary.json"
 
-    summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
     module_source = f"""from __future__ import annotations
 
