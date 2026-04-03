@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Mapping
+from datetime import date, datetime
 from dataclasses import replace
 from typing import Any, Protocol
 
@@ -9,6 +10,7 @@ from loopforge.core.types import (
     AccessGuide,
     BootstrapTurn,
     CapabilityContext,
+    ExecutionStep,
     ExperimentCandidate,
     ExperimentSpec,
     ExperimentSpecProposal,
@@ -17,8 +19,45 @@ from loopforge.core.types import (
     OpsConsultation,
     RoleModelConfig,
     ReflectionSummary,
+    RunnerAuthoringRequest,
+    RunnerAuthoringResult,
     ReviewDecision,
     SpecQuestion,
+    StreamFn,
+)
+
+
+DATA_SCIENCE_METRICS_REASONING = (
+    "HOW TO THINK ABOUT EXPERIMENT DESIGN:\n"
+    "\n"
+    "You are a skilled data scientist. Derive answers from the objective — don't ask the user "
+    "to confirm what they already told you.\n"
+    "\n"
+    "1. PRIMARY METRIC: The user's objective directly implies it. "
+    "'Improve X for subset Y' means primary = X measured on Y. Just use it.\n"
+    "\n"
+    "2. GUARDRAILS: Think about what COULD BREAK when you change things. "
+    "A guardrail is something you're not optimizing but could be harmed by your changes. "
+    "The key test: 'If I change the model to improve the primary metric, could this other metric get worse?' "
+    "If yes, it's a guardrail. If no causal connection exists, ignore it.\n"
+    "\n"
+    "Key pattern — the COMPLEMENT RULE: when optimizing for a subset (e.g. bench players), "
+    "the complement subset's performance (e.g. starters) is naturally a guardrail, because "
+    "model changes that help one group can hurt the other. The aggregate (overall) follows from the subsets.\n"
+    "\n"
+    "3. DATA PIPELINE: Look at the discovered columns, data assets, and schema files in the capability context. "
+    "Think through how your proposed metrics will actually be computed from the data that exists. "
+    "If a field you need doesn't exist directly, reason about how to get it: "
+    "derive it from existing columns, find it in a schema definition (pandera, SQL DDL, ORM models), "
+    "join from another table, or compute it as a transformation. "
+    "State your plan clearly. Only ask the user when you genuinely can't figure out the path to the data.\n"
+    "\n"
+    "4. DON'T ASK WHAT YOU CAN DERIVE: "
+    "If the objective implies the metric, use it. "
+    "If the complement subset is obvious, make it a guardrail. "
+    "If a column can be derived from existing data, propose the derivation. "
+    "If a metric from the repo has no causal connection to your changes, exclude it silently. "
+    "Only ask when there is genuine ambiguity you cannot resolve from the objective and repo context."
 )
 
 
@@ -42,6 +81,7 @@ class BootstrapBackend(Protocol):
         capability_context: CapabilityContext,
         answer_history: dict[str, Any] | None = None,
         role_models: RoleModelConfig | None = None,
+        bootstrap_memory: dict[str, Any] | None = None,
     ) -> BootstrapTurn: ...
 
 
@@ -65,6 +105,10 @@ class AccessAdvisorBackend(Protocol):
         capability_context: CapabilityContext,
         preflight_checks,
     ) -> AccessGuide: ...
+
+
+class RunnerAuthoringBackend(Protocol):
+    def author_runner(self, request: RunnerAuthoringRequest) -> RunnerAuthoringResult: ...
 
 
 class ReviewBackend(Protocol):
@@ -102,13 +146,70 @@ class _LiteLLMJsonBackend:
         completion_fn: Any | None = None,
         temperature: float = 0.2,
         extra_kwargs: dict[str, Any] | None = None,
+        stream_fn: StreamFn | None = None,
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.extra_kwargs = extra_kwargs or {}
         self._completion_fn = completion_fn
+        self._stream_fn = stream_fn
+
+    def _stream_completion(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
+        """Call litellm with stream=True, emitting tokens via stream_fn."""
+        from litellm import completion as litellm_completion
+
+        response = litellm_completion(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            stream=True,
+            **kwargs,
+            **self.extra_kwargs,
+        )
+        chunks: list[str] = []
+        assert self._stream_fn is not None
+        for part in response:
+            choices = getattr(part, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            if delta is None:
+                continue
+            token = getattr(delta, "content", None) or ""
+            if token:
+                chunks.append(token)
+                self._stream_fn(token)
+        self._stream_fn("\n")
+        return "".join(chunks)
+
+    def _complete_text(self, system_prompt: str, user_message: str) -> str:
+        """Lightweight text completion — no JSON parsing, just a plain response."""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+        if self._stream_fn and self._completion_fn is None:
+            return self._stream_completion(messages)
+        completion_fn = self._completion_fn
+        if completion_fn is None:
+            from litellm import completion as litellm_completion
+            completion_fn = litellm_completion
+        response = completion_fn(
+            model=self.model,
+            messages=messages,
+            temperature=self.temperature,
+            **self.extra_kwargs,
+        )
+        return self._extract_content(response)
 
     def _complete_json(self, system_prompt: str, payload: dict[str, Any]) -> dict[str, Any]:
+        messages = [
+            {"role": "system", "content": f"{system_prompt} Return a valid JSON object only."},
+            {"role": "user", "content": json.dumps(payload, indent=2, sort_keys=True, default=self._json_default)},
+        ]
+        if self._stream_fn and self._completion_fn is None:
+            content = self._stream_completion(messages, response_format={"type": "json_object"})
+            return json.loads(content)
         completion_fn = self._completion_fn
         if completion_fn is None:
             from litellm import completion as litellm_completion
@@ -116,15 +217,27 @@ class _LiteLLMJsonBackend:
             completion_fn = litellm_completion
         response = completion_fn(
             model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(payload, indent=2, sort_keys=True)},
-            ],
+            messages=messages,
             temperature=self.temperature,
             response_format={"type": "json_object"},
             **self.extra_kwargs,
         )
         return json.loads(self._extract_content(response))
+
+    @staticmethod
+    def _json_default(value: Any) -> Any:
+        if isinstance(value, date | datetime):
+            return value.isoformat()
+        if callable(getattr(value, "isoformat", None)):
+            return str(value.isoformat())
+        if hasattr(value, "tolist") and not isinstance(value, str):
+            return value.tolist()
+        if hasattr(value, "item"):
+            try:
+                return value.item()
+            except (TypeError, ValueError):
+                pass
+        return str(value)
 
     @staticmethod
     def _extract_content(response: Any) -> str:
@@ -156,33 +269,169 @@ class _LiteLLMJsonBackend:
         raise ValueError("Could not extract JSON text from LiteLLM response content.")
 
 
+def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
+    allowed_actions = list(snapshot.effective_spec.allowed_actions)
+    generic_autonomous = (
+        snapshot.capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic"
+    )
+    forced_next_action = snapshot.effective_spec.metadata.get("force_next_action")
+    if forced_next_action not in allowed_actions:
+        forced_next_action = None
+    latest_record = snapshot.recent_records[-1] if snapshot.recent_records else None
+    if (
+        forced_next_action is None
+        and latest_record is not None
+        and latest_record.outcome.status == "recoverable_failure"
+        and latest_record.candidate.action_type in allowed_actions
+    ):
+        recommended_next_action = latest_record.candidate.action_type
+    else:
+        recommended_next_action = forced_next_action or (allowed_actions[0] if allowed_actions else "explore")
+    return {
+        "name": "guided_observation",
+        "allowed_actions": allowed_actions,
+        "generic_autonomous": generic_autonomous,
+        "recent_failures": [
+            {
+                "iteration_id": record.iteration_id,
+                "action_type": record.candidate.action_type,
+                "failure_type": record.outcome.failure_type,
+                "failure_summary": record.outcome.failure_summary,
+                "recovery_actions": record.outcome.recovery_actions,
+            }
+            for record in snapshot.recent_records
+            if record.outcome.status != "success"
+        ],
+        "recent_action_types": [summary.action_type for summary in snapshot.recent_summaries],
+        "forced_next_action": forced_next_action,
+        "recommended_next_action": recommended_next_action,
+    }
+
+
 class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
+        iteration_policy = build_iteration_policy(snapshot)
         payload = self._complete_json(
             system_prompt=(
                 "You are a fresh worker agent in an experimentation loop. "
                 "Use only the provided effective spec, accepted memory, and human interventions. "
                 "Respect the configured primary metric, secondary metrics, and guardrail metrics, "
-                "including any scorer_ref or metric constraints. Return one bounded next experiment."
+                "including any scorer_ref or metric constraints. "
+                "After bootstrap, execution is autonomous: do not wait for more user input during normal experimentation. "
+                "Keep iterating until the configured stop condition, a true execution blocker, or a safety boundary is reached. "
+                "Treat recoverable execution failures as normal iteration evidence. If the latest record failed, use it to decide the next fix/retry step. "
+                "Do not make random changes. Base each step on observed evidence from the repo, data probe, memory, and latest outcomes. "
+                "Prefer the narrowest next step that either reduces uncertainty or addresses a concrete observed issue. "
+                "Do not infer facts that are unknown. If the repo context is incomplete, use an action that gathers the missing evidence first. "
+                "If you propose a change action, explain which observation or result justifies it and keep the modification narrow. "
+                "When the execution mode is generic autonomous, treat action_type as a lightweight label only. The real work should be expressed in bounded execution_steps. "
+                "In generic autonomous mode, prefer execution_steps whenever the next step requires inspection, dependency installation, code edits, test runs, or retries. "
+                "When useful, include bounded execution_steps with concrete shell commands or safe repo file writes the runtime can run directly. "
+                "Return one bounded next experiment.\n\n"
+                + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
+                "recent_records": [record.to_dict() for record in snapshot.recent_records],
                 "recent_summaries": [summary.to_dict() for summary in snapshot.recent_summaries],
                 "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
                 "lessons_learned": snapshot.lessons_learned,
+                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
+                "iteration_policy": iteration_policy,
                 "next_iteration_id": snapshot.next_iteration_id,
             },
         )
+        payload = self._normalise_candidate_payload(payload, snapshot, iteration_policy=iteration_policy)
         return ExperimentCandidate(
             hypothesis=payload["hypothesis"],
             action_type=payload["action_type"],
             change_type=payload["change_type"],
             instructions=payload["instructions"],
+            execution_steps=[ExecutionStep.from_dict(step) for step in payload.get("execution_steps", [])],
             config_patch=payload.get("config_patch", {}),
             metadata=payload.get("metadata", {}),
         )
+
+    @staticmethod
+    def _normalise_candidate_payload(
+        payload: dict[str, Any] | None,
+        snapshot: MemorySnapshot,
+        *,
+        iteration_policy: dict[str, Any],
+    ) -> dict[str, Any]:
+        candidate_payload = dict(payload or {})
+        allowed_actions = list(snapshot.effective_spec.allowed_actions)
+        default_action = iteration_policy["recommended_next_action"]
+        generic_autonomous = bool(iteration_policy.get("generic_autonomous"))
+        action_type = candidate_payload.get("action_type")
+        if not isinstance(action_type, str) or not action_type.strip():
+            candidate_payload["action_type"] = default_action
+        change_type = candidate_payload.get("change_type")
+        if not isinstance(change_type, str) or not change_type.strip():
+            candidate_payload["change_type"] = candidate_payload["action_type"]
+        instructions = candidate_payload.get("instructions")
+        if not isinstance(instructions, str) or not instructions.strip():
+            candidate_payload["instructions"] = f"Run the {candidate_payload['action_type']} step."
+        hypothesis = candidate_payload.get("hypothesis")
+        if not isinstance(hypothesis, str) or not hypothesis.strip():
+            candidate_payload["hypothesis"] = f"Try {candidate_payload['action_type']} next."
+        config_patch = candidate_payload.get("config_patch")
+        if not isinstance(config_patch, dict):
+            candidate_payload["config_patch"] = {}
+        raw_steps = candidate_payload.get("execution_steps")
+        if not isinstance(raw_steps, list):
+            candidate_payload["execution_steps"] = []
+        else:
+            normalised_steps = []
+            for item in raw_steps:
+                if not isinstance(item, dict):
+                    continue
+                kind = str(item.get("kind", "shell"))
+                if kind == "shell":
+                    command = item.get("command")
+                    if not isinstance(command, str) or not command.strip():
+                        continue
+                    normalised_steps.append(
+                        {
+                            "kind": "shell",
+                            "command": command.strip(),
+                            "cwd": item.get("cwd"),
+                            "timeout_seconds": item.get("timeout_seconds"),
+                            "allow_failure": bool(item.get("allow_failure", False)),
+                            "rationale": str(item.get("rationale", "")),
+                        }
+                    )
+                    continue
+                if kind in {"write_file", "append_file"}:
+                    path = item.get("path")
+                    if not isinstance(path, str) or not path.strip():
+                        continue
+                    normalised_steps.append(
+                        {
+                            "kind": kind,
+                            "command": "",
+                            "path": path.strip(),
+                            "content": str(item.get("content", "")),
+                            "cwd": item.get("cwd"),
+                            "timeout_seconds": item.get("timeout_seconds"),
+                            "allow_failure": bool(item.get("allow_failure", False)),
+                            "rationale": str(item.get("rationale", "")),
+                        }
+                    )
+            candidate_payload["execution_steps"] = normalised_steps
+        metadata = candidate_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            candidate_payload["metadata"] = {}
+        if generic_autonomous and candidate_payload["execution_steps"] and not candidate_payload["action_type"].strip():
+            candidate_payload["action_type"] = default_action
+        if candidate_payload["action_type"] not in allowed_actions and allowed_actions and not (
+            generic_autonomous and candidate_payload["execution_steps"]
+        ):
+            candidate_payload["action_type"] = default_action
+            candidate_payload["change_type"] = default_action
+        return candidate_payload
 
 
 CONSULTATION_TRIGGER_TOKENS = (
@@ -222,6 +471,7 @@ def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
         " ".join(snapshot.capability_context.available_data_assets),
         json.dumps(snapshot.capability_context.environment_facts, sort_keys=True),
         json.dumps(snapshot.effective_spec.metadata, sort_keys=True),
+        " ".join(item.content for item in snapshot.markdown_memory),
     ]
     haystack = " ".join(part.lower() for part in search_space if part)
     return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
@@ -320,11 +570,14 @@ class LiteLLMSpecBackend(_LiteLLMJsonBackend):
                 },
             },
         )
+        raw_notes = payload.get("notes", [])
+        if isinstance(raw_notes, str):
+            raw_notes = [raw_notes] if raw_notes.strip() else []
         return ExperimentSpecProposal(
             objective=payload["objective"],
             recommended_spec=ExperimentSpec.from_dict(payload["recommended_spec"]),
             questions=[SpecQuestion.from_dict(item) for item in payload.get("questions", [])],
-            notes=payload.get("notes", []),
+            notes=raw_notes,
         )
 
 
@@ -335,18 +588,25 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
         capability_context: CapabilityContext,
         answer_history: dict[str, Any] | None = None,
         role_models: RoleModelConfig | None = None,
+        bootstrap_memory: dict[str, Any] | None = None,
     ) -> BootstrapTurn:
         payload = self._complete_json(
             system_prompt=(
-                "You are the initial clarifying agent for an experimentation runtime. "
+                "You are a skilled data scientist and the initial clarifying agent for an experimentation runtime. "
                 "Read the user's goal, inspect the discovered repo capabilities, and align on the problem framing. "
+                "You bring deep ML/stats expertise: reason about which metrics are relevant to the stated objective "
+                "and filter out metrics that don't apply. "
+                "You may suggest new metrics or evaluation approaches based on your domain knowledge, but always "
+                "confirm metric choices with the user. "
                 "Ask only the highest-value remaining questions, recommend a concrete experiment spec, "
-                "and set ready_to_start=true only when the spec is specific enough to begin execution."
+                "and set ready_to_start=true only when the spec is specific enough to begin execution.\n\n"
+                + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
                 "user_goal": user_goal,
                 "capability_context": capability_context.to_dict(),
                 "answer_history": answer_history or {},
+                "bootstrap_memory": bootstrap_memory or {},
                 "role_models": role_models.to_dict() if role_models is not None else None,
                 "instructions": {
                     "return_fields": [
@@ -370,15 +630,29 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "options",
                     ],
                     "behavior": [
-                        "Prefer discovered codebase metrics when available.",
-                        "If the user already implied a metric calculation, reflect that in scorer_ref, params, or constraints.",
-                        "Use guardrail metrics for non-negotiable regressions.",
-                        "Keep required questions minimal and concrete.",
+                        "Think like a skilled data scientist. Derive metrics, guardrails, and experiment design "
+                        "from the objective and repo context. Don't ask the user to confirm what they already told you.",
+                        "You have creative freedom to suggest new metrics, evaluation approaches, or analysis "
+                        "strategies based on your domain expertise — as long as you explain your reasoning.",
+                        "Use prior run memory (summaries, lessons, markdown memory) to avoid repeating mistakes.",
+                        "Only ask a question when there is genuine ambiguity you cannot resolve yourself. "
+                        "Keep questions minimal, concrete, and high-value.",
+                        "Be direct. If you can't find what the user asked for, say so plainly and ask. "
+                        "Don't discuss unrelated things that happen to exist in the repo.",
+                        "Don't explain obvious decisions. If you excluded an irrelevant metric, just exclude it — "
+                        "don't write a note saying 'I intentionally excluded X because...'. The user already knows.",
+                        "Ask at most ONE required question per turn. Don't bundle multiple questions or generate "
+                        "fallback alternatives ('do you want X instead?') alongside the primary question. "
+                        "The user's answer to the first question may make follow-ups irrelevant.",
                     ],
                 },
             },
         )
-        proposal_payload = self._normalise_bootstrap_proposal(payload.get("proposal"), user_goal=user_goal)
+        proposal_payload = self._normalise_bootstrap_proposal(
+            payload.get("proposal"),
+            user_goal=user_goal,
+            capability_context=capability_context,
+        )
         resolved_role_models = role_models or RoleModelConfig(
             planner=self.model,
             worker=self.model,
@@ -397,16 +671,88 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
             ready_to_start=payload.get("ready_to_start", False),
         )
 
+
+class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
+    def author_runner(self, request: RunnerAuthoringRequest) -> RunnerAuthoringResult:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are authoring a real repo-specific experiment runner module. "
+                "Return a valid JSON object with fields module_source, summary, and notes. "
+                "module_source must be plain Python code only. No markdown fences.\n\n"
+                "The generated module must define build_adapter(spec, memory_root) and return AdapterSetup. "
+                "It must expose real handlers, a discovery_provider or capability_provider, and a preflight_provider. "
+                "Do not generate placeholders or NotImplementedError stubs. "
+                "Do not intentionally block in preflight. Build the best runnable baseline path you can from the repo. "
+                "Prefer baseline/eda/slice_analysis/targeted_tune actions over raw helper function names."
+            ),
+            payload={
+                "request": request.to_dict(),
+                "instructions": {
+                    "module_must_import": [
+                        "from pathlib import Path",
+                        "from loopforge import AdapterSetup, CapabilityContext, ExperimentOutcome, MetricResult, PreflightCheck",
+                    ],
+                    "required_symbols": [
+                        "build_adapter",
+                    ],
+                    "coding_rules": [
+                        "Use ASCII only.",
+                        "No markdown fences.",
+                        "No ellipses or placeholder comments.",
+                        "Do not reference .loopforge/generated.",
+                        "Do not ask the user to manually edit Python files.",
+                        "Use previous_errors to repair the last failed attempt when present.",
+                    ],
+                },
+            },
+        )
+        return RunnerAuthoringResult.from_dict(payload)
+
+    def build_experiment_guide(
+        self,
+        turn: BootstrapTurn,
+        capability_context: CapabilityContext,
+        answers: dict[str, Any] | None = None,
+    ) -> str:
+        return self._complete_text(
+            system_prompt=(
+                "You are a senior data scientist writing a concise experiment guide for a worker agent "
+                "that will execute this experiment. The worker has never seen the repo or the user conversation. "
+                "Write only what the worker needs to get started. Be specific — include file paths, function names, "
+                "column names, and code patterns. No preamble."
+            ),
+            user_message=json.dumps({
+                "experiment_spec": turn.proposal.recommended_spec.to_dict(),
+                "capability_context": capability_context.to_dict(),
+                "user_answers": answers or {},
+                "planner_notes": turn.proposal.notes,
+                "sections_to_cover": [
+                    "Data loading: exact function/file to call, what it returns",
+                    "Schema: key columns, types, what they represent",
+                    "Target: column to predict, any transformations needed",
+                    "Features: what feature engineering to apply, existing utilities to reuse",
+                    "Metrics: how each metric is computed, scorer references",
+                    "Splits: CV strategy, grouping keys to prevent leakage",
+                    "Derivations: any columns that need to be created from existing data",
+                    "User decisions: anything confirmed during planning",
+                ],
+            }, indent=2),
+        )
+
     @staticmethod
     def _normalise_bootstrap_proposal(
         payload: dict[str, Any] | None,
         *,
         user_goal: str,
+        capability_context: CapabilityContext,
     ) -> dict[str, Any]:
-        proposal_payload = dict(payload or {})
-        proposal_payload.setdefault("objective", user_goal)
-        recommended_spec = dict(proposal_payload.get("recommended_spec", {}))
-        recommended_spec.setdefault("objective", proposal_payload["objective"])
+        proposal_payload = dict(payload) if isinstance(payload, Mapping) else {}
+        if not isinstance(proposal_payload.get("objective"), str) or not proposal_payload.get("objective", "").strip():
+            proposal_payload["objective"] = user_goal
+        raw_recommended_spec = proposal_payload.get("recommended_spec")
+        recommended_spec = dict(raw_recommended_spec) if isinstance(raw_recommended_spec, Mapping) else {}
+        if not isinstance(recommended_spec.get("objective"), str) or not recommended_spec.get("objective", "").strip():
+            recommended_spec["objective"] = proposal_payload["objective"]
         recommended_spec["primary_metric"] = LiteLLMBootstrapBackend._normalise_metric_payload(
             recommended_spec.get("primary_metric"),
             default_name="primary_metric",
@@ -428,23 +774,49 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
             )
             for index, metric_payload in enumerate(recommended_spec.get("guardrail_metrics", []))
         ]
-        recommended_spec.setdefault("allowed_actions", [])
+        allowed_actions = recommended_spec.get("allowed_actions", [])
+        if not isinstance(allowed_actions, list):
+            allowed_actions = [str(allowed_actions)] if allowed_actions else []
+        normalized_actions = [str(action) for action in allowed_actions if str(action).strip()]
+        if not normalized_actions:
+            normalized_actions = list(capability_context.available_actions.keys())
+        if capability_context.environment_facts.get("execution_backend_kind") == "generic_agentic":
+            generic_actions = capability_context.environment_facts.get("generic_autonomous_actions", [])
+            if isinstance(generic_actions, list):
+                merged_actions = [str(action) for action in generic_actions if str(action).strip()]
+                for action in normalized_actions:
+                    if action not in merged_actions:
+                        merged_actions.append(action)
+                normalized_actions = merged_actions
+        recommended_spec["allowed_actions"] = normalized_actions
         recommended_spec.setdefault("constraints", {})
         recommended_spec.setdefault("search_space", {})
         recommended_spec.setdefault("stop_conditions", {})
+        recommended_spec["stop_conditions"].setdefault("max_iterations", 30)
+        recommended_spec["stop_conditions"].setdefault("max_autonomous_hours", 6)
         recommended_spec.setdefault("metadata", {})
+        recommended_spec["metadata"].setdefault("execution_mode", "autonomous_after_bootstrap")
+        recommended_spec = LiteLLMBootstrapBackend._apply_capability_metric_defaults(
+            recommended_spec,
+            capability_context=capability_context,
+        )
         proposal_payload["recommended_spec"] = recommended_spec
         proposal_payload.setdefault("questions", [])
-        proposal_payload.setdefault("notes", [])
+        notes = proposal_payload.get("notes", [])
+        if isinstance(notes, str):
+            notes = [notes] if notes.strip() else []
+        proposal_payload["notes"] = notes
         return proposal_payload
 
     @staticmethod
     def _normalise_metric_payload(
-        payload: dict[str, Any] | None,
+        payload: dict[str, Any] | str | None,
         *,
         default_name: str,
         default_goal: str,
     ) -> dict[str, Any]:
+        if isinstance(payload, str):
+            payload = {"name": payload}
         metric_payload = dict(payload or {})
         metric_payload.setdefault("name", default_name)
         metric_payload.setdefault("goal", default_goal)
@@ -454,6 +826,62 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
         metric_payload.setdefault("comparator", "value")
         metric_payload.setdefault("constraints", {})
         return metric_payload
+
+    @staticmethod
+    def _apply_capability_metric_defaults(
+        recommended_spec: dict[str, Any],
+        *,
+        capability_context: CapabilityContext,
+    ) -> dict[str, Any]:
+        metric_catalog = capability_context.available_metrics
+        primary_metric = dict(recommended_spec["primary_metric"])
+        metric_name = primary_metric.get("name", "primary_metric")
+        if metric_name == "primary_metric":
+            # LLM returned placeholder — find the repo's primary metric
+            for name, metadata in metric_catalog.items():
+                if metadata.get("preferred_role") == "primary":
+                    primary_metric["name"] = name
+                    primary_metric["goal"] = metadata.get("goal", primary_metric.get("goal", "maximize"))
+                    primary_metric["scorer_ref"] = metadata.get("scorer_ref")
+                    break
+        elif metric_name in metric_catalog:
+            # LLM named a real metric — trust the repo's metadata for goal/scorer
+            repo_meta = metric_catalog[metric_name]
+            if "goal" in repo_meta:
+                primary_metric["goal"] = repo_meta["goal"]
+            if "scorer_ref" in repo_meta:
+                primary_metric.setdefault("scorer_ref", repo_meta["scorer_ref"])
+        recommended_spec["primary_metric"] = primary_metric
+        if not recommended_spec.get("guardrail_metrics"):
+            inferred_guardrails = []
+            for name, metadata in metric_catalog.items():
+                if metadata.get("preferred_role") != "guardrail":
+                    continue
+                inferred_guardrails.append(
+                    LiteLLMBootstrapBackend._normalise_metric_payload(
+                        {
+                            "name": name,
+                            "goal": metadata.get("goal", "maximize"),
+                            "scorer_ref": metadata.get("scorer_ref"),
+                        },
+                        default_name=name,
+                        default_goal=metadata.get("goal", "maximize"),
+                    )
+                )
+            recommended_spec["guardrail_metrics"] = inferred_guardrails
+        return recommended_spec
+
+
+LiteLLMBootstrapBackend.build_experiment_guide = LiteLLMRunnerAuthoringBackend.build_experiment_guide
+LiteLLMBootstrapBackend._normalise_bootstrap_proposal = staticmethod(
+    LiteLLMRunnerAuthoringBackend._normalise_bootstrap_proposal
+)
+LiteLLMBootstrapBackend._normalise_metric_payload = staticmethod(
+    LiteLLMRunnerAuthoringBackend._normalise_metric_payload
+)
+LiteLLMBootstrapBackend._apply_capability_metric_defaults = staticmethod(
+    LiteLLMRunnerAuthoringBackend._apply_capability_metric_defaults
+)
 
 
 class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
@@ -470,6 +898,7 @@ class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
                 "capability_context": snapshot.capability_context.to_dict(),
                 "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
+                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
                 "instructions": {
                     "return_fields": [
                         "focus",
@@ -539,17 +968,24 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a fresh reflection agent. Assess whether the experiment result is meaningful, "
                 "what was learned, whether primary or guardrail metrics moved in the intended direction, "
-                "and what action type should be considered next."
+                "and what action type should be considered next. "
+                "If the iteration failed but the failure is recoverable, reflect on the failure as useful evidence and recommend the next repair or retry step. "
+                "Treat the loop as autonomous after bootstrap: recommend the next experiment step directly unless execution is truly blocked.\n\n"
+                + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
+                "recent_records": [record.to_dict() for record in snapshot.recent_records],
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
                 "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
+                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
             },
         )
+        if not isinstance(payload.get("assessment"), str) or not payload.get("assessment", "").strip():
+            payload["assessment"] = "The run completed; treat the result as provisional until reviewed."
         return ReflectionSummary(
             assessment=payload["assessment"],
             lessons=payload.get("lessons", []),
@@ -570,7 +1006,10 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a fresh review agent. Decide whether this iteration should enter accepted memory. "
                 "Use status accepted, rejected, or pending_human. Consider guardrail violations and "
-                "whether the reported metric results match the configured scoring contract."
+                "whether the reported metric results match the configured scoring contract. "
+                "Recoverable execution failures should usually still be accepted into memory if they materially help the next worker continue. "
+                "Do not route work back to the user during normal experimentation unless a real blocker or safety boundary requires human intervention.\n\n"
+                + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
@@ -578,9 +1017,15 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
                 "reflection": reflection.to_dict(),
+                "recent_records": [record.to_dict() for record in snapshot.recent_records],
                 "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
+                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
             },
         )
+        if payload.get("status") not in {"accepted", "rejected", "pending_human"}:
+            payload["status"] = "accepted"
+        if not isinstance(payload.get("reason"), str) or not payload.get("reason", "").strip():
+            payload["reason"] = "Accepted by fallback because the review response was incomplete."
         return ReviewDecision(
             status=payload["status"],
             reason=payload["reason"],
@@ -611,13 +1056,35 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                     "return_fields": ["message"],
                     "style": [
                         "Write for a human following the run.",
-                        "Mention blockers, next steps, and why they matter.",
-                        "Keep it concise.",
+                        "Mention blockers and next steps briefly.",
+                        "Be direct and concise. Don't explain obvious decisions.",
+                        "Don't mention things you excluded or decided against — just focus on what matters.",
+                        "If something wasn't found, say so plainly. Don't discuss unrelated things in the repo.",
                     ],
                 },
             },
         )
         return payload["message"]
+
+    def answer_question(
+        self,
+        question: str,
+        turn: BootstrapTurn,
+        capability_context: CapabilityContext,
+    ) -> str:
+        context = json.dumps({
+            "current_plan": turn.proposal.to_dict(),
+            "capability_context": capability_context.to_dict(),
+            "preflight_checks": [c.to_dict() for c in turn.preflight_checks],
+        }, indent=2)
+        return self._complete_text(
+            system_prompt=(
+                "You are a skilled data scientist discussing an experiment plan with the user. "
+                "Answer their question directly and concisely based on the current context. "
+                "Don't repeat the full plan — just answer what they asked."
+            ),
+            user_message=f"Current context:\n{context}\n\nUser question: {question}",
+        )
 
     def summarize_iteration(
         self,
@@ -631,10 +1098,12 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
         payload = self._complete_json(
             system_prompt=(
                 "You are the human-facing narrator for an experimentation runtime. "
-                "Summarize what just happened, what changed, whether it was trusted, and what comes next."
+                "Summarize what just happened, what changed, whether it was trusted, and what comes next. "
+                "Make it clear the system will keep iterating autonomously after bootstrap unless it is genuinely blocked."
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
+                "markdown_memory": [item.to_dict() for item in snapshot.markdown_memory],
                 "candidate": candidate.to_dict(),
                 "outcome": outcome.to_dict(),
                 "reflection": reflection.to_dict(),
@@ -651,4 +1120,3 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             },
         )
         return payload["message"]
-

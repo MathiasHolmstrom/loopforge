@@ -2,37 +2,65 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import json
+import os
+import re
+import subprocess
 import sys
-from dataclasses import replace
+from datetime import date, datetime
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from loopforge.auto_adapter import synthesize_auto_adapter
+from loopforge.auto_adapter import build_repo_scan_context
 from loopforge.core import (
     AdapterSetup,
     BootstrapTurn,
     CapabilityContext,
     ConsultingWorkerBackend,
+    DataAssetSchema,
+    ExperimentCandidate,
     ExperimentOrchestrator,
+    ExperimentOutcome,
     ExperimentSpec,
     FileMemoryStore,
     LiteLLMAccessAdvisorBackend,
     LiteLLMBootstrapBackend,
     LiteLLMConsultationBackend,
     LiteLLMNarrationBackend,
+    LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
     LiteLLMReviewBackend,
     LiteLLMWorkerBackend,
     PreflightCheck,
+    ProgressFn,
+    StreamFn,
     PrimaryMetric,
     RoleModelConfig,
     RoutingExperimentExecutor,
+    MemorySnapshot,
+    MarkdownMemoryNote,
+    RunnerAuthoringBackend,
+    RunnerAuthoringRequest,
+    RunnerAuthoringResult,
+    RunnerValidationResult,
+    SpecQuestion,
+    _noop_progress,
 )
+from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
 
 DEFAULT_OPENAI_MODEL = "openai/gpt-5.4"
-DEFAULT_CLAUDE_MODEL = "anthropic/claude-sonnet-4-5"
+DEFAULT_CLAUDE_MODEL = "anthropic/claude-opus-4-6-v1"
 DEFAULT_MODEL_PROFILE = "codex_with_claude_support"
+ExecutionBackendKind = Literal["supported", "planning_only"]
+GENERIC_AUTONOMOUS_ACTIONS = [
+    "inspect_repo",
+    "inspect_data",
+    "edit_code",
+    "run_experiment",
+    "fix_failure",
+]
 
 MODEL_PROFILES: dict[str, dict[str, str]] = {
     "all_codex": {
@@ -44,7 +72,7 @@ MODEL_PROFILES: dict[str, dict[str, str]] = {
         "narrator": DEFAULT_OPENAI_MODEL,
     },
     "codex_with_claude_support": {
-        "planner": DEFAULT_OPENAI_MODEL,
+        "planner": DEFAULT_CLAUDE_MODEL,
         "worker": DEFAULT_OPENAI_MODEL,
         "reflection": DEFAULT_OPENAI_MODEL,
         "review": DEFAULT_OPENAI_MODEL,
@@ -52,6 +80,55 @@ MODEL_PROFILES: dict[str, dict[str, str]] = {
         "narrator": DEFAULT_CLAUDE_MODEL,
     },
 }
+
+
+def _can_use_anthropic_helpers() -> bool:
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return True
+    if os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"):
+        return True
+    if os.getenv("ANTHROPIC_BEDROCK_BASE_URL") or os.getenv("CLAUDE_CODE_USE_BEDROCK"):
+        return True
+    if os.getenv("AWS_PROFILE"):
+        return True
+    return False
+
+
+def _resolve_helper_model(preferred_model: str, fallback_model: str) -> str:
+    if preferred_model.startswith("anthropic/") and not _can_use_anthropic_helpers():
+        return fallback_model
+    # Route through Bedrock proxy
+    if preferred_model.startswith("anthropic/") and os.getenv("ANTHROPIC_BEDROCK_BASE_URL"):
+        model_name = preferred_model.removeprefix("anthropic/")
+        return f"bedrock/us.anthropic.{model_name}"
+    return preferred_model
+
+
+def summarise_runtime_exception(exc: Exception) -> str:
+    text = str(exc).strip() or exc.__class__.__name__
+    if "PermissionError: [WinError 5] Access is denied" in text:
+        return (
+            "Execution reached the real experiment, but the downstream modeling stack hit a Windows "
+            "permission error while creating multiprocessing resources."
+        )
+    return text
+
+
+def _missing_python_dependency(exc: Exception) -> tuple[str, str] | None:
+    package_name = None
+    if isinstance(exc, ModuleNotFoundError):
+        package_name = exc.name
+    if not package_name:
+        missing = re.search(r"No module named ['\"]([^'\"]+)['\"]", str(exc))
+        if missing:
+            package_name = missing.group(1)
+    if not package_name:
+        return None
+    module_name = package_name.split(".", maxsplit=1)[0]
+    install_name = {
+        "sklearn": "scikit-learn",
+    }.get(module_name, module_name)
+    return module_name, install_name
 
 
 def load_factory(factory_path: str) -> Any:
@@ -72,6 +149,156 @@ def load_factory(factory_path: str) -> Any:
     else:
         module = importlib.import_module(module_name)
     return getattr(module, attribute_name)
+
+
+@dataclass(frozen=True)
+class ExecutionBackendResolution:
+    kind: ExecutionBackendKind
+    factory_path: str | None = None
+    reason: str | None = None
+
+
+def _slugify_runner_name(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "_", value).strip("_").lower()
+    return slug or "repo"
+
+
+def _authored_runner_paths(memory_root: Path, repo_root: Path) -> tuple[Path, Path]:
+    runners_dir = memory_root / "runners"
+    stem = _slugify_runner_name(repo_root.name)
+    return runners_dir / f"{stem}_runner.py", runners_dir / f"{stem}_runner_manifest.json"
+
+
+MAX_RUNNER_AUTHORING_ATTEMPTS = 3
+
+
+def _coerce_preflight_checks(raw_checks: list[Any] | None) -> list[PreflightCheck]:
+    checks: list[PreflightCheck] = []
+    for item in raw_checks or []:
+        if isinstance(item, PreflightCheck):
+            checks.append(item)
+        elif isinstance(item, dict):
+            checks.append(PreflightCheck.from_dict(item))
+    return checks
+
+
+def _validate_runner_factory(
+    *,
+    factory_path: str,
+    objective: str,
+    memory_root: Path,
+) -> RunnerValidationResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+    checks: list[PreflightCheck] = []
+    try:
+        spec = build_bootstrap_spec(objective)
+        adapter_setup = load_adapter_setup(factory_path=factory_path, spec=spec, memory_root=memory_root)
+    except Exception as exc:
+        return RunnerValidationResult(success=False, factory_path=factory_path, errors=[f"Runner import failed: {exc}"])
+    if adapter_setup is None:
+        return RunnerValidationResult(
+            success=False,
+            factory_path=factory_path,
+            errors=["build_adapter did not return an AdapterSetup."],
+        )
+    if not adapter_setup.handlers:
+        errors.append("Runner did not expose any executable handlers.")
+    try:
+        if adapter_setup.discovery_provider is not None:
+            capability_context = adapter_setup.discovery_provider(objective)
+        elif adapter_setup.capability_provider is not None:
+            capability_context = adapter_setup.capability_provider(spec)
+        else:
+            capability_context = CapabilityContext()
+            errors.append("Runner did not expose a discovery_provider or capability_provider.")
+    except Exception as exc:
+        return RunnerValidationResult(
+            success=False,
+            factory_path=factory_path,
+            errors=[f"Runner capability discovery failed: {exc}"],
+        )
+    if not adapter_setup.preflight_provider:
+        errors.append("Runner did not expose a preflight_provider.")
+    else:
+        try:
+            checks = _coerce_preflight_checks(adapter_setup.preflight_provider(spec, capability_context))
+        except Exception as exc:
+            errors.append(f"Runner preflight failed to execute: {exc}")
+        else:
+            for check in checks:
+                if check.status != "failed":
+                    continue
+                if check.name in {
+                    "repo_execution_not_supported",
+                    "auto_adapter_scaffold",
+                    "autonomous_execution_permissions",
+                }:
+                    errors.append(check.detail)
+                else:
+                    warnings.append(check.detail)
+    smoke_test_passed = False
+    if not errors:
+        smoke_error = _smoke_validate_runner(
+            adapter_setup=adapter_setup,
+            capability_context=capability_context,
+            objective=objective,
+        )
+        if smoke_error is None:
+            smoke_test_passed = True
+        else:
+            errors.append(smoke_error)
+    return RunnerValidationResult(
+        success=not errors,
+        factory_path=factory_path,
+        errors=errors,
+        warnings=warnings,
+        preflight_checks=checks,
+        smoke_test_passed=smoke_test_passed,
+    )
+
+
+def _smoke_validate_runner(
+    *,
+    adapter_setup: AdapterSetup,
+    capability_context: CapabilityContext,
+    objective: str,
+) -> str | None:
+    if not adapter_setup.handlers:
+        return "Runner smoke test failed: no handlers were exposed."
+    handler_name = "baseline" if "baseline" in adapter_setup.handlers else next(iter(adapter_setup.handlers))
+    spec = ExperimentSpec(
+        objective=objective,
+        primary_metric=PrimaryMetric(name="primary_metric", goal="maximize"),
+        allowed_actions=[handler_name],
+    )
+    snapshot = MemorySnapshot(
+        spec=spec,
+        effective_spec=spec,
+        capability_context=capability_context,
+        best_summary=None,
+        latest_summary=None,
+        recent_records=[],
+        recent_summaries=[],
+        recent_human_interventions=[],
+        lessons_learned="",
+        markdown_memory=[],
+        next_iteration_id=1,
+    )
+    candidate = ExperimentCandidate(
+        hypothesis="Smoke-test the authored runner baseline path.",
+        action_type=handler_name,
+        change_type="baseline" if handler_name == "baseline" else "validation",
+        instructions=f"Smoke-test the {handler_name} handler.",
+    )
+    handler = adapter_setup.handlers[handler_name]
+    try:
+        outcome = handler.execute(candidate, snapshot)
+    except Exception as exc:
+        return f"Runner smoke test failed while executing {handler_name}: {exc}"
+    if not isinstance(outcome, ExperimentOutcome):
+        return f"Runner smoke test failed: handler {handler_name} did not return an ExperimentOutcome."
+    return None
 
 
 def build_bootstrap_spec(objective: str) -> ExperimentSpec:
@@ -95,12 +322,13 @@ def default_role_models(
         defaults = MODEL_PROFILES[profile]
     except KeyError as exc:
         raise ValueError(f"Unknown model profile: {profile!r}") from exc
-    resolved_planner = planner_model or defaults["planner"]
-    resolved_worker = worker_model or defaults["worker"]
-    resolved_reflection = reflection_model or defaults["reflection"] or resolved_worker
-    resolved_review = review_model or defaults["review"] or resolved_reflection
-    resolved_consultation = consultation_model or defaults["consultation"]
-    resolved_narrator = narrator_model or defaults["narrator"] or resolved_reflection
+    fallback = defaults["worker"]
+    resolved_planner = _resolve_helper_model(planner_model or defaults["planner"], fallback)
+    resolved_worker = _resolve_helper_model(worker_model or defaults["worker"], fallback)
+    resolved_reflection = _resolve_helper_model(reflection_model or defaults["reflection"] or resolved_worker, resolved_worker)
+    resolved_review = _resolve_helper_model(review_model or defaults["review"] or resolved_reflection, resolved_reflection)
+    resolved_consultation = _resolve_helper_model(consultation_model or defaults["consultation"], resolved_worker)
+    resolved_narrator = _resolve_helper_model(narrator_model or defaults["narrator"] or resolved_reflection, resolved_reflection)
     return RoleModelConfig(
         planner=resolved_planner,
         worker=resolved_worker,
@@ -123,13 +351,200 @@ def load_adapter_setup(
     return None
 
 
+DATA_PROBE_TIMEOUT_SECONDS = 5
+DATA_PROBE_MAX_FILE_MB = 50
+DATA_PROBE_SAMPLE_ROWS = 5
+LOCAL_PROBEABLE_SUFFIXES = {".csv", ".parquet", ".json", ".jsonl", ".xlsx", ".xls"}
+
+
+def _normalise_probe_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, date | datetime):
+        return value.isoformat()
+    if callable(getattr(value, "isoformat", None)):
+        return str(value.isoformat())
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _normalise_probe_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_normalise_probe_value(item) for item in value]
+    if hasattr(value, "tolist") and not isinstance(value, str):
+        return _normalise_probe_value(value.tolist())
+    if hasattr(value, "item"):
+        try:
+            return _normalise_probe_value(value.item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _looks_like_local_asset_path(asset_path: str) -> bool:
+    stripped = asset_path.strip()
+    if not stripped:
+        return False
+    lowered = stripped.lower()
+    if "://" in lowered or lowered.startswith(("s3:", "dbfs:", "jdbc:", "snowflake:", "databricks:")):
+        return False
+    if any(token in stripped for token in ("\n", "\r")):
+        return False
+    path = Path(stripped)
+    if path.suffix.lower() in LOCAL_PROBEABLE_SUFFIXES:
+        return True
+    if path.is_absolute():
+        return True
+    if any(sep in stripped for sep in ("/", "\\")):
+        return True
+    return False
+
+
+def _probe_rows_note(schema: DataAssetSchema) -> str:
+    if schema.total_rows_verified is not None:
+        return f"verified total rows={schema.total_rows_verified}"
+    if schema.total_rows_estimate is not None:
+        return f"estimated total rows={schema.total_rows_estimate}"
+    if schema.sample_rows_loaded is not None:
+        return f"sampled {schema.sample_rows_loaded} rows; total rows unknown"
+    return "row count unknown"
+
+
+def _probe_data_asset(asset_path: str, repo_root: Path) -> DataAssetSchema:
+    """Quickly inspect a single data asset. Returns schema info or a load error."""
+    import concurrent.futures
+
+    if not _looks_like_local_asset_path(asset_path):
+        return DataAssetSchema(
+            asset_path=asset_path,
+            verification_level="not_local_file",
+            load_error="Asset is not a local file-backed path; probe requires adapter-provided metadata.",
+        )
+
+    resolved = Path(asset_path)
+    if not resolved.is_absolute():
+        resolved = repo_root / resolved
+
+    def _do_probe() -> DataAssetSchema:
+        if not resolved.exists():
+            return DataAssetSchema(asset_path=asset_path, load_error=f"File not found: {resolved}")
+
+        size_mb = resolved.stat().st_size / (1024 * 1024)
+        suffix = resolved.suffix.lower()
+        probe_limit = DATA_PROBE_SAMPLE_ROWS * 10
+
+        # Too large — report size but don't load
+        if size_mb > DATA_PROBE_MAX_FILE_MB:
+            return DataAssetSchema(
+                asset_path=asset_path,
+                load_error=f"File too large for quick probe ({size_mb:.1f} MB > {DATA_PROBE_MAX_FILE_MB} MB limit)",
+            )
+
+        try:
+            import pandas as pd
+        except ImportError:
+            return DataAssetSchema(asset_path=asset_path, load_error="pandas not available for data probe")
+
+        try:
+            total_rows_verified: int | None = None
+            total_rows_estimate: int | None = None
+            verification_level = "sample_only"
+            if suffix == ".csv":
+                df = pd.read_csv(resolved, nrows=probe_limit)
+                if len(df) < probe_limit:
+                    total_rows_verified = len(df)
+            elif suffix == ".parquet":
+                try:
+                    import pyarrow.parquet as pq
+                except ImportError as exc:
+                    return DataAssetSchema(
+                        asset_path=asset_path,
+                        verification_level="unsupported",
+                        load_error=f"Parquet probing requires pyarrow for cheap metadata inspection: {exc}",
+                    )
+                parquet_file = pq.ParquetFile(resolved)
+                total_rows_verified = int(parquet_file.metadata.num_rows)
+                verification_level = "verified_total_rows"
+                if parquet_file.num_row_groups == 0:
+                    df = pd.DataFrame()
+                else:
+                    sample_table = parquet_file.read_row_group(0)
+                    if sample_table.num_rows > probe_limit:
+                        sample_table = sample_table.slice(0, probe_limit)
+                    df = sample_table.to_pandas()
+            elif suffix in (".json", ".jsonl"):
+                df = pd.read_json(resolved, lines=suffix == ".jsonl", nrows=probe_limit)
+                if len(df) < probe_limit:
+                    total_rows_verified = len(df)
+            elif suffix in (".xlsx", ".xls"):
+                df = pd.read_excel(resolved, nrows=probe_limit)
+                if len(df) < probe_limit:
+                    total_rows_verified = len(df)
+            else:
+                return DataAssetSchema(asset_path=asset_path, load_error=f"Unsupported format: {suffix}")
+        except Exception as exc:
+            return DataAssetSchema(asset_path=asset_path, load_error=f"Load failed: {exc}")
+
+        sample_values = {}
+        for col in df.columns[:30]:
+            unique = df[col].dropna().unique()[:DATA_PROBE_SAMPLE_ROWS]
+            sample_values[col] = [_normalise_probe_value(value) for value in unique]
+
+        return DataAssetSchema(
+            asset_path=asset_path,
+            columns=list(df.columns),
+            dtypes={col: str(dtype) for col, dtype in df.dtypes.items()},
+            sample_rows_loaded=len(df),
+            total_rows_verified=total_rows_verified,
+            total_rows_estimate=total_rows_estimate,
+            verification_level=verification_level,
+            sample_values=sample_values,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            future = pool.submit(_do_probe)
+            return future.result(timeout=DATA_PROBE_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError:
+            return DataAssetSchema(
+                asset_path=asset_path,
+                load_error=f"Probe timed out after {DATA_PROBE_TIMEOUT_SECONDS}s",
+            )
+        except Exception as exc:
+            return DataAssetSchema(asset_path=asset_path, load_error=f"Probe error: {exc}")
+
+
+def probe_data_assets(capability_context: CapabilityContext, repo_root: Path) -> CapabilityContext:
+    """Run a quick schema probe on all discovered data assets. Non-blocking with hard timeout."""
+    if not capability_context.available_data_assets:
+        return capability_context
+    schemas = [_probe_data_asset(asset, repo_root) for asset in capability_context.available_data_assets]
+    notes = list(capability_context.notes)
+    for schema in schemas:
+        if schema.load_error:
+            notes.append(f"Data probe ({schema.asset_path}): {schema.load_error}")
+        elif schema.columns:
+            notes.append(
+                f"Data probe ({schema.asset_path}): {len(schema.columns)} columns, "
+                f"{_probe_rows_note(schema)}. Columns: {', '.join(schema.columns[:15])}"
+                + (f" ... and {len(schema.columns) - 15} more" if len(schema.columns) > 15 else "")
+            )
+    return replace(capability_context, data_schemas=schemas, notes=notes)
+
+
 def discover_capabilities_for_objective(
     *,
     objective: str,
     memory_root: Path | str,
-    executor_factory_path: str,
+    executor_factory_path: str | None,
+    repo_root: Path | str = ".",
 ) -> CapabilityContext:
     memory_root_path = Path(memory_root)
+    from loopforge.auto_adapter import scan_repo
+
+    scan_result = scan_repo(Path(repo_root))
+    if executor_factory_path is None:
+        context = build_repo_scan_context(repo_root)
+        return probe_data_assets(context, Path(repo_root))
     adapter_setup = load_adapter_setup(
         factory_path=executor_factory_path,
         spec=build_bootstrap_spec(objective),
@@ -138,10 +553,23 @@ def discover_capabilities_for_objective(
     if adapter_setup is None:
         return CapabilityContext()
     if adapter_setup.discovery_provider is not None:
-        return adapter_setup.discovery_provider(objective)
-    if adapter_setup.capability_provider is not None:
-        return adapter_setup.capability_provider(build_bootstrap_spec(objective))
-    return CapabilityContext()
+        context = adapter_setup.discovery_provider(objective)
+    elif adapter_setup.capability_provider is not None:
+        context = adapter_setup.capability_provider(build_bootstrap_spec(objective))
+    else:
+        context = CapabilityContext()
+    discovered_assets = [asset for asset in scan_result.get("data_assets", []) if asset not in context.available_data_assets]
+    if discovered_assets:
+        context = replace(context, available_data_assets=[*context.available_data_assets, *discovered_assets])
+    # Quick data probe — non-blocking, hard timeout per asset
+    context = probe_data_assets(context, Path(repo_root))
+    # Augment with fresh column scan so the agent always sees what columns exist in the code
+    column_notes = [n for n in scan_result.get("notes", []) if "column" in n.lower()]
+    for file_path, cols in scan_result.get("column_refs", {}).items():
+        column_notes.append(f"  {file_path}: {', '.join(cols)}")
+    if column_notes:
+        context = replace(context, notes=[*context.notes, *column_notes])
+    return context
 
 
 def run_preflight_checks(
@@ -149,7 +577,7 @@ def run_preflight_checks(
     spec: ExperimentSpec,
     capability_context: CapabilityContext,
     memory_root: Path | str,
-    executor_factory_path: str,
+    executor_factory_path: str | None,
 ) -> list[PreflightCheck]:
     checks: list[PreflightCheck] = []
     memory_root_path = Path(memory_root)
@@ -176,13 +604,38 @@ def run_preflight_checks(
             )
         )
 
+    if executor_factory_path is None or capability_context.environment_facts.get("autonomous_execution_supported") is False:
+        if executor_factory_path is None and capability_context.environment_facts.get("autonomous_execution_supported") is not False:
+            checks.append(
+                PreflightCheck(
+                    name="generic_agentic_execution",
+                    status="passed",
+                    detail="No repo-specific runner was found, so Loopforge will use the generic autonomous executor.",
+                    required=False,
+                    scope="execution",
+                )
+            )
+            return checks
+        checks.append(
+            PreflightCheck(
+                name="repo_execution_not_supported",
+                status="failed",
+                detail=(
+                    "Loopforge can inspect this repo and plan the experiment, but this objective is not yet wired "
+                    "to a real autonomous runner."
+                ),
+                scope="execution",
+            )
+        )
+        return checks
+
     adapter_setup = load_adapter_setup(
         factory_path=executor_factory_path,
         spec=spec,
         memory_root=memory_root_path,
     )
     if adapter_setup is not None and adapter_setup.preflight_provider is not None:
-        checks.extend(adapter_setup.preflight_provider(spec, capability_context))
+        checks.extend(_coerce_preflight_checks(adapter_setup.preflight_provider(spec, capability_context)))
     elif capability_context.available_data_assets:
         checks.append(
             PreflightCheck(
@@ -230,6 +683,136 @@ def missing_requirements_from_bootstrap(
     return missing_requirements
 
 
+def apply_answers_to_bootstrap_turn(
+    turn: BootstrapTurn,
+    *,
+    answers: dict[str, Any] | None,
+) -> BootstrapTurn:
+    answer_map = {str(key): value for key, value in (answers or {}).items() if value not in (None, "")}
+    spec = turn.proposal.recommended_spec
+    merged_metadata = dict(spec.metadata)
+    merged_metadata["bootstrap_answers"] = {
+        **dict(merged_metadata.get("bootstrap_answers", {})),
+        **answer_map,
+    }
+    answer_notes = list(turn.proposal.notes)
+    for key, value in answer_map.items():
+        note = f"User answer ({key}): {value}"
+        if note not in answer_notes:
+            answer_notes.append(note)
+    updated_spec = replace(spec, metadata=merged_metadata)
+    updated_proposal = replace(turn.proposal, recommended_spec=updated_spec, notes=answer_notes)
+    missing_requirements = missing_requirements_from_bootstrap(
+        questions=updated_proposal.questions,
+        answers=answer_map,
+        preflight_checks=turn.preflight_checks,
+    )
+    required_question_keys = {
+        question.key
+        for question in updated_proposal.questions
+        if question.required
+    }
+    resolved_required_questions = bool(required_question_keys) and required_question_keys.issubset(answer_map.keys())
+    had_answer_blocker = any(req.startswith("answer:") for req in turn.missing_requirements)
+    ready_to_start = (turn.ready_to_start or had_answer_blocker or resolved_required_questions) and not missing_requirements
+    return replace(
+        turn,
+        proposal=updated_proposal,
+        missing_requirements=missing_requirements,
+        ready_to_start=ready_to_start,
+    )
+
+
+def _is_internal_bootstrap_question(question: SpecQuestion) -> bool:
+    joined = " ".join(
+        part
+        for part in (
+            question.key,
+            question.prompt,
+            question.rationale or "",
+            " ".join(str(o) for o in (question.options or [])),
+            question.suggested_answer or "",
+        )
+        if part
+    ).lower()
+    internal_tokens = (
+        "adapter",
+        "executor factory",
+        "execution entrypoint",
+        "entrypoint",
+        "module path",
+        "factory path",
+        ".loopforge/generated",
+    )
+    return any(token in joined for token in internal_tokens)
+
+
+def sanitise_bootstrap_questions(questions: list[SpecQuestion]) -> list[SpecQuestion]:
+    return [question for question in questions if not _is_internal_bootstrap_question(question)]
+
+
+ESSENTIAL_BOOTSTRAP_QUESTION_TOKENS = (
+    "metric",
+    "scorer",
+    "guardrail",
+    "primary",
+    "secondary",
+    "probab",
+    "precision",
+    "recall",
+    "mae",
+    "rmse",
+    "log loss",
+    "ordinal",
+    "calibration",
+    "threshold",
+    "objective",
+    "target",
+)
+
+
+def _is_essential_bootstrap_question(question: SpecQuestion) -> bool:
+    joined = " ".join(
+        part
+        for part in (
+            question.key,
+            question.prompt,
+            question.rationale or "",
+            " ".join(str(o) for o in (question.options or [])),
+            question.suggested_answer or "",
+        )
+        if part
+    ).lower()
+    return any(token in joined for token in ESSENTIAL_BOOTSTRAP_QUESTION_TOKENS)
+
+
+def refine_bootstrap_questions(
+    questions: list[SpecQuestion],
+    *,
+    answers: dict[str, Any] | None,
+) -> list[SpecQuestion]:
+    sanitized = sanitise_bootstrap_questions(questions)
+    essential_required = [question for question in sanitized if question.required and _is_essential_bootstrap_question(question)]
+    optional_questions = [question for question in sanitized if not question.required]
+    refined: list[SpecQuestion] = []
+    if essential_required:
+        refined.append(essential_required[0])
+    existing_keys = {question.key for question in refined + optional_questions}
+    if "user_extra_context" not in existing_keys and "user_extra_context" not in (answers or {}):
+        optional_questions.append(
+            SpecQuestion(
+                key="user_extra_context",
+                prompt=(
+                    "Any extra modelling context, constraints, or ideas the agent should consider before it proceeds autonomously? "
+                    "Leave blank to skip."
+                ),
+                required=False,
+            )
+        )
+    refined.extend(optional_questions)
+    return refined
+
+
 def should_prepare_access_guide(
     *,
     capability_context: CapabilityContext,
@@ -243,6 +826,100 @@ def should_prepare_access_guide(
     joined_notes = " ".join(capability_context.notes).lower()
     joined_env = str(capability_context.environment_facts).lower()
     return any(token in joined_notes or token in joined_env for token in access_tokens)
+
+
+def should_force_metric_discussion(
+    *,
+    user_goal: str,
+    answers: dict[str, Any] | None,
+    capability_context: CapabilityContext,
+    turn: BootstrapTurn,
+) -> bool:
+    if not capability_context.available_metrics:
+        return False
+    goal_text = user_goal.lower()
+    if any(token in goal_text for token in ("metric", "mae", "rmse", "log loss", "ordinal", "precision", "recall")):
+        return False
+    answer_values = " ".join(str(value).lower() for value in (answers or {}).values())
+    if any(token in answer_values for token in ("metric", "mae", "rmse", "log loss", "ordinal", "precision", "recall")):
+        return False
+    if any("metric" in question.key.lower() or "metric" in question.prompt.lower() for question in turn.proposal.questions):
+        return False
+    return True
+
+
+def _metric_relevant_to_objective(name: str, metadata: dict[str, Any], objective: str) -> bool:
+    """Check whether a metric seems relevant to the stated objective."""
+    objective_lower = objective.lower()
+    name_lower = name.lower()
+    # Generic regression/accuracy metrics are always relevant
+    generic_tokens = ("mae", "rmse", "mse", "r2", "accuracy", "precision", "recall", "f1")
+    if any(token in name_lower for token in generic_tokens):
+        return True
+    # Check if the metric's target/domain overlaps with the objective
+    metric_domain_tokens = name_lower.replace("_", " ").split()
+    objective_tokens = set(objective_lower.replace("_", " ").split())
+    if any(token in objective_tokens for token in metric_domain_tokens if len(token) > 2):
+        return True
+    # Check metadata for a target field that matches
+    target = str(metadata.get("target", "")).lower()
+    if target and target in objective_lower:
+        return True
+    return False
+
+
+def build_metric_guess(capability_context: CapabilityContext, objective: str = "") -> str:
+    primary = None
+    guardrails: list[str] = []
+    secondary: list[str] = []
+    for name, metadata in capability_context.available_metrics.items():
+        if objective and not _metric_relevant_to_objective(name, metadata, objective):
+            continue
+        role = str(metadata.get("preferred_role", "")).lower()
+        if role == "primary" and primary is None:
+            primary = name
+        elif role == "guardrail":
+            guardrails.append(name)
+        else:
+            secondary.append(name)
+    if primary is None and capability_context.available_metrics:
+        # Fall back to first relevant metric, or first overall
+        for name, metadata in capability_context.available_metrics.items():
+            if not objective or _metric_relevant_to_objective(name, metadata, objective):
+                primary = name
+                break
+        if primary is None:
+            primary = next(iter(capability_context.available_metrics))
+    parts = []
+    if primary is not None:
+        parts.append(f"Primary: {primary}")
+    if secondary:
+        parts.append("Secondary: " + ", ".join(secondary))
+    if guardrails:
+        parts.append("Guardrails: " + ", ".join(guardrails))
+    return "; ".join(parts)
+
+
+def resolve_repo_root_from_objective(objective: str, current_root: Path) -> Path:
+    """If the objective mentions a repo name, try to find it as a sibling or child directory."""
+    import re
+    resolved = current_root.resolve()
+    # Extract potential repo names — hyphenated or underscored multi-word names
+    candidates = re.findall(r'[a-zA-Z][a-zA-Z0-9_-]{2,}(?:-[a-zA-Z0-9_]+)+', objective)
+    # Also try single words that look like repo names (before "repo" keyword)
+    repo_match = re.search(r'(?:inside|in|from|of)\s+(\S+?)(?:\s+repo|\s+repository)?(?:\s|$)', objective, re.IGNORECASE)
+    if repo_match:
+        candidates.insert(0, repo_match.group(1).strip().rstrip('.'))
+    for name in candidates:
+        # Check sibling directory
+        sibling = resolved.parent / name
+        if sibling.is_dir() and sibling.resolve() != resolved:
+            return sibling
+        # Check child directory
+        child = resolved / name
+        if child.is_dir():
+            return child
+    return current_root
 
 
 class Loopforge:
@@ -262,16 +939,35 @@ class Loopforge:
         temperature: float = 0.2,
         bootstrap_backend: Any | None = None,
         worker_backend: Any | None = None,
+        runner_authoring_backend: RunnerAuthoringBackend | None = None,
         consultation_backend: Any | None = None,
         access_advisor_backend: Any | None = None,
         reflection_backend: Any | None = None,
         review_backend: Any | None = None,
         narrator_backend: Any | None = None,
+        progress_fn: ProgressFn | None = None,
+        stream_fn: StreamFn | None = None,
     ) -> None:
+        self.explicit_executor_factory_path = executor_factory_path
         self.executor_factory_path = executor_factory_path
         self.repo_root = Path(repo_root)
         self.memory_root = Path(memory_root)
         self.temperature = temperature
+        self.progress_fn: ProgressFn = progress_fn or _noop_progress
+        self._stream_fn = stream_fn
+        self._cached_capability_context: CapabilityContext | None = None
+        self._cached_capability_key: tuple[str, str | None] | None = None
+        self._cached_authoring_failure_reason: str | None = None
+        self._attempted_dependency_installs: set[str] = set()
+        bedrock_base = os.getenv("ANTHROPIC_BEDROCK_BASE_URL")
+        if bedrock_base:
+            self._bedrock_kwargs: dict[str, Any] = {
+                "api_base": bedrock_base,
+                "api_key": os.getenv("OPENAI_API_KEY"),
+                "drop_params": True,
+            }
+        else:
+            self._bedrock_kwargs: dict[str, Any] = {}
         self.role_models = default_role_models(
             planner_model=planner_model,
             worker_model=worker_model,
@@ -281,46 +977,149 @@ class Loopforge:
             narrator_model=narrator_model,
             profile=model_profile,
         )
+        def _extra(model: str) -> dict[str, Any]:
+            if model.startswith("bedrock/") and self._bedrock_kwargs:
+                return {"extra_kwargs": self._bedrock_kwargs}
+            return {}
+
         self.bootstrap_backend = bootstrap_backend or LiteLLMBootstrapBackend(
-            model=self.role_models.planner,
-            temperature=temperature,
+            model=self.role_models.planner, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.planner),
         )
-        primary_worker_backend = worker_backend or LiteLLMWorkerBackend(model=self.role_models.worker, temperature=temperature)
+        primary_worker_backend = worker_backend or LiteLLMWorkerBackend(
+            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
+        )
+        self.runner_authoring_backend = runner_authoring_backend or LiteLLMRunnerAuthoringBackend(
+            model=self.role_models.worker, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.worker),
+        )
         self.consultation_backend = consultation_backend or LiteLLMConsultationBackend(
-            model=self.role_models.consultation,
-            temperature=temperature,
+            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
         )
         self.access_advisor_backend = access_advisor_backend or LiteLLMAccessAdvisorBackend(
-            model=self.role_models.consultation,
-            temperature=temperature,
+            model=self.role_models.consultation, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.consultation),
         )
         self.worker_backend = ConsultingWorkerBackend(
             worker_backend=primary_worker_backend,
             consultation_backend=self.consultation_backend,
         )
         self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
-            model=self.role_models.reflection,
-            temperature=temperature,
+            model=self.role_models.reflection, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.reflection),
         )
         self.review_backend = review_backend or LiteLLMReviewBackend(
-            model=self.role_models.review,
-            temperature=temperature,
+            model=self.role_models.review, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.review),
         )
         self.narrator_backend = narrator_backend or LiteLLMNarrationBackend(
-            model=self.role_models.narrator,
-            temperature=temperature,
+            model=self.role_models.narrator, temperature=temperature, stream_fn=stream_fn, **_extra(self.role_models.narrator),
         )
 
-    def resolve_executor_factory_path(self, objective: str) -> str:
-        if self.executor_factory_path:
-            return self.executor_factory_path
-        synthesized_factory_path = synthesize_auto_adapter(
-            repo_root=self.repo_root,
-            memory_root=self.memory_root,
-            objective=objective,
+    def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
+        if self.explicit_executor_factory_path:
+            self.executor_factory_path = self.explicit_executor_factory_path
+            return ExecutionBackendResolution(kind="supported", factory_path=self.explicit_executor_factory_path)
+        cached_authored_runner = self._load_cached_authored_runner(objective)
+        if cached_authored_runner is not None:
+            return cached_authored_runner
+        self.executor_factory_path = None
+        return ExecutionBackendResolution(
+            kind="planning_only",
+            reason=(
+                "No repo-specific runner was found. Loopforge will use the generic autonomous executor for this objective."
+            ),
         )
-        self.executor_factory_path = synthesized_factory_path
-        return synthesized_factory_path
+
+    def resolve_executor_factory_path(self, objective: str) -> str | None:
+        return self.resolve_execution_backend(objective).factory_path
+
+    def _load_cached_authored_runner(self, objective: str) -> ExecutionBackendResolution | None:
+        runner_path, manifest_path = _authored_runner_paths(self.memory_root, self.repo_root)
+        if not runner_path.exists() or not manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if Path(manifest.get("repo_root", "")).resolve() != self.repo_root.resolve():
+            return None
+        validation = _validate_runner_factory(
+            factory_path=f"{runner_path}:build_adapter",
+            objective=objective,
+            memory_root=self.memory_root,
+        )
+        if not validation.success:
+            try:
+                runner_path.unlink(missing_ok=True)
+                manifest_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return None
+        self.executor_factory_path = f"{runner_path}:build_adapter"
+        return ExecutionBackendResolution(kind="supported", factory_path=self.executor_factory_path)
+
+    def _author_runner(self, user_goal: str, capability_context: CapabilityContext) -> ExecutionBackendResolution:
+        cached = self._load_cached_authored_runner(user_goal)
+        if cached is not None:
+            return cached
+        runner_path, manifest_path = _authored_runner_paths(self.memory_root, self.repo_root)
+        runner_path.parent.mkdir(parents=True, exist_ok=True)
+        previous_errors: list[str] = []
+        last_validation: RunnerValidationResult | None = None
+        temp_paths: list[Path] = []
+        try:
+            for attempt_number in range(1, MAX_RUNNER_AUTHORING_ATTEMPTS + 1):
+                temp_path = runner_path.with_name(f"{runner_path.stem}_candidate_{attempt_number}.py")
+                temp_paths.append(temp_path)
+                request = RunnerAuthoringRequest(
+                    user_goal=user_goal,
+                    repo_root=str(self.repo_root.resolve()),
+                    capability_context=capability_context,
+                    target_module_path=str(runner_path),
+                    attempt_number=attempt_number,
+                    previous_errors=list(previous_errors),
+                )
+                try:
+                    authored = self.runner_authoring_backend.author_runner(request)
+                except Exception as exc:
+                    return ExecutionBackendResolution(
+                        kind="planning_only",
+                        reason=f"Runner authoring failed before validation: {exc}",
+                    )
+                temp_path.write_text(authored.module_source.rstrip() + "\n", encoding="utf-8")
+                validation = _validate_runner_factory(
+                    factory_path=f"{temp_path}:build_adapter",
+                    objective=user_goal,
+                    memory_root=self.memory_root,
+                )
+                last_validation = validation
+                if validation.success:
+                    runner_path.write_text(temp_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    manifest_path.write_text(
+                        json.dumps(
+                            {
+                                "repo_root": str(self.repo_root.resolve()),
+                                "user_goal": user_goal,
+                                "factory_path": f"{runner_path}:build_adapter",
+                                "summary": authored.summary,
+                                "notes": authored.notes,
+                                "validation": validation.to_dict(),
+                            },
+                            indent=2,
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                    self.executor_factory_path = f"{runner_path}:build_adapter"
+                    return ExecutionBackendResolution(kind="supported", factory_path=self.executor_factory_path)
+                previous_errors = list(validation.errors)
+            reason = "Loopforge tried to author a repo-specific runner, but validation failed."
+            if last_validation is not None and last_validation.errors:
+                reason += " " + "; ".join(last_validation.errors[:3])
+            return ExecutionBackendResolution(kind="planning_only", reason=reason)
+        finally:
+            for temp_path in temp_paths:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     def bootstrap(
         self,
@@ -328,17 +1127,86 @@ class Loopforge:
         user_goal: str,
         answers: dict[str, Any] | None = None,
     ) -> BootstrapTurn:
-        executor_factory_path = self.resolve_executor_factory_path(user_goal)
-        capability_context = discover_capabilities_for_objective(
-            objective=user_goal,
-            memory_root=self.memory_root,
-            executor_factory_path=executor_factory_path,
-        )
-        turn = self.bootstrap_backend.propose_bootstrap_turn(
-            user_goal=user_goal,
-            capability_context=capability_context,
-            answer_history=answers,
-            role_models=self.role_models,
+        # Resolve target repo from objective if it mentions a specific repo
+        resolved_root = resolve_repo_root_from_objective(user_goal, self.repo_root)
+        if resolved_root != self.repo_root:
+            self.repo_root = resolved_root
+            self._cached_capability_context = None  # Force re-scan of the correct repo
+            self._cached_capability_key = None
+            self._cached_authoring_failure_reason = None
+            if self.explicit_executor_factory_path is None:
+                self.executor_factory_path = None
+        self.progress_fn("resolve_backend", "Detecting execution environment...")
+        resolution = self.resolve_execution_backend(user_goal)
+        executor_factory_path = resolution.factory_path
+        # Don't load prior session memory during bootstrap — it pollutes new objectives
+        # with irrelevant context from previous runs. Memory is only used during iterations.
+        bootstrap_memory = {}
+        capability_key = (str(self.repo_root.resolve()), executor_factory_path)
+        if self._cached_capability_context is None or self._cached_capability_key != capability_key:
+            self.progress_fn("discover_capabilities", "Scanning repository capabilities...")
+            self._cached_capability_context = discover_capabilities_for_objective(
+                objective=user_goal,
+                memory_root=self.memory_root,
+                executor_factory_path=executor_factory_path,
+                repo_root=self.repo_root,
+            )
+            self._cached_capability_key = capability_key
+        capability_context = self._cached_capability_context
+        if resolution.kind == "planning_only" and resolution.reason:
+            merged_actions = dict(capability_context.available_actions)
+            for action in GENERIC_AUTONOMOUS_ACTIONS:
+                merged_actions.setdefault(action, "generic_autonomous_executor")
+            capability_context = replace(
+                capability_context,
+                available_actions=merged_actions,
+                environment_facts={
+                    **capability_context.environment_facts,
+                    "execution_resolution_reason": resolution.reason,
+                    "autonomous_execution_supported": True,
+                    "execution_backend_kind": "generic_agentic",
+                    "runner_kind": "generic_agentic_executor",
+                    "generic_autonomous_actions": list(GENERIC_AUTONOMOUS_ACTIONS),
+                },
+                notes=[
+                    resolution.reason,
+                    "Generic autonomous execution is available after bootstrap. The worker can inspect the repo, edit files, run commands, and recover from ordinary failures without a repo-specific runner.",
+                    *capability_context.notes,
+                ],
+            )
+            self._cached_capability_context = capability_context
+        self.progress_fn("propose_plan", f"[{self.role_models.planner}] Drafting experiment plan...")
+        try:
+            turn = self.bootstrap_backend.propose_bootstrap_turn(
+                user_goal=user_goal,
+                capability_context=capability_context,
+                answer_history=answers,
+                role_models=self.role_models,
+                bootstrap_memory=bootstrap_memory,
+            )
+        except TypeError:
+            turn = self.bootstrap_backend.propose_bootstrap_turn(
+                user_goal=user_goal,
+                capability_context=capability_context,
+                answer_history=answers,
+                role_models=self.role_models,
+            )
+        turn = replace(
+            turn,
+            proposal=replace(
+                turn.proposal,
+                recommended_spec=replace(
+                    turn.proposal.recommended_spec,
+                    metadata={
+                        **turn.proposal.recommended_spec.metadata,
+                        "execution_backend_kind": capability_context.environment_facts.get("execution_backend_kind"),
+                        "autonomous_execution_supported": capability_context.environment_facts.get(
+                            "autonomous_execution_supported"
+                        ),
+                    },
+                ),
+                questions=refine_bootstrap_questions(turn.proposal.questions, answers=answers),
+            ),
         )
         preflight_checks = run_preflight_checks(
             spec=turn.proposal.recommended_spec,
@@ -351,14 +1219,14 @@ class Loopforge:
             answers=answers,
             preflight_checks=preflight_checks,
         )
-        ready_to_start = turn.ready_to_start and not missing_requirements
+        ready_to_start = not missing_requirements
         access_guide_path = None
-        helper_notes: list[str] = []
         if should_prepare_access_guide(
             capability_context=capability_context,
             preflight_checks=preflight_checks,
         ):
             try:
+                self.progress_fn("access_guide", "Building access guide...")
                 access_guide = self.access_advisor_backend.build_access_guide(
                     user_goal=user_goal,
                     capability_context=capability_context,
@@ -368,8 +1236,8 @@ class Loopforge:
                 guide_path = self.memory_root / "ops_access_guide.md"
                 guide_path.write_text(access_guide.markdown.rstrip() + "\n", encoding="utf-8")
                 access_guide_path = str(guide_path)
-            except Exception as exc:
-                helper_notes.append(f"Access guide generation failed: {exc}")
+            except Exception:
+                pass
         resolved_turn = replace(
             turn,
             preflight_checks=preflight_checks,
@@ -377,15 +1245,25 @@ class Loopforge:
             missing_requirements=missing_requirements,
             access_guide_path=access_guide_path,
         )
+        # Write experiment guide when ready (or close to ready)
+        if ready_to_start or not [r for r in missing_requirements if r.startswith("answer:")]:
+            try:
+                self.progress_fn("experiment_guide", "Writing experiment guide...")
+                guide_text = self.bootstrap_backend.build_experiment_guide(
+                    resolved_turn, capability_context, answers,
+                )
+                self.memory_root.mkdir(parents=True, exist_ok=True)
+                guide_path = self.memory_root / "experiment_guide.md"
+                guide_path.write_text(guide_text.rstrip() + "\n", encoding="utf-8")
+            except Exception:
+                pass
+        self.progress_fn("narrate", f"[{self.role_models.narrator}] Preparing summary...")
         try:
             human_update = self.narrator_backend.summarize_bootstrap(resolved_turn, capability_context)
-        except Exception as exc:
+        except Exception:
             human_update = resolved_turn.assistant_message
-            helper_notes.append(f"Narration backend failed: {exc}")
         if access_guide_path is not None:
             human_update = f"{human_update}\nAccess guide: {access_guide_path}"
-        if helper_notes:
-            human_update = "\n".join([human_update, *helper_notes]) if human_update else "\n".join(helper_notes)
         return replace(resolved_turn, human_update=human_update)
 
     def start(
@@ -396,29 +1274,167 @@ class Loopforge:
         iterations: int | None = None,
     ) -> dict[str, Any]:
         bootstrap_turn = self.bootstrap(user_goal=user_goal, answers=answers)
+        return self.start_from_bootstrap_turn(
+            bootstrap_turn=bootstrap_turn,
+            user_goal=user_goal,
+            iterations=iterations,
+        )
+
+    def _install_python_dependency(self, package_name: str) -> tuple[bool, dict[str, Any]]:
+        attempts = [
+            ["uv", "pip", "install", package_name],
+            [sys.executable, "-m", "pip", "install", package_name],
+        ]
+        last_result: dict[str, Any] = {}
+        for command in attempts:
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=self.repo_root,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except Exception as exc:
+                last_result = {
+                    "command": command,
+                    "returncode": None,
+                    "stdout": "",
+                    "stderr": str(exc),
+                }
+                continue
+            last_result = {
+                "command": command,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+            }
+            if completed.returncode == 0:
+                return True, last_result
+        return False, last_result
+
+    def _make_execution_recovery_handler(self):
+        def recover(handler, candidate, snapshot, exc):
+            dependency = _missing_python_dependency(exc)
+            if dependency is None:
+                return None
+            module_name, install_name = dependency
+            if install_name in self._attempted_dependency_installs:
+                return None
+            self._attempted_dependency_installs.add(install_name)
+            self.progress_fn("dependency_recovery", f"Installing missing dependency {install_name}...")
+            installed, install_result = self._install_python_dependency(install_name)
+            if not installed:
+                return ExperimentOutcome(
+                    status="recoverable_failure",
+                    notes=[
+                        f"Execution failed because Python dependency {module_name!r} is missing.",
+                        f"Automatic install attempt failed for {install_name}.",
+                    ],
+                    next_ideas=["Inspect the environment, install the dependency manually if needed, then retry."],
+                    failure_type=exc.__class__.__name__,
+                    failure_summary=str(exc).strip() or exc.__class__.__name__,
+                    recoverable=True,
+                    recovery_actions=[f"Install dependency {install_name} and retry the same step."],
+                    execution_details={"install_attempt": install_result},
+                )
+            try:
+                return handler.execute(candidate, snapshot)
+            except Exception as retry_exc:
+                return ExperimentOutcome(
+                    status="recoverable_failure",
+                    notes=[
+                        f"Installed dependency {install_name} automatically, but the retried execution still failed.",
+                        f"Retry failure: {retry_exc}",
+                    ],
+                    next_ideas=["Inspect the new failure and continue from it in the next iteration."],
+                    failure_type=retry_exc.__class__.__name__,
+                    failure_summary=str(retry_exc).strip() or retry_exc.__class__.__name__,
+                    recoverable=True,
+                    recovery_actions=["Use the updated environment and new failure details to choose the next fix."],
+                    execution_details={"install_attempt": install_result},
+                )
+
+        return recover
+
+    def start_from_bootstrap_turn(
+        self,
+        *,
+        bootstrap_turn: BootstrapTurn,
+        user_goal: str,
+        iterations: int | None = None,
+        iteration_callback=None,
+    ) -> dict[str, Any]:
         if not bootstrap_turn.ready_to_start:
             return {"status": "needs_input", "bootstrap": bootstrap_turn.to_dict()}
 
         spec = bootstrap_turn.proposal.recommended_spec
         memory_store = FileMemoryStore(self.memory_root)
-        adapter_result = load_factory(self.resolve_executor_factory_path(user_goal))(spec=spec, memory_root=self.memory_root)
-        if isinstance(adapter_result, AdapterSetup):
-            handlers = adapter_result.handlers
-            capability_provider = adapter_result.capability_provider
+        executor_factory_path = self.resolve_executor_factory_path(user_goal)
+        if executor_factory_path is None:
+            handlers = {}
+            capability_provider = lambda effective_spec: self._cached_capability_context or CapabilityContext()
         else:
-            handlers = adapter_result
-            capability_provider = None
+            adapter_result = load_factory(executor_factory_path)(spec=spec, memory_root=self.memory_root)
+            if isinstance(adapter_result, AdapterSetup):
+                handlers = adapter_result.handlers
+                capability_provider = adapter_result.capability_provider
+            else:
+                handlers = adapter_result
+                capability_provider = None
         orchestrator = ExperimentOrchestrator(
             memory_store=memory_store,
             worker_backend=self.worker_backend,
-            executor=RoutingExperimentExecutor(handlers=handlers),
+            executor=RoutingExperimentExecutor(
+                handlers=handlers,
+                plan_executor=GenericExecutionPlanExecutor(repo_root=self.repo_root),
+                recovery_handler=self._make_execution_recovery_handler(),
+            ),
             reflection_backend=self.reflection_backend,
             review_backend=self.review_backend,
             narrator_backend=self.narrator_backend,
             capability_provider=capability_provider,
+            progress_fn=self.progress_fn,
+            role_models=self.role_models,
         )
         orchestrator.initialize(spec=spec)
-        results = orchestrator.run(iterations=iterations)
+        try:
+            results = orchestrator.run(iterations=iterations, iteration_callback=iteration_callback)
+        except Exception as exc:
+            return {
+                "status": "blocked",
+                "bootstrap": bootstrap_turn.to_dict(),
+                "error": {
+                    "type": exc.__class__.__name__,
+                    "message": summarise_runtime_exception(exc),
+                    "detail": str(exc),
+                },
+            }
+        if results and results[-1].record.outcome.status == "blocked":
+            blocked_outcome = results[-1].record.outcome
+            return {
+                "status": "blocked",
+                "bootstrap": bootstrap_turn.to_dict(),
+                "results": [
+                    {
+                        "record": cycle_result.record.to_dict(),
+                        "accepted_summary": (
+                            cycle_result.accepted_summary.to_dict()
+                            if cycle_result.accepted_summary is not None
+                            else None
+                        ),
+                        "human_update": cycle_result.human_update,
+                    }
+                    for cycle_result in results
+                ],
+                "error": {
+                    "type": blocked_outcome.failure_type or "ExecutionBlocked",
+                    "message": summarise_runtime_exception(
+                        RuntimeError(blocked_outcome.failure_summary or "Execution hit a non-recoverable blocker.")
+                    ),
+                    "detail": blocked_outcome.failure_summary or "",
+                },
+            }
         return {
             "status": "started",
             "bootstrap": bootstrap_turn.to_dict(),

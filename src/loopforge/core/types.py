@@ -7,10 +7,19 @@ from typing import Any, Literal
 
 MetricGoal = Literal["maximize", "minimize"]
 IterationResult = Literal["improved", "regressed", "inconclusive"]
+OutcomeStatus = Literal["success", "recoverable_failure", "blocked"]
 ReviewStatus = Literal["accepted", "rejected", "pending_human"]
 HumanInterventionType = Literal["note", "override", "hypothesis"]
 PreflightStatus = Literal["passed", "warning", "failed"]
-PreflightScope = Literal["bootstrap", "execution"]
+PreflightScope = Literal["bootstrap", "execution", "setup"]
+ExecutionStepKind = Literal["shell", "write_file", "append_file"]
+
+ProgressFn = Callable[[str, str], None]
+StreamFn = Callable[[str], None]
+
+
+def _noop_progress(stage: str, message: str) -> None:
+    pass
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,38 @@ class ExperimentSpec:
 
 
 @dataclass(frozen=True)
+class DataAssetSchema:
+    """Quick schema snapshot of a data asset discovered during bootstrap."""
+    asset_path: str
+    columns: list[str] = field(default_factory=list)
+    dtypes: dict[str, str] = field(default_factory=dict)
+    sample_rows_loaded: int | None = None
+    total_rows_verified: int | None = None
+    total_rows_estimate: int | None = None
+    verification_level: str = "unknown"
+    sample_values: dict[str, list[Any]] = field(default_factory=dict)
+    load_error: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "DataAssetSchema":
+        legacy_row_count = payload.get("row_count")
+        return cls(
+            asset_path=payload.get("asset_path", ""),
+            columns=payload.get("columns", []),
+            dtypes=payload.get("dtypes", {}),
+            sample_rows_loaded=payload.get("sample_rows_loaded"),
+            total_rows_verified=payload.get("total_rows_verified", legacy_row_count),
+            total_rows_estimate=payload.get("total_rows_estimate"),
+            verification_level=payload.get("verification_level", "unknown"),
+            sample_values=payload.get("sample_values", {}),
+            load_error=payload.get("load_error"),
+        )
+
+
+@dataclass(frozen=True)
 class CapabilityContext:
     available_actions: dict[str, str] = field(default_factory=dict)
     available_entities: dict[str, list[str]] = field(default_factory=dict)
@@ -157,6 +198,7 @@ class CapabilityContext:
     available_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
     environment_facts: dict[str, Any] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    data_schemas: list[DataAssetSchema] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -171,20 +213,64 @@ class AdapterSetup:
 
 
 @dataclass(frozen=True)
+class ExecutionStep:
+    kind: ExecutionStepKind
+    command: str = ""
+    path: str | None = None
+    content: str | None = None
+    cwd: str | None = None
+    timeout_seconds: int | None = None
+    allow_failure: bool = False
+    rationale: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ExecutionStep":
+        return cls(
+            kind=payload["kind"],
+            command=payload.get("command", ""),
+            path=payload.get("path"),
+            content=payload.get("content"),
+            cwd=payload.get("cwd"),
+            timeout_seconds=payload.get("timeout_seconds"),
+            allow_failure=payload.get("allow_failure", False),
+            rationale=payload.get("rationale", ""),
+        )
+
+
+@dataclass(frozen=True)
 class ExperimentCandidate:
     hypothesis: str
     action_type: str
     change_type: str
     instructions: str
+    execution_steps: list[ExecutionStep] = field(default_factory=list)
     config_patch: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["execution_steps"] = [step.to_dict() for step in self.execution_steps]
+        return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ExperimentCandidate":
+        return cls(
+            hypothesis=payload["hypothesis"],
+            action_type=payload["action_type"],
+            change_type=payload["change_type"],
+            instructions=payload["instructions"],
+            execution_steps=[ExecutionStep.from_dict(item) for item in payload.get("execution_steps", [])],
+            config_patch=payload.get("config_patch", {}),
+            metadata=payload.get("metadata", {}),
+        )
 
 
 @dataclass(frozen=True)
 class ExperimentOutcome:
+    status: OutcomeStatus = "success"
     metric_results: dict[str, MetricResult] = field(default_factory=dict)
     primary_metric_value: float | None = None
     secondary_metrics: dict[str, float] = field(default_factory=dict)
@@ -196,6 +282,11 @@ class ExperimentOutcome:
     dataset_version: str | None = None
     code_or_config_changes: list[str] = field(default_factory=list)
     candidate_fingerprint: str | None = None
+    failure_type: str | None = None
+    failure_summary: str | None = None
+    recoverable: bool = False
+    recovery_actions: list[str] = field(default_factory=list)
+    execution_details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -207,6 +298,7 @@ class ExperimentOutcome:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "ExperimentOutcome":
         return cls(
+            status=payload.get("status", "success"),
             metric_results={
                 name: MetricResult.from_dict(result_payload)
                 for name, result_payload in payload.get("metric_results", {}).items()
@@ -221,6 +313,11 @@ class ExperimentOutcome:
             dataset_version=payload.get("dataset_version"),
             code_or_config_changes=payload.get("code_or_config_changes", []),
             candidate_fingerprint=payload.get("candidate_fingerprint"),
+            failure_type=payload.get("failure_type"),
+            failure_summary=payload.get("failure_summary"),
+            recoverable=payload.get("recoverable", False),
+            recovery_actions=payload.get("recovery_actions", []),
+            execution_details=payload.get("execution_details", {}),
         )
 
     def resolved_metric_results(self, spec: ExperimentSpec) -> dict[str, MetricResult]:
@@ -320,6 +417,50 @@ class AccessGuide:
 
 
 @dataclass(frozen=True)
+class RunnerAuthoringRequest:
+    user_goal: str
+    repo_root: str
+    capability_context: CapabilityContext
+    target_module_path: str
+    build_symbol: str = "build_adapter"
+    attempt_number: int = 1
+    previous_errors: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RunnerAuthoringRequest":
+        return cls(
+            user_goal=payload["user_goal"],
+            repo_root=payload["repo_root"],
+            capability_context=CapabilityContext(**payload["capability_context"]),
+            target_module_path=payload["target_module_path"],
+            build_symbol=payload.get("build_symbol", "build_adapter"),
+            attempt_number=payload.get("attempt_number", 1),
+            previous_errors=payload.get("previous_errors", []),
+        )
+
+
+@dataclass(frozen=True)
+class RunnerAuthoringResult:
+    module_source: str
+    summary: str = ""
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RunnerAuthoringResult":
+        return cls(
+            module_source=payload["module_source"],
+            summary=payload.get("summary", ""),
+            notes=payload.get("notes", []),
+        )
+
+
+@dataclass(frozen=True)
 class ReviewDecision:
     status: ReviewStatus
     reason: str
@@ -373,6 +514,10 @@ class IterationSummary:
     dataset_version: str | None = None
     code_or_config_changes: list[str] = field(default_factory=list)
     candidate_fingerprint: str | None = None
+    outcome_status: OutcomeStatus = "success"
+    failure_type: str | None = None
+    failure_summary: str | None = None
+    recovery_actions: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
@@ -409,6 +554,10 @@ class IterationSummary:
             dataset_version=payload.get("dataset_version"),
             code_or_config_changes=payload.get("code_or_config_changes", []),
             candidate_fingerprint=payload.get("candidate_fingerprint"),
+            outcome_status=payload.get("outcome_status", "success"),
+            failure_type=payload.get("failure_type"),
+            failure_summary=payload.get("failure_summary"),
+            recovery_actions=payload.get("recovery_actions", []),
         )
 
 
@@ -436,7 +585,7 @@ class IterationRecord:
         return cls(
             iteration_id=payload["iteration_id"],
             parent_iteration_id=payload.get("parent_iteration_id"),
-            candidate=ExperimentCandidate(**payload["candidate"]),
+            candidate=ExperimentCandidate.from_dict(payload["candidate"]),
             outcome=ExperimentOutcome.from_dict(payload["outcome"]),
             reflection=ReflectionSummary.from_dict(payload["reflection"]),
             review=ReviewDecision.from_dict(payload["review"]),
@@ -546,6 +695,37 @@ class PreflightCheck:
 
 
 @dataclass(frozen=True)
+class RunnerValidationResult:
+    success: bool
+    factory_path: str | None = None
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    preflight_checks: list[PreflightCheck] = field(default_factory=list)
+    smoke_test_passed: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "success": self.success,
+            "factory_path": self.factory_path,
+            "errors": self.errors,
+            "warnings": self.warnings,
+            "preflight_checks": [item.to_dict() for item in self.preflight_checks],
+            "smoke_test_passed": self.smoke_test_passed,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "RunnerValidationResult":
+        return cls(
+            success=payload["success"],
+            factory_path=payload.get("factory_path"),
+            errors=payload.get("errors", []),
+            warnings=payload.get("warnings", []),
+            preflight_checks=[PreflightCheck.from_dict(item) for item in payload.get("preflight_checks", [])],
+            smoke_test_passed=payload.get("smoke_test_passed", False),
+        )
+
+
+@dataclass(frozen=True)
 class BootstrapTurn:
     assistant_message: str
     proposal: ExperimentSpecProposal
@@ -601,16 +781,49 @@ class AgentUpdate:
 
 
 @dataclass(frozen=True)
+class MarkdownMemoryNote:
+    path: str
+    content: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "MarkdownMemoryNote":
+        return cls(
+            path=payload["path"],
+            content=payload["content"],
+        )
+
+
+@dataclass(frozen=True)
 class MemorySnapshot:
     spec: ExperimentSpec
     effective_spec: ExperimentSpec
     capability_context: CapabilityContext
     best_summary: IterationSummary | None
     latest_summary: IterationSummary | None
+    recent_records: list[IterationRecord]
     recent_summaries: list[IterationSummary]
     recent_human_interventions: list[HumanIntervention]
     lessons_learned: str
+    markdown_memory: list[MarkdownMemoryNote]
     next_iteration_id: int
+
+
+class ExperimentInterrupted(Exception):
+    """Raised when the experiment loop is interrupted by Ctrl+C."""
+
+    def __init__(
+        self,
+        results_so_far: list[IterationCycleResult],
+        current_stage: str,
+        snapshot: MemorySnapshot | None = None,
+    ) -> None:
+        self.results_so_far = results_so_far
+        self.current_stage = current_stage
+        self.snapshot = snapshot
+        super().__init__(f"Experiment interrupted during {current_stage} after {len(results_so_far)} iteration(s)")
 
 
 def apply_human_interventions(

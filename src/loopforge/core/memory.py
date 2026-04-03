@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+from typing import Any
 
 from loopforge.core.types import (
     AgentUpdate,
@@ -10,6 +11,7 @@ from loopforge.core.types import (
     HumanIntervention,
     IterationRecord,
     IterationSummary,
+    MarkdownMemoryNote,
     MemorySnapshot,
     apply_human_interventions,
 )
@@ -27,6 +29,7 @@ class FileMemoryStore:
         self._updates_path = self.root / "agent_updates.jsonl"
         self._human_notes_path = self.root / "human_notes.jsonl"
         self._lessons_path = self.root / "lessons_learned.md"
+        self._experiment_journal_path = self.root / "experiment_journal.md"
         self._artifact_index_path = self._artifacts_dir / "index.json"
 
     def initialize(self, spec: ExperimentSpec) -> None:
@@ -40,6 +43,7 @@ class FileMemoryStore:
             (self._updates_path, ""),
             (self._human_notes_path, ""),
             (self._lessons_path, ""),
+            (self._experiment_journal_path, ""),
             (self._artifact_index_path, "[]\n"),
         ]:
             if not path.exists():
@@ -55,6 +59,7 @@ class FileMemoryStore:
         capability_context: CapabilityContext | None = None,
     ) -> MemorySnapshot:
         spec = self.load_spec()
+        records = self._read_records()
         summaries = self._read_summaries()
         human_interventions = self._read_human_interventions()
         effective_spec = apply_human_interventions(spec, human_interventions)
@@ -65,11 +70,28 @@ class FileMemoryStore:
             capability_context=capability_context or CapabilityContext(),
             best_summary=self._read_best_summary(),
             latest_summary=summaries[-1] if summaries else None,
+            recent_records=records[-summary_window:],
             recent_summaries=summaries[-summary_window:],
             recent_human_interventions=human_interventions[-human_window:],
             lessons_learned=lessons.strip(),
-            next_iteration_id=len(self._read_records()) + 1,
+            markdown_memory=self._read_markdown_memory(),
+            next_iteration_id=len(records) + 1,
         )
+
+    def load_bootstrap_context(self, summary_window: int = 5, human_window: int = 10) -> dict[str, Any]:
+        summaries = self._read_summaries()
+        best_summary = self._read_best_summary()
+        human_interventions = self._read_human_interventions()
+        lessons = self._lessons_path.read_text(encoding="utf-8") if self._lessons_path.exists() else ""
+        objective = self._objective_path.read_text(encoding="utf-8").strip() if self._objective_path.exists() else None
+        return {
+            "previous_objective": objective,
+            "best_summary": best_summary.to_dict() if best_summary is not None else None,
+            "recent_summaries": [summary.to_dict() for summary in summaries[-summary_window:]],
+            "recent_human_interventions": [item.to_dict() for item in human_interventions[-human_window:]],
+            "lessons_learned": lessons.strip(),
+            "markdown_memory": [item.to_dict() for item in self._read_markdown_memory()],
+        }
 
     def append_iteration_record(self, record: IterationRecord) -> None:
         with self._records_path.open("a", encoding="utf-8") as handle:
@@ -79,6 +101,7 @@ class FileMemoryStore:
         with self._summaries_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(summary.to_dict(), sort_keys=True) + "\n")
         self._append_lessons(summary.lessons)
+        self._append_experiment_journal(summary)
         self._append_artifacts(summary)
 
     def write_best_summary(self, summary: IterationSummary) -> None:
@@ -163,4 +186,46 @@ class FileMemoryStore:
             json.dumps(existing_payload, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
+
+    def _read_markdown_memory(self) -> list[MarkdownMemoryNote]:
+        if not self.root.exists():
+            return []
+        notes: list[MarkdownMemoryNote] = []
+        for path in sorted(self.root.glob("*.md")):
+            if not path.is_file():
+                continue
+            content = path.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            notes.append(
+                MarkdownMemoryNote(
+                    path=str(path.relative_to(self.root)).replace("\\", "/"),
+                    content=content,
+                )
+            )
+        return notes
+
+    def _append_experiment_journal(self, summary: IterationSummary) -> None:
+        lines = [
+            f"## Iteration {summary.iteration_id}: {summary.hypothesis}",
+            f"- Action: {summary.action_type}",
+            f"- Result: {summary.result}",
+            f"- Outcome status: {summary.outcome_status}",
+            f"- Primary metric: {summary.primary_metric_name}={summary.primary_metric_value}",
+            f"- Review reason: {summary.review_reason}",
+        ]
+        if summary.failure_summary:
+            lines.append(f"- Failure: {summary.failure_summary}")
+        if summary.recovery_actions:
+            lines.append("- Recovery actions: " + "; ".join(summary.recovery_actions))
+        if summary.guardrail_failures:
+            lines.append("- Guardrail failures: " + ", ".join(summary.guardrail_failures))
+        if summary.lessons:
+            lines.append("- Lessons: " + "; ".join(summary.lessons))
+        if summary.do_not_repeat:
+            lines.append("- Do not repeat: " + "; ".join(summary.do_not_repeat))
+        if summary.next_ideas:
+            lines.append("- Next ideas: " + "; ".join(summary.next_ideas))
+        with self._experiment_journal_path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n\n")
 

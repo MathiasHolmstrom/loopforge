@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -10,11 +11,14 @@ from loopforge.bootstrap import (
     DEFAULT_MODEL_PROFILE,
     DEFAULT_OPENAI_MODEL,
     Loopforge,
+    apply_answers_to_bootstrap_turn,
     discover_capabilities_for_objective,
     default_role_models,
 )
 from loopforge.core import (
     AdapterSetup,
+    CapabilityContext,
+    ExperimentInterrupted,
     ExperimentSpec,
     ExperimentSpecProposal,
     FileMemoryStore,
@@ -91,6 +95,262 @@ def _prompt_non_empty(prompt: str, *, input_fn=input, print_fn=print) -> str:
         print_fn("A problem statement is required.")
 
 
+def _apply_suggested_answers(turn, answers: dict[str, Any], *, print_fn=print) -> int:
+    # Don't auto-fill — let the user answer their own questions.
+    # Suggested answers are shown as defaults in the prompt instead.
+    return 0
+
+
+def _sanitize_human_text(text: str) -> str:
+    replacements = {
+        "auto_adapter_scaffold": "repo execution setup",
+        "adapter scaffold": "repo execution setup",
+        "generated adapter module": "generated execution file",
+        "adapter module": "execution file",
+        ".loopforge/generated": ".loopforge/generated",
+        "\u2192": "->",
+        "\u2014": "-",
+        "\u2013": "-",
+        "\u2026": "...",
+    }
+    sanitized = text
+    for source, target in replacements.items():
+        sanitized = sanitized.replace(source, target)
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    return sanitized.encode(encoding, errors="replace").decode(encoding, errors="replace")
+
+
+def _friendly_requirement(requirement: str) -> str:
+    if requirement == "preflight:auto_adapter_scaffold":
+        return "Loopforge still needs a runnable execution binding for the detected experiment path."
+    if requirement == "preflight:repo_execution_not_supported":
+        return "This repo is not yet wired with a real autonomous runner for the requested experiment."
+    if requirement.startswith("preflight:"):
+        return requirement.removeprefix("preflight:")
+    if requirement.startswith("answer:"):
+        return requirement.removeprefix("answer:")
+    return requirement
+
+
+def _friendly_check_detail(check) -> str:
+    if check.name == "auto_adapter_scaffold":
+        return (
+            "Loopforge found a likely experiment path, but it does not yet have a runnable repo-specific "
+            "execution binding for it."
+        )
+    if check.name == "repo_execution_not_supported":
+        return (
+            "Loopforge can inspect this repo and plan the work, but it cannot execute experiments here yet "
+            "because there is no supported repo-specific runner."
+        )
+    return _sanitize_human_text(check.detail)
+
+
+def _friendly_metric_label(metric) -> str:
+    name = getattr(metric, "display_name", None) or metric.name
+    words = name.replace("_", " ").split()
+    if not words:
+        return name
+    return " ".join(word.upper() if word.isupper() else word.capitalize() for word in words)
+
+
+def _summarize_actions(actions: list[str], *, generic_autonomous: bool = False) -> str:
+    if generic_autonomous:
+        return "agent will autonomously inspect, edit, run, and recover as needed"
+    if not actions:
+        return "no runnable actions were discovered yet"
+    preview = ", ".join(actions[:3])
+    if len(actions) > 3:
+        preview += f", and {len(actions) - 3} more"
+    return f"choose among the discovered actions: {preview}"
+
+
+def _print_plan_summary(turn, *, print_fn=print) -> None:
+    spec = turn.proposal.recommended_spec
+    generic_autonomous = spec.metadata.get("execution_backend_kind") == "generic_agentic"
+    print_fn("\n--- Experiment plan ---")
+    print_fn(f"  Goal       : {_sanitize_human_text(spec.objective)}")
+    print_fn(f"  Metric     : {_friendly_metric_label(spec.primary_metric)} ({spec.primary_metric.goal})")
+    if spec.guardrail_metrics:
+        print_fn(
+            f"  Guardrails : {', '.join(_friendly_metric_label(metric) for metric in spec.guardrail_metrics[:3])}"
+        )
+    if spec.secondary_metrics:
+        print_fn(
+            f"  Also track : {', '.join(_friendly_metric_label(metric) for metric in spec.secondary_metrics[:3])}"
+        )
+    print_fn(f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}")
+    print_fn("")
+
+
+def _print_blocked_summary(turn, *, print_fn=print) -> None:
+    """Print a human-readable summary when the loop cannot start."""
+    failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+    required_failures = [check for check in failed_checks if check.required]
+    setup_failures = [check for check in failed_checks if not check.required]
+    if required_failures:
+        print_fn("\nBlocked — the following checks failed:")
+        for check in required_failures:
+            print_fn(f"  - {_friendly_check_detail(check)}")
+    if setup_failures:
+        print_fn("\nSetup still needed:")
+        for check in setup_failures:
+            print_fn(f"  - {_friendly_check_detail(check)}")
+    if turn.missing_requirements:
+        print_fn("\nStill needed:")
+        for req in turn.missing_requirements:
+            print_fn(f"  - {_friendly_requirement(req)}")
+    notes = getattr(turn.proposal, "notes", None) or []
+    if notes:
+        print_fn("\nNotes:")
+        for note in notes:
+            print_fn(f"  - {_sanitize_human_text(note)}")
+
+
+def _print_result_summary(result: dict[str, Any], *, print_fn=print) -> None:
+    """Print a human-readable summary of the experiment result."""
+    status = result.get("status", "unknown")
+    if status == "blocked":
+        error = result.get("error", {})
+        print_fn(f"\nExperiment blocked: {error.get('message', 'unknown error')}")
+        return
+    if status == "needs_input":
+        print_fn("\nExperiment still needs input before it can run.")
+        return
+    cycle_results = result.get("results", [])
+    print_fn(f"\nExperiment finished — {len(cycle_results)} iteration(s) completed.")
+    for i, cycle in enumerate(cycle_results, 1):
+        update = cycle.get("human_update")
+        if update:
+            print_fn(f"\n--- Iteration {i} ---")
+            print_fn(update)
+
+
+def _confirm_or_feedback(prompt: str, *, input_fn=input) -> str | None:
+    """Ask for confirmation or feedback. Returns None for yes, feedback string otherwise."""
+    answer = input_fn(prompt).strip()
+    if answer.lower() in ("y", "yes", ""):
+        return None
+    return answer
+
+
+def _make_stream_fn():
+    """Build a stream callback that writes tokens to stdout in real-time."""
+
+    def stream(token: str) -> None:
+        sys.stdout.write(token)
+        sys.stdout.flush()
+
+    return stream
+
+
+def _make_progress_fn(print_fn=print):
+    """Build a progress callback that prints stage updates to the console."""
+    last_stage = [None]
+
+    def progress(stage: str, message: str) -> None:
+        if stage == last_stage[0]:
+            return
+        last_stage[0] = stage
+        print_fn(f"\n  ... {message}")
+
+    return progress
+
+
+def _make_iteration_callback(print_fn=print):
+    """Build a callback that prints rich per-iteration details."""
+    iteration_count = [0]
+
+    def callback(cycle_result) -> None:
+        iteration_count[0] += 1
+        record = cycle_result.record
+        candidate = record.candidate
+        outcome = record.outcome
+        reflection = record.reflection
+        review = record.review
+
+        print_fn(f"\n{'=' * 60}")
+        print_fn(f"  Iteration {record.iteration_id} — {candidate.action_type}")
+        print_fn(f"{'=' * 60}")
+        print_fn(f"  Hypothesis : {candidate.hypothesis}")
+
+        # Outcome
+        metrics_parts = []
+        for name, result in outcome.metric_results.items():
+            if result.value is not None:
+                metrics_parts.append(f"{name}={result.value:.4g}")
+        if outcome.primary_metric_value is not None and not metrics_parts:
+            metrics_parts.append(f"primary={outcome.primary_metric_value:.4g}")
+        metrics_str = " | ".join(metrics_parts) if metrics_parts else "no metrics"
+        print_fn(f"  Outcome    : {outcome.status} | {metrics_str}")
+        if outcome.notes:
+            for note in outcome.notes[:3]:
+                print_fn(f"               {note}")
+
+        # Reflection
+        assessment = reflection.assessment
+        if len(assessment) > 200:
+            assessment = assessment[:200] + "..."
+        print_fn(f"  Reflection : {assessment}")
+        if reflection.lessons:
+            for lesson in reflection.lessons[:3]:
+                print_fn(f"    - {lesson}")
+
+        # Review
+        print_fn(f"  Review     : {review.status} — {review.reason}")
+
+        # Accepted summary result
+        if cycle_result.accepted_summary is not None:
+            print_fn(f"  Result     : {cycle_result.accepted_summary.result}")
+
+        # Narrator update
+        if cycle_result.human_update:
+            print_fn(f"\n  {cycle_result.human_update}")
+        print_fn("")
+
+    return callback
+
+
+def _planning_status_message(planner_tag: str, *, first_run: bool, replan_reason: str) -> str | None:
+    if first_run:
+        return f"\n{planner_tag} Analysing repository and planning experiment..."
+    if replan_reason == "feedback":
+        return f"\n{planner_tag} Updating plan..."
+    return None
+
+
+def _resolve_question_answer(question, raw: str) -> str:
+    if question.options:
+        if not raw and question.suggested_answer:
+            return question.suggested_answer
+        if raw.isdigit() and 1 <= int(raw) <= len(question.options):
+            return question.options[int(raw) - 1]
+        return raw or question.suggested_answer or ""
+    if not raw and question.suggested_answer:
+        return question.suggested_answer
+    return raw or ""
+
+
+def _is_start_intent(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    if normalized in {"y", "yes", "go", "start", "run", "proceed", "continue"}:
+        return True
+    start_phrases = (
+        "go ahead",
+        "go ahead start",
+        "go ahead and start",
+        "start it",
+        "start now",
+        "run it",
+        "run now",
+        "let's start",
+        "lets start",
+        "start man",
+        "go ahead man",
+    )
+    return any(phrase in normalized for phrase in start_phrases)
+
+
 def run_interactive_start(
     *,
     repo_root: Path | str = ".",
@@ -108,6 +368,7 @@ def run_interactive_start(
     input_fn=input,
     print_fn=print,
 ) -> int:
+    progress_fn = _make_progress_fn(print_fn)
     app = Loopforge(
         executor_factory_path=executor_factory,
         repo_root=repo_root,
@@ -120,29 +381,221 @@ def run_interactive_start(
         consultation_model=consultation_model,
         narrator_model=narrator_model,
         temperature=temperature,
+        progress_fn=progress_fn,
     )
     user_goal = _prompt_non_empty("What problem are we solving? ", input_fn=input_fn, print_fn=print_fn)
     answers: dict[str, Any] = {}
+    replan_reason = "initial"
+    first_run = True
+    turn = None
+    planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
+    narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
-        turn = app.bootstrap(user_goal=user_goal, answers=answers)
-        if turn.human_update:
-            print_fn(turn.human_update)
-        elif turn.assistant_message:
-            print_fn(turn.assistant_message)
-        if turn.access_guide_path:
-            print_fn(f"Access guide written to {turn.access_guide_path}")
+        # Only call the LLM when we actually need a new plan
+        if replan_reason:
+            planning_message = _planning_status_message(
+                planner_tag,
+                first_run=first_run,
+                replan_reason=replan_reason,
+            )
+            if planning_message:
+                print_fn(planning_message)
+            first_run = False
+            try:
+                turn = app.bootstrap(user_goal=user_goal, answers=answers)
+            except KeyboardInterrupt:
+                print_fn("\n\n--- Interrupted during planning ---")
+                try:
+                    redirect = input_fn(
+                        "Feedback for current plan (or 'restart: ...' / 'quit'): "
+                    ).strip()
+                except (KeyboardInterrupt, EOFError):
+                    print_fn("\nAborted.")
+                    return 0
+                if redirect.lower() in ("quit", "exit"):
+                    print_fn("Aborted.")
+                    return 0
+                if redirect.lower().startswith("restart:"):
+                    restarted_goal = redirect.partition(":")[2].strip()
+                    if restarted_goal:
+                        user_goal = restarted_goal
+                    answers = {}
+                    first_run = True
+                    replan_reason = "initial"
+                    continue
+                if redirect.lower().startswith("restart "):
+                    restarted_goal = redirect[len("restart "):].strip()
+                    if restarted_goal:
+                        user_goal = restarted_goal
+                    answers = {}
+                    first_run = True
+                    replan_reason = "initial"
+                    continue
+                pending_required = (
+                    [q for q in turn.proposal.questions if q.required and q.key not in answers]
+                    if turn is not None
+                    else []
+                )
+                if redirect and len(pending_required) == 1:
+                    answers[pending_required[0].key] = _resolve_question_answer(pending_required[0], redirect)
+                    turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+                    replan_reason = ""
+                    continue
+                pending_optional = (
+                    [q for q in turn.proposal.questions if not q.required and q.key not in answers]
+                    if turn is not None
+                    else []
+                )
+                if redirect and len(pending_optional) == 1:
+                    answers[pending_optional[0].key] = _resolve_question_answer(pending_optional[0], redirect)
+                    turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+                    replan_reason = ""
+                    continue
+                if redirect:
+                    answers["user_feedback"] = redirect
+                    replan_reason = "feedback"
+                else:
+                    replan_reason = "feedback"
+                continue
+            replan_reason = ""
+
+            # Show the human-friendly narrative
+            narrative = turn.human_update or turn.assistant_message or ""
+            if narrative:
+                print_fn(f"\n{narrator_tag} {_sanitize_human_text(narrative)}")
+            if turn.access_guide_path:
+                print_fn(f"\n(Access guide written to {turn.access_guide_path})")
+
+            # Show blockers if any
+            failed_checks = [c for c in (turn.preflight_checks or []) if c.status == "failed"]
+            if failed_checks:
+                _print_blocked_summary(turn, print_fn=print_fn)
+
+            # Auto-fill safe defaults, then re-plan with them
+            if _apply_suggested_answers(turn, answers, print_fn=print_fn):
+                replan_reason = "answers"
+                continue
+
+        # Ask any remaining required questions — NO re-plan between questions
+        required_questions = [q for q in turn.proposal.questions if q.required]
+        pending_questions = [q for q in required_questions if q.key not in answers]
+        if pending_questions:
+            for question in pending_questions:
+                if question.options:
+                    print_fn(f"\n{question.prompt}")
+                    for i, opt in enumerate(question.options, 1):
+                        print_fn(f"  {i}. {opt}")
+                    print_fn(f"  Or type your own answer.")
+                    if question.suggested_answer:
+                        print_fn(f"  (default: {question.suggested_answer})")
+                    raw = input_fn("Your choice: ").strip()
+                    answers[question.key] = _resolve_question_answer(question, raw)
+                else:
+                    print_fn(f"\n{question.prompt}")
+                    if question.suggested_answer:
+                        print_fn(f"  (default: {question.suggested_answer})")
+                    raw = input_fn("> ").strip()
+                    answers[question.key] = _resolve_question_answer(question, raw)
+            turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+            continue
+
+        optional_questions = [q for q in turn.proposal.questions if not q.required and q.key not in answers]
+        if optional_questions:
+            question = optional_questions[0]
+            if question.options:
+                print_fn(f"\n{question.prompt}")
+                for i, opt in enumerate(question.options, 1):
+                    print_fn(f"  {i}. {opt}")
+                print_fn("  Or press Enter to skip.")
+                raw = input_fn("Your choice: ").strip()
+                answers[question.key] = _resolve_question_answer(question, raw)
+            else:
+                print_fn(f"\n{question.prompt}")
+                raw = input_fn("> ").strip()
+                answers[question.key] = raw
+            if answers[question.key]:
+                turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
+                continue
+
+        # Show the plan summary if ready
         if turn.ready_to_start:
-            result = app.start(user_goal=user_goal, answers=answers, iterations=iterations)
-            print_fn(json.dumps(result, indent=2, sort_keys=True))
+            _print_plan_summary(turn, print_fn=print_fn)
+
+        # Always prompt the user — whether ready, blocked, or anything else
+        if turn.ready_to_start:
+            prompt_text = "Ready to start? [Y to go / or type feedback] "
+        else:
+            prompt_text = "> "
+        response = input_fn(prompt_text).strip()
+        if not response:
+            continue
+        if response.lower() in ("quit", "exit"):
+            print_fn("Aborted.")
             return 0
-        required_questions = [question for question in turn.proposal.questions if question.required]
-        pending_questions = [question for question in required_questions if question.key not in answers]
-        if not pending_questions:
-            print_fn(json.dumps({"status": "needs_input", "bootstrap": turn.to_dict()}, indent=2, sort_keys=True))
-            return 1
-        for question in pending_questions:
-            answer = _prompt_non_empty(f"{question.prompt} ", input_fn=input_fn, print_fn=print_fn)
-            answers[question.key] = answer
+        if turn.ready_to_start and _is_start_intent(response):
+            print_fn("\nStarting experiment loop...\n")
+            try:
+                iteration_cb = _make_iteration_callback(print_fn)
+                result = app.start_from_bootstrap_turn(
+                    bootstrap_turn=turn,
+                    user_goal=user_goal,
+                    iterations=iterations,
+                    iteration_callback=iteration_cb,
+                )
+            except ExperimentInterrupted as exc:
+                print_fn(f"\n--- Interrupted after {len(exc.results_so_far)} iteration(s) ---")
+                for i, cycle in enumerate(exc.results_so_far, 1):
+                    if cycle.human_update:
+                        print_fn(f"\n  Iteration {i}: {cycle.human_update}")
+                try:
+                    redirect = input_fn("\nNew instructions (or 'quit' to stop): ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    print_fn("\nAborted.")
+                    return 0
+                if not redirect or redirect.lower() in ("quit", "exit"):
+                    print_fn("Stopped.")
+                    return 0
+                append_human_intervention(
+                    memory_root=app.memory_root,
+                    message=redirect,
+                    effects={"user_redirect": True},
+                    author="human",
+                    type_="override",
+                )
+                answers["user_feedback"] = redirect
+                replan_reason = "feedback"
+                continue
+            except KeyboardInterrupt:
+                print_fn("\n\n--- Interrupted during experiment ---")
+                try:
+                    redirect = input_fn("New instructions (or 'quit' to stop): ").strip()
+                except (KeyboardInterrupt, EOFError):
+                    print_fn("\nAborted.")
+                    return 0
+                if not redirect or redirect.lower() in ("quit", "exit"):
+                    print_fn("Stopped.")
+                    return 0
+                answers["user_feedback"] = redirect
+                replan_reason = "feedback"
+                continue
+            _print_result_summary(result, print_fn=print_fn)
+            return 0
+        # If it looks like a question, answer it directly — no full re-plan
+        if response.rstrip().endswith("?") or response.lower().startswith(("what ", "why ", "how ", "can ", "do ", "is ", "are ")):
+            answers.setdefault("discussion", [])
+            answers["discussion"].append(response)
+            try:
+                cap_ctx = app._cached_capability_context or CapabilityContext()
+                quick_reply = app.narrator_backend.answer_question(response, turn, cap_ctx)
+                print_fn(f"\n{narrator_tag} {quick_reply}\n")
+            except Exception:
+                answers["user_feedback"] = response
+                replan_reason = "feedback"
+            continue
+        # Anything else is feedback that changes the plan — re-plan
+        answers["user_feedback"] = response
+        replan_reason = "feedback"
+        continue
 
 
 def run_from_spec(
@@ -190,11 +643,15 @@ def run_from_spec(
         handlers = adapter_result
         capability_provider = None
     from loopforge.core import ExperimentOrchestrator, RoutingExperimentExecutor
+    from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 
     orchestrator = ExperimentOrchestrator(
         memory_store=memory_store,
         worker_backend=app.worker_backend,
-        executor=RoutingExperimentExecutor(handlers=handlers),
+        executor=RoutingExperimentExecutor(
+            handlers=handlers,
+            plan_executor=GenericExecutionPlanExecutor(repo_root=Path(".")),
+        ),
         reflection_backend=app.reflection_backend,
         review_backend=app.review_backend,
         narrator_backend=app.narrator_backend,
@@ -236,6 +693,7 @@ def draft_spec(
         objective=objective,
         memory_root=memory_root,
         executor_factory_path=resolved_factory_path,
+        repo_root=repo_root,
     )
     backend = LiteLLMSpecBackend(model=planner_model, temperature=temperature)
     return backend.propose_spec(
@@ -349,4 +807,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

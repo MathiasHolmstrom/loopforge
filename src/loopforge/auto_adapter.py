@@ -6,17 +6,35 @@ import re
 from pathlib import Path
 from typing import Any
 
+from loopforge.core.types import CapabilityContext
+
 
 METRIC_TOKENS = ("metric", "score", "loss", "auc", "precision", "recall", "accuracy", "f1", "rmse", "mae")
-ACTION_TOKENS = ("train", "baseline", "evaluate", "eval", "eda", "tune", "validate", "predict", "infer")
-DATA_TOKENS = ("data", "dataset", "table", "feature", "artifact", "model")
-EXCLUDED_DIRS = {".git", ".hg", ".venv", ".pytest_cache", "__pycache__", "node_modules"}
+DATA_TOKENS = ("data", "dataset", "table", "feature", "artifact", "model", "schema", "ddl", "migration")
+EXCLUDED_DIRS = {".git", ".hg", ".venv", ".pytest_cache", "__pycache__", "node_modules", ".loopforge"}
+DATA_FILE_SUFFIXES = {".csv", ".parquet", ".json", ".jsonl", ".xlsx", ".xls"}
+# Patterns that indicate a string is a DataFrame column reference
+COLUMN_ACCESS_FUNCS = {"col", "alias", "over", "sort", "select", "with_columns", "group_by", "filter"}
+COLUMN_NOISE = {"utf-8", "utf8", "r", "w", "rb", "wb", "a", "", ".", ",", "/", "\\", "ok", "true", "false"}
 
 
 def _iter_python_files(repo_root: Path) -> list[Path]:
     files: list[Path] = []
     for path in repo_root.rglob("*.py"):
         if any(part in EXCLUDED_DIRS for part in path.parts):
+            continue
+        files.append(path)
+    return files
+
+
+def _iter_data_files(repo_root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in repo_root.rglob("*"):
+        if any(part in EXCLUDED_DIRS for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in DATA_FILE_SUFFIXES:
             continue
         files.append(path)
     return files
@@ -31,12 +49,73 @@ def _record_symbol(name: str, path: Path, repo_root: Path, bucket: dict[str, dic
     }
 
 
+def _is_candidate_action_name(name: str) -> bool:
+    lowered = name.lower()
+    if lowered.startswith("_") or lowered.startswith("test_"):
+        return False
+    if len(lowered) > 48:
+        return False
+    if "__" in lowered:
+        return False
+    return True
+
+
+def _file_uses_dataframes(tree: ast.AST) -> bool:
+    """Check if a file imports pandas or polars (i.e. actually works with DataFrames)."""
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module = getattr(node, "module", "") or ""
+            names = [alias.name for alias in getattr(node, "names", [])]
+            all_names = [module] + names
+            if any(n in ("pandas", "polars", "pl", "pd") for n in all_names):
+                return True
+            if any("pandas" in n or "polars" in n for n in all_names):
+                return True
+    return False
+
+
+def _extract_column_refs(tree: ast.AST) -> set[str]:
+    """Extract likely DataFrame column names from AST — only from files that use DataFrames."""
+    if not _file_uses_dataframes(tree):
+        return set()
+    columns: set[str] = set()
+    for node in ast.walk(tree):
+        # pl.col("name"), .alias("name"), .over(["col1", "col2"]), etc.
+        if isinstance(node, ast.Call):
+            func = node.func
+            func_name = None
+            if isinstance(func, ast.Attribute):
+                func_name = func.attr
+            elif isinstance(func, ast.Name):
+                func_name = func.id
+            if func_name and func_name.lower() in COLUMN_ACCESS_FUNCS:
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        columns.add(arg.value)
+                    elif isinstance(arg, ast.List):
+                        for elt in arg.elts:
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                                columns.add(elt.value)
+    # Filter noise — keep only plausible column names (lowercase/snake_case, no class names)
+    def _looks_like_column(name: str) -> bool:
+        if name.lower() in COLUMN_NOISE:
+            return False
+        if len(name) <= 1:
+            return False
+        if name[0].isupper() and any(c.isupper() for c in name[1:]):
+            return False  # CamelCase = likely a class name
+        return True
+
+    return {c for c in columns if _looks_like_column(c)}
+
+
 def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     metrics: dict[str, dict[str, Any]] = {}
     actions: dict[str, dict[str, Any]] = {}
     data_assets: list[str] = []
     notes: list[str] = []
+    column_refs: dict[str, list[str]] = {}  # file -> columns found
 
     for path in _iter_python_files(root):
         relative_path = str(path.relative_to(root)).replace("\\", "/")
@@ -44,21 +123,30 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
         if any(token in lower_path for token in DATA_TOKENS) and relative_path not in data_assets:
             data_assets.append(relative_path)
         try:
-            tree = ast.parse(path.read_text(encoding="utf-8"))
+            source = path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
-        for node in ast.walk(tree):
+        for node in ast.iter_child_nodes(tree):
             name = getattr(node, "name", None)
             if not isinstance(name, str):
                 continue
             lowered = name.lower()
-            if any(token in lowered for token in METRIC_TOKENS):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and any(
+                token in lowered for token in METRIC_TOKENS
+            ):
                 _record_symbol(name, path, root, metrics)
-            if any(token in lowered for token in ACTION_TOKENS):
-                normalized = name.lower()
-                if normalized == "eval":
-                    normalized = "evaluate"
-                _record_symbol(normalized, path, root, actions)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and _is_candidate_action_name(name):
+                _record_symbol(name, path, root, actions)
+        # Extract column references from data manipulation code
+        cols = _extract_column_refs(tree)
+        if cols:
+            column_refs[relative_path] = sorted(cols)
+
+    for path in _iter_data_files(root):
+        relative_path = str(path.relative_to(root)).replace("\\", "/")
+        if relative_path not in data_assets:
+            data_assets.append(relative_path)
 
     if metrics:
         notes.append(f"Discovered {len(metrics)} candidate metric symbols from Python sources.")
@@ -67,13 +155,61 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     if data_assets:
         notes.append(f"Discovered {len(data_assets)} candidate data-related files from repo paths.")
 
+    # Summarize discovered columns for the agent (cap at 50 to avoid noise)
+    all_columns = sorted({col for cols in column_refs.values() for col in cols})
+    if all_columns:
+        if len(all_columns) <= 50:
+            notes.append(f"DataFrame columns referenced in code: {', '.join(all_columns)}")
+        else:
+            notes.append(
+                f"DataFrame columns referenced in code ({len(all_columns)} total, showing first 50): "
+                f"{', '.join(all_columns[:50])} ..."
+            )
+        for file_path, cols in column_refs.items():
+            notes.append(f"  {file_path}: {', '.join(cols)}")
+
     return {
         "repo_root": str(root),
         "metrics": metrics,
         "actions": actions,
         "data_assets": data_assets,
         "notes": notes,
+        "column_refs": column_refs,
     }
+
+
+def build_repo_scan_context(repo_root: Path | str) -> CapabilityContext:
+    summary = scan_repo(repo_root)
+    discovered_actions = summary["actions"]
+    discovered_metrics = summary["metrics"]
+    notes = [
+        "Loopforge can inspect this repo and plan experiments from observed repo structure, but it does not yet have a real runnable runner for this objective.",
+        "Discovered symbols are observations only. They are not executable experiment steps until the repo has a supported runner.",
+    ]
+    notes.extend(summary["notes"])
+    if discovered_actions:
+        previews = [f"{name} ({item['path']})" for name, item in list(discovered_actions.items())[:10]]
+        notes.append("Public callables discovered in code: " + ", ".join(previews))
+    return CapabilityContext(
+        available_actions={name: item["path"] for name, item in discovered_actions.items()},
+        available_data_assets=list(summary["data_assets"]),
+        available_metrics={
+            name: {
+                "scorer_ref": f"repo_scan:{item['path']}:{item['symbol']}",
+                "path": item["path"],
+            }
+            for name, item in discovered_metrics.items()
+        },
+        environment_facts={
+            "execution_backend_kind": "planning_only_repo_scan",
+            "autonomous_execution_supported": False,
+            "observation_mode": "repo_scan_only",
+            "repo_root": summary["repo_root"],
+            "discovered_action_count": len(discovered_actions),
+            "discovered_metric_count": len(discovered_metrics),
+        },
+        notes=notes,
+    )
 
 
 def _slugify(value: str) -> str:
@@ -145,8 +281,8 @@ def _preflight_provider(spec, capability_context):
             name="auto_adapter_scaffold",
             status="failed",
             detail=(
-                "Loopforge synthesized an adapter scaffold from repo inspection, but action handlers are still "
-                "placeholders. Fill in the generated adapter module before execution."
+                "Loopforge found a likely experiment path from repo inspection, but it does not yet have a "
+                "real repo-specific runner for it. Execution cannot start until that runner is wired."
             ),
             scope="execution",
         )
