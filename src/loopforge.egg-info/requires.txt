@@ -1,0 +1,4 @@
+litellm>=1.61.0
+
+[test]
+pytest>=8.0.0
