@@ -7,6 +7,7 @@ from loopforge import (
     AdapterSetup,
     BootstrapTurn,
     CapabilityContext,
+    ConsultingWorkerBackend,
     ExperimentCandidate,
     ExperimentOrchestrator,
     ExperimentOutcome,
@@ -16,6 +17,8 @@ from loopforge import (
     Loopforge,
     MetricResult,
     MetricSpec,
+    AccessGuide,
+    OpsConsultation,
     PreflightCheck,
     PrimaryMetric,
     ReflectionSummary,
@@ -61,6 +64,58 @@ class FakeReviewBackend:
 
     def review(self, snapshot, candidate, outcome, reflection):
         return self._decisions.pop(0)
+
+
+class FakeNarrationBackend:
+    def __init__(self) -> None:
+        self.bootstrap_calls = []
+        self.iteration_calls = []
+
+    def summarize_bootstrap(self, turn, capability_context):
+        self.bootstrap_calls.append((turn, capability_context))
+        return f"bootstrap:{turn.proposal.objective}"
+
+    def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+        self.iteration_calls.append((snapshot, candidate, outcome, reflection, review, accepted_summary))
+        return f"iteration:{candidate.action_type}:{review.status}"
+
+
+class FakeConsultationBackend:
+    def __init__(self, focus: str = "databricks deploy") -> None:
+        self.focus = focus
+        self.calls = []
+
+    def consult(self, snapshot):
+        self.calls.append(snapshot)
+        return OpsConsultation(
+            focus=self.focus,
+            guidance="Use bundle deploy and verify env vars first.",
+            commands=["databricks bundle validate", "databricks bundle deploy -t dev"],
+            required_env_vars=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+            risks=["Missing workspace permissions"],
+            should_consult=True,
+        )
+
+
+class FakeAccessAdvisorBackend:
+    def __init__(self) -> None:
+        self.calls = []
+
+    def build_access_guide(self, user_goal, capability_context, preflight_checks):
+        self.calls.append((user_goal, capability_context, preflight_checks))
+        return AccessGuide(
+            summary="Check Databricks credentials before running.",
+            required_env_vars=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
+            required_permissions=["Workspace access", "Job run permission"],
+            commands=["databricks auth profiles", "databricks bundle validate"],
+            steps=["Export env vars", "Validate access", "Run the bundle"],
+            markdown=(
+                "# Access Guide\n\n"
+                "## Environment Variables\n"
+                "- DATABRICKS_HOST\n"
+                "- DATABRICKS_TOKEN\n"
+            ),
+        )
 
 
 def build_spec(**overrides) -> ExperimentSpec:
@@ -179,6 +234,46 @@ def test_orchestrator_injects_capability_context_into_worker_snapshot(tmp_path) 
     assert worker.snapshots[0].capability_context.available_metrics["log_loss"]["scorer_ref"] == "metrics.log_loss_cv"
 
 
+def test_consulting_worker_requests_ops_help_for_databricks_flows(tmp_path) -> None:
+    store = FileMemoryStore(tmp_path / "loop")
+    worker = FakeWorkerBackend(
+        [
+            ExperimentCandidate(
+                hypothesis="Deploy the updated Databricks bundle.",
+                action_type="baseline",
+                change_type="deployment",
+                instructions="Deploy to Databricks dev.",
+            )
+        ]
+    )
+    consultation = FakeConsultationBackend()
+    orchestrator = ExperimentOrchestrator(
+        memory_store=store,
+        worker_backend=ConsultingWorkerBackend(worker_backend=worker, consultation_backend=consultation),
+        executor=RoutingExperimentExecutor(
+            handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.41)])}
+        ),
+        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
+        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        capability_provider=lambda effective_spec: CapabilityContext(notes=["Need Databricks deploy guidance"]),
+    )
+    orchestrator.initialize(
+        build_spec(
+            objective="Deploy the Databricks training job and verify data access.",
+            allowed_actions=["baseline"],
+        )
+    )
+
+    cycle = orchestrator.run_iteration()
+
+    assert consultation.calls
+    assert "Ops consult guidance: Use bundle deploy and verify env vars first." in worker.snapshots[0].capability_context.notes
+    assert cycle.record.candidate.metadata["ops_consultation"]["required_env_vars"] == [
+        "DATABRICKS_HOST",
+        "DATABRICKS_TOKEN",
+    ]
+
+
 def test_rejected_review_stays_in_raw_records_but_not_in_accepted_memory(tmp_path) -> None:
     store = FileMemoryStore(tmp_path / "loop")
     orchestrator = ExperimentOrchestrator(
@@ -263,6 +358,16 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
         def review(self, snapshot, candidate, outcome, reflection):
             return ReviewDecision(status="accepted", reason="Approved into memory.")
 
+    class StubNarration:
+        def __init__(self, model: str, completion_fn=None, temperature: float = 0.2, extra_kwargs=None) -> None:
+            self.model = model
+
+        def summarize_bootstrap(self, turn, capability_context):
+            return "bootstrap update"
+
+        def summarize_iteration(self, snapshot, candidate, outcome, reflection, review, accepted_summary):
+            return "iteration update"
+
     def fake_factory(spec, memory_root: Path):
         return AdapterSetup(
             handlers={"baseline": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.39)])},
@@ -276,6 +381,7 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMWorkerBackend", StubWorker)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReflectionBackend", StubReflection)
     monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
+    monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)
     monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
     monkeypatch.setattr("loopforge.cli.load_factory", lambda _: fake_factory)
 
@@ -288,6 +394,7 @@ def test_run_from_spec_supports_factory_and_returns_reviewed_cycle_results(tmp_p
 
     assert results[0]["accepted_summary"]["hypothesis"] == "Baseline"
     assert results[0]["record"]["review"]["status"] == "accepted"
+    assert results[0]["human_update"] == "iteration update"
 
 
 def test_discover_capabilities_for_objective_prefers_discovery_provider(tmp_path, monkeypatch) -> None:
@@ -443,6 +550,8 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
         executor_factory_path="fake.module:factory",
         memory_root=tmp_path / "memory",
         bootstrap_backend=StubBootstrapBackend(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        narrator_backend=FakeNarrationBackend(),
     )
 
     turn = app.bootstrap(user_goal="Improve fraud detection recall.")
@@ -454,6 +563,54 @@ def test_loopforge_bootstrap_returns_questions_and_preflight_failures(tmp_path, 
     ]
     assert turn.preflight_checks[0].name == "memory_root_access"
     assert turn.preflight_checks[1].name == "warehouse_permissions"
+    assert turn.access_guide_path is not None
+    assert turn.human_update is not None
+    assert "bootstrap:Improve fraud detection recall." in turn.human_update
+    assert "Access guide:" in turn.human_update
+    assert Path(turn.access_guide_path).read_text(encoding="utf-8").startswith("# Access Guide")
+
+
+def test_loopforge_blocks_autonomous_start_without_execution_preflight(tmp_path, monkeypatch) -> None:
+    class StubBootstrapBackend:
+        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+            return BootstrapTurn(
+                assistant_message="The plan is clear.",
+                proposal=ExperimentSpecProposal(
+                    objective=user_goal,
+                    recommended_spec=ExperimentSpec(
+                        objective=user_goal,
+                        primary_metric=PrimaryMetric(name="fraud_recall", goal="maximize"),
+                        allowed_actions=["train"],
+                    ),
+                ),
+                role_models=role_models,
+                ready_to_start=True,
+            )
+
+    def fake_factory(spec, memory_root: Path):
+        return AdapterSetup(
+            handlers={"train": StaticActionExecutor([ExperimentOutcome(primary_metric_value=0.5)])},
+            discovery_provider=lambda objective: CapabilityContext(
+                available_data_assets=["fraud_training_set"],
+            ),
+        )
+
+    monkeypatch.setattr("loopforge.bootstrap.load_factory", lambda _: fake_factory)
+
+    app = Loopforge(
+        executor_factory_path="fake.module:factory",
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        narrator_backend=FakeNarrationBackend(),
+    )
+
+    turn = app.bootstrap(user_goal="Improve fraud detection recall.")
+
+    assert turn.ready_to_start is False
+    assert "preflight:autonomous_execution_permissions" in turn.missing_requirements
+    assert turn.preflight_checks[1].status == "failed"
+    assert turn.preflight_checks[1].scope == "execution"
 
 
 def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path, monkeypatch) -> None:
@@ -511,6 +668,8 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
         memory_root=tmp_path / "memory",
         bootstrap_backend=StubBootstrapBackend(),
         worker_backend=StubWorker(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        narrator_backend=FakeNarrationBackend(),
         reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Fine.")]),
         review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
     )
@@ -526,8 +685,13 @@ def test_loopforge_start_uses_defaults_and_runs_when_bootstrap_is_ready(tmp_path
         worker="openai/gpt-5.4",
         reflection="openai/gpt-5.4",
         review="openai/gpt-5.4",
+        consultation="anthropic/claude-sonnet-4-5",
+        narrator="anthropic/claude-sonnet-4-5",
     ).to_dict()
     assert result["results"][0]["accepted_summary"]["primary_metric_value"] == 0.55
+    assert "bootstrap:Improve fraud detection recall." in result["bootstrap"]["human_update"]
+    assert result["bootstrap"]["access_guide_path"].endswith("ops_access_guide.md")
+    assert result["results"][0]["human_update"] == "iteration:baseline:accepted"
 
 
 def test_synthesize_auto_adapter_creates_loadable_reusable_factory(tmp_path) -> None:
@@ -602,6 +766,8 @@ def test_loopforge_bootstrap_auto_synthesizes_adapter_when_missing(tmp_path) -> 
         repo_root=repo_root,
         memory_root=tmp_path / "memory",
         bootstrap_backend=StubBootstrapBackend(),
+        access_advisor_backend=FakeAccessAdvisorBackend(),
+        narrator_backend=FakeNarrationBackend(),
     )
 
     turn = app.bootstrap(user_goal="Protect approval precision.")

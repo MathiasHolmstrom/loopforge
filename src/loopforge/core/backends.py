@@ -2,9 +2,11 @@
 
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Protocol
 
 from loopforge.core.types import (
+    AccessGuide,
     BootstrapTurn,
     CapabilityContext,
     ExperimentCandidate,
@@ -12,6 +14,7 @@ from loopforge.core.types import (
     ExperimentSpecProposal,
     ExperimentOutcome,
     MemorySnapshot,
+    OpsConsultation,
     RoleModelConfig,
     ReflectionSummary,
     ReviewDecision,
@@ -51,6 +54,19 @@ class ReflectionBackend(Protocol):
     ) -> ReflectionSummary: ...
 
 
+class ConsultationBackend(Protocol):
+    def consult(self, snapshot: MemorySnapshot) -> OpsConsultation: ...
+
+
+class AccessAdvisorBackend(Protocol):
+    def build_access_guide(
+        self,
+        user_goal: str,
+        capability_context: CapabilityContext,
+        preflight_checks,
+    ) -> AccessGuide: ...
+
+
 class ReviewBackend(Protocol):
     def review(
         self,
@@ -59,6 +75,24 @@ class ReviewBackend(Protocol):
         outcome: ExperimentOutcome,
         reflection: ReflectionSummary,
     ) -> ReviewDecision: ...
+
+
+class NarrationBackend(Protocol):
+    def summarize_bootstrap(
+        self,
+        turn: BootstrapTurn,
+        capability_context: CapabilityContext,
+    ) -> str: ...
+
+    def summarize_iteration(
+        self,
+        snapshot: MemorySnapshot,
+        candidate: ExperimentCandidate,
+        outcome: ExperimentOutcome,
+        reflection: ReflectionSummary,
+        review: ReviewDecision,
+        accepted_summary,
+    ) -> str: ...
 
 
 class _LiteLLMJsonBackend:
@@ -149,6 +183,92 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
             config_patch=payload.get("config_patch", {}),
             metadata=payload.get("metadata", {}),
         )
+
+
+CONSULTATION_TRIGGER_TOKENS = (
+    "databricks",
+    "deploy",
+    "deployment",
+    "bundle",
+    "workspace",
+    "warehouse",
+    "catalog",
+    "secret",
+    "token",
+    "auth",
+    "credential",
+    "permission",
+    "environment variable",
+    "env var",
+    "cli",
+    "command",
+    "external service",
+    "service",
+    "job",
+    "cluster",
+    "sdk",
+    "api",
+    "endpoint",
+    "load data",
+    "data access",
+)
+
+
+def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
+    search_space = [
+        snapshot.effective_spec.objective,
+        " ".join(snapshot.effective_spec.allowed_actions),
+        " ".join(snapshot.capability_context.notes),
+        " ".join(snapshot.capability_context.available_data_assets),
+        json.dumps(snapshot.capability_context.environment_facts, sort_keys=True),
+        json.dumps(snapshot.effective_spec.metadata, sort_keys=True),
+    ]
+    haystack = " ".join(part.lower() for part in search_space if part)
+    return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
+
+
+def _inject_consultation(snapshot: MemorySnapshot, consultation: OpsConsultation) -> MemorySnapshot:
+    updated_notes = list(snapshot.capability_context.notes)
+    updated_notes.append(f"Ops consult focus: {consultation.focus}")
+    updated_notes.append(f"Ops consult guidance: {consultation.guidance}")
+    if consultation.commands:
+        updated_notes.append("Suggested commands: " + "; ".join(consultation.commands))
+    if consultation.required_env_vars:
+        updated_notes.append("Required env vars: " + ", ".join(consultation.required_env_vars))
+    if consultation.risks:
+        updated_notes.append("Operational risks: " + "; ".join(consultation.risks))
+    updated_environment_facts = dict(snapshot.capability_context.environment_facts)
+    updated_environment_facts["ops_consultation"] = consultation.to_dict()
+    updated_context = replace(
+        snapshot.capability_context,
+        notes=updated_notes,
+        environment_facts=updated_environment_facts,
+    )
+    return replace(snapshot, capability_context=updated_context)
+
+
+class ConsultingWorkerBackend:
+    def __init__(
+        self,
+        worker_backend: WorkerBackend,
+        consultation_backend: ConsultationBackend | None = None,
+    ) -> None:
+        self.worker_backend = worker_backend
+        self.consultation_backend = consultation_backend
+
+    def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
+        consultation = None
+        delegated_snapshot = snapshot
+        if self.consultation_backend is not None and should_request_ops_consult(snapshot):
+            consultation = self.consultation_backend.consult(snapshot)
+            if consultation.should_consult:
+                delegated_snapshot = _inject_consultation(snapshot, consultation)
+        candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
+        if consultation is None or not consultation.should_consult:
+            return candidate
+        merged_metadata = dict(candidate.metadata)
+        merged_metadata["ops_consultation"] = consultation.to_dict()
+        return replace(candidate, metadata=merged_metadata)
 
 
 class LiteLLMSpecBackend(_LiteLLMJsonBackend):
@@ -259,6 +379,78 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
         )
 
 
+class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
+    def consult(self, snapshot: MemorySnapshot) -> OpsConsultation:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are a specialist operations consult agent. "
+                "Help the primary coding agent with external services, CLI workflows, environment variables, "
+                "deployment steps, data access setup, and authentication issues. "
+                "Give concise, concrete guidance without taking ownership of the main task."
+            ),
+            payload={
+                "effective_spec": snapshot.effective_spec.to_dict(),
+                "capability_context": snapshot.capability_context.to_dict(),
+                "recent_human_interventions": [item.to_dict() for item in snapshot.recent_human_interventions],
+                "best_summary": snapshot.best_summary.to_dict() if snapshot.best_summary is not None else None,
+                "instructions": {
+                    "return_fields": [
+                        "focus",
+                        "guidance",
+                        "commands",
+                        "required_env_vars",
+                        "risks",
+                        "should_consult",
+                    ],
+                    "behavior": [
+                        "Prioritize exact operational steps.",
+                        "Call out missing credentials, env vars, or permissions explicitly.",
+                        "Prefer bounded commands over long prose.",
+                    ],
+                },
+            },
+        )
+        return OpsConsultation.from_dict(payload)
+
+
+class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
+    def build_access_guide(
+        self,
+        user_goal: str,
+        capability_context: CapabilityContext,
+        preflight_checks,
+    ) -> AccessGuide:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are the access and permissions advisor for an experimentation runtime. "
+                "Your job is to determine what credentials, permissions, environment variables, and commands "
+                "a human needs in order to run safely. Write a direct markdown playbook that another coding "
+                "agent can follow without improvising."
+            ),
+            payload={
+                "user_goal": user_goal,
+                "capability_context": capability_context.to_dict(),
+                "preflight_checks": [item.to_dict() for item in preflight_checks],
+                "instructions": {
+                    "return_fields": [
+                        "summary",
+                        "required_env_vars",
+                        "required_permissions",
+                        "commands",
+                        "steps",
+                        "markdown",
+                    ],
+                    "behavior": [
+                        "Be direct and operational.",
+                        "Separate env vars, permissions, and commands.",
+                        "If access is blocked, say exactly what is missing.",
+                    ],
+                },
+            },
+        )
+        return AccessGuide.from_dict(payload)
+
+
 class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
     def reflect(
         self,
@@ -317,4 +509,69 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
             reason=payload["reason"],
             should_update_memory=payload.get("should_update_memory", True),
         )
+
+
+class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
+    def summarize_bootstrap(
+        self,
+        turn: BootstrapTurn,
+        capability_context: CapabilityContext,
+    ) -> str:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are the human-facing narrator for an experimentation runtime. "
+                "Explain progress clearly and concisely so a human can follow what the system is doing."
+            ),
+            payload={
+                "assistant_message": turn.assistant_message,
+                "proposal": turn.proposal.to_dict(),
+                "role_models": turn.role_models.to_dict(),
+                "preflight_checks": [item.to_dict() for item in turn.preflight_checks],
+                "ready_to_start": turn.ready_to_start,
+                "missing_requirements": turn.missing_requirements,
+                "capability_context": capability_context.to_dict(),
+                "instructions": {
+                    "return_fields": ["message"],
+                    "style": [
+                        "Write for a human following the run.",
+                        "Mention blockers, next steps, and why they matter.",
+                        "Keep it concise.",
+                    ],
+                },
+            },
+        )
+        return payload["message"]
+
+    def summarize_iteration(
+        self,
+        snapshot: MemorySnapshot,
+        candidate: ExperimentCandidate,
+        outcome: ExperimentOutcome,
+        reflection: ReflectionSummary,
+        review: ReviewDecision,
+        accepted_summary,
+    ) -> str:
+        payload = self._complete_json(
+            system_prompt=(
+                "You are the human-facing narrator for an experimentation runtime. "
+                "Summarize what just happened, what changed, whether it was trusted, and what comes next."
+            ),
+            payload={
+                "effective_spec": snapshot.effective_spec.to_dict(),
+                "candidate": candidate.to_dict(),
+                "outcome": outcome.to_dict(),
+                "reflection": reflection.to_dict(),
+                "review": review.to_dict(),
+                "accepted_summary": accepted_summary.to_dict() if accepted_summary is not None else None,
+                "instructions": {
+                    "return_fields": ["message"],
+                    "style": [
+                        "Write for a human operator.",
+                        "Include the decision and the practical implication.",
+                        "Keep it concise.",
+                    ],
+                },
+            },
+        )
+        return payload["message"]
 

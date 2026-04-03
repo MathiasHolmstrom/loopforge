@@ -7,6 +7,7 @@ Loopforge is a provider-agnostic experimentation runtime for repeated agent-driv
 - Runs a fresh worker for each iteration
 - Separates raw records from accepted memory
 - Supports reflection and review agents
+- Uses Codex-style primary roles by default, with Claude-style support for ops guidance and human-facing narration
 - Lets humans interject with structured overrides
 - Keeps domain execution behind adapters or handler factories
 - Can draft an initial experiment spec by proposing primary, secondary, and guardrail metrics from discovered scorer metadata
@@ -17,6 +18,7 @@ Loopforge is a provider-agnostic experimentation runtime for repeated agent-driv
 
 - `loopforge.core`: schemas, memory, orchestrator, LiteLLM backends
 - `loopforge.bootstrap`: zero-config bootstrap API with default OpenAI role assignment and adapter preflight checks
+- `loopforge.bootstrap`: zero-config bootstrap API with Codex-primary defaults, Claude ops consultation, and generated access guides
 - `loopforge.cli`: start from a plain-language goal, draft a spec, run the loop from a JSON spec, or append a human intervention
 
 ## CLI
@@ -24,6 +26,7 @@ Loopforge is a provider-agnostic experimentation runtime for repeated agent-driv
 ```bash
 loopforge start --message "Improve fraud recall without breaking precision"
 loopforge start --message "Improve fraud recall without breaking precision" --executor-factory package.module:factory
+loopforge start --message "Deploy the Databricks training flow" --model-profile codex_with_claude_support
 loopforge draft-spec --objective "Improve fraud recall without breaking precision" --memory-root .memory --executor-factory package.module:factory --planner-model openai/gpt-5.4
 loopforge run --spec spec.json --memory-root .memory --executor-factory package.module:factory --worker-model openai/gpt-5.4
 loopforge interject --memory-root .memory --message "Focus on slice analysis next" --effects-json '{"force_next_action": "eda"}'
@@ -46,8 +49,27 @@ If the bootstrap agent still needs clarification, `result["status"]` will be `ne
 - a recommended experiment spec
 - required clarifying questions
 - preflight checks for memory, data access, and permissions
+- a Claude-written `ops_access_guide.md` under the memory root when access, auth, env vars, or permissions need direct operator steps
 
 Once the required questions are answered and preflight checks pass, `start()` initializes memory and runs the loop.
+
+## Default Role Behavior
+
+The default profile is `codex_with_claude_support`:
+
+- `planner`, `worker`, `reflection`, `review`: `openai/gpt-5.4`
+- `consultation`: `anthropic/claude-sonnet-4-5`
+- `narrator`: `anthropic/claude-sonnet-4-5`
+
+That means Codex-style models own spec formation, experiment proposals, reflection, and review. Claude-style models are reserved for:
+
+- external-service and CLI consultation
+- permissions and environment-variable guidance
+- direct human-readable updates and summaries
+
+You can override the profile or any individual role from the CLI with `--model-profile`, `--consultation-model`, and `--narrator-model`.
+
+Autonomous execution is blocked unless execution-level preflight checks pass. Discovery alone is not enough. If an adapter can identify likely datasets, jobs, or permissions but cannot verify access through `preflight_provider`, Loopforge keeps `status="needs_input"` and reports a blocking `autonomous_execution_permissions` failure.
 
 ## Auto Adapter
 
@@ -68,3 +90,5 @@ Adapters can expose repo-specific scorer metadata through `AdapterSetup.discover
 - supporting secondary metrics
 - guardrail metrics with explicit constraints
 - follow-up questions when the user needs to confirm a calculation variant or custom scorer function
+
+`PreflightCheck` entries can be scoped to bootstrap or execution. In practice, `start()` only proceeds when required execution-scope checks pass, so unattended loops do not begin in environments that still depend on human approval or missing credentials.

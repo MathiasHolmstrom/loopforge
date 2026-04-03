@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from loopforge.bootstrap import (
+    DEFAULT_MODEL_PROFILE,
     DEFAULT_OPENAI_MODEL,
     Loopforge,
     discover_capabilities_for_objective,
@@ -31,13 +32,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--spec", required=True, help="Path to a JSON experiment spec.")
     run_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory and summaries.")
     run_parser.add_argument("--executor-factory", required=True, help="Import path package.module:function_name")
+    run_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
     run_parser.add_argument(
         "--worker-model",
-        default=DEFAULT_OPENAI_MODEL,
+        default=None,
         help="LiteLLM model id for the worker agent.",
     )
     run_parser.add_argument("--reflection-model", help="LiteLLM model id for the reflection agent.")
     run_parser.add_argument("--review-model", help="LiteLLM model id for the review agent.")
+    run_parser.add_argument("--consultation-model", help="LiteLLM model id for the operations consult agent.")
+    run_parser.add_argument("--narrator-model", help="LiteLLM model id for the human-facing narrator agent.")
     run_parser.add_argument("--iterations", type=int, default=None, help="Override max iterations for this run.")
     run_parser.add_argument("--temperature", type=float, default=0.2)
 
@@ -59,10 +63,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--repo-root", default=".", help="Repository root to scan when auto-synthesizing.")
     start_parser.add_argument("--memory-root", default=".loopforge", help="Directory used for loop memory.")
     start_parser.add_argument("--executor-factory", help="Import path package.module:function_name")
-    start_parser.add_argument("--planner-model", default=DEFAULT_OPENAI_MODEL)
-    start_parser.add_argument("--worker-model", default=DEFAULT_OPENAI_MODEL)
+    start_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
+    start_parser.add_argument("--planner-model", default=None)
+    start_parser.add_argument("--worker-model", default=None)
     start_parser.add_argument("--reflection-model")
     start_parser.add_argument("--review-model")
+    start_parser.add_argument("--consultation-model")
+    start_parser.add_argument("--narrator-model")
     start_parser.add_argument("--answers-json", default="{}")
     start_parser.add_argument("--iterations", type=int, default=None)
     start_parser.add_argument("--temperature", type=float, default=0.2)
@@ -81,25 +88,35 @@ def run_from_spec(
     spec_path: Path | str,
     memory_root: Path | str,
     executor_factory_path: str,
-    worker_model: str,
+    worker_model: str | None,
     reflection_model: str | None = None,
     review_model: str | None = None,
+    consultation_model: str | None = None,
+    narrator_model: str | None = None,
+    model_profile: str = DEFAULT_MODEL_PROFILE,
     iterations: int | None = None,
     temperature: float = 0.2,
 ) -> list[dict[str, Any]]:
     spec = ExperimentSpec.from_dict(json.loads(Path(spec_path).read_text(encoding="utf-8")))
-    app = Loopforge(
-        executor_factory_path=executor_factory_path,
-        memory_root=memory_root,
-        planner_model=default_role_models(
-            planner_model=worker_model,
-            worker_model=worker_model,
-            reflection_model=reflection_model,
-            review_model=review_model,
-        ).planner,
+    role_models = default_role_models(
+        planner_model=worker_model,
         worker_model=worker_model,
         reflection_model=reflection_model,
         review_model=review_model,
+        consultation_model=consultation_model,
+        narrator_model=narrator_model,
+        profile=model_profile,
+    )
+    app = Loopforge(
+        executor_factory_path=executor_factory_path,
+        memory_root=memory_root,
+        model_profile=model_profile,
+        planner_model=role_models.planner,
+        worker_model=role_models.worker,
+        reflection_model=role_models.reflection,
+        review_model=role_models.review,
+        consultation_model=role_models.consultation,
+        narrator_model=role_models.narrator,
         temperature=temperature,
     )
     memory_store = FileMemoryStore(memory_root)
@@ -118,6 +135,7 @@ def run_from_spec(
         executor=RoutingExperimentExecutor(handlers=handlers),
         reflection_backend=app.reflection_backend,
         review_backend=app.review_backend,
+        narrator_backend=app.narrator_backend,
         capability_provider=capability_provider,
     )
     orchestrator.initialize(spec=spec)
@@ -127,6 +145,7 @@ def run_from_spec(
             "accepted_summary": (
                 cycle_result.accepted_summary.to_dict() if cycle_result.accepted_summary is not None else None
             ),
+            "human_update": cycle_result.human_update,
         }
         for cycle_result in orchestrator.run(iterations=iterations)
     ]
@@ -194,6 +213,9 @@ def main(argv: list[str] | None = None) -> int:
             worker_model=args.worker_model,
             reflection_model=args.reflection_model,
             review_model=args.review_model,
+            consultation_model=args.consultation_model,
+            narrator_model=args.narrator_model,
+            model_profile=args.model_profile,
             iterations=args.iterations,
             temperature=args.temperature,
         )
@@ -218,10 +240,13 @@ def main(argv: list[str] | None = None) -> int:
             executor_factory_path=args.executor_factory,
             repo_root=args.repo_root,
             memory_root=args.memory_root,
+            model_profile=args.model_profile,
             planner_model=args.planner_model,
             worker_model=args.worker_model,
             reflection_model=args.reflection_model,
             review_model=args.review_model,
+            consultation_model=args.consultation_model,
+            narrator_model=args.narrator_model,
             temperature=args.temperature,
         )
         result = app.start(

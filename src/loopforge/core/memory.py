@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from loopforge.core.types import (
+    AgentUpdate,
     CapabilityContext,
     ExperimentSpec,
     HumanIntervention,
@@ -23,6 +24,7 @@ class FileMemoryStore:
         self._best_result_path = self.root / "best_result.json"
         self._records_path = self.root / "iteration_records.jsonl"
         self._summaries_path = self.root / "iteration_summaries.jsonl"
+        self._updates_path = self.root / "agent_updates.jsonl"
         self._human_notes_path = self.root / "human_notes.jsonl"
         self._lessons_path = self.root / "lessons_learned.md"
         self._artifact_index_path = self._artifacts_dir / "index.json"
@@ -35,6 +37,7 @@ class FileMemoryStore:
         for path, default_contents in [
             (self._records_path, ""),
             (self._summaries_path, ""),
+            (self._updates_path, ""),
             (self._human_notes_path, ""),
             (self._lessons_path, ""),
             (self._artifact_index_path, "[]\n"),
@@ -88,6 +91,10 @@ class FileMemoryStore:
         with self._human_notes_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(intervention.to_dict(), sort_keys=True) + "\n")
 
+    def append_agent_update(self, update: AgentUpdate) -> None:
+        with self._updates_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(update.to_dict(), sort_keys=True) + "\n")
+
     def _read_records(self) -> list[IterationRecord]:
         if not self._records_path.exists():
             return []
@@ -112,6 +119,15 @@ class FileMemoryStore:
         return [
             HumanIntervention.from_dict(json.loads(line))
             for line in self._human_notes_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+    def read_agent_updates(self) -> list[AgentUpdate]:
+        if not self._updates_path.exists():
+            return []
+        return [
+            AgentUpdate.from_dict(json.loads(line))
+            for line in self._updates_path.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
 

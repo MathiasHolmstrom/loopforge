@@ -2,9 +2,10 @@
 
 from typing import Protocol
 
-from loopforge.core.backends import ReflectionBackend, ReviewBackend, WorkerBackend
+from loopforge.core.backends import NarrationBackend, ReflectionBackend, ReviewBackend, WorkerBackend
 from loopforge.core.memory import FileMemoryStore
 from loopforge.core.types import (
+    AgentUpdate,
     CapabilityContext,
     ExperimentCandidate,
     ExperimentOutcome,
@@ -47,6 +48,7 @@ class ExperimentOrchestrator:
         executor: RoutingExperimentExecutor,
         reflection_backend: ReflectionBackend,
         review_backend: ReviewBackend,
+        narrator_backend: NarrationBackend | None = None,
         capability_provider=None,
         summary_window: int = 5,
         human_window: int = 10,
@@ -56,6 +58,7 @@ class ExperimentOrchestrator:
         self.executor = executor
         self.reflection_backend = reflection_backend
         self.review_backend = review_backend
+        self.narrator_backend = narrator_backend
         self.capability_provider = capability_provider
         self.summary_window = summary_window
         self.human_window = human_window
@@ -85,7 +88,24 @@ class ExperimentOrchestrator:
             self.memory_store.append_accepted_summary(accepted_summary)
             if accepted_summary.result == "improved":
                 self.memory_store.write_best_summary(accepted_summary)
-        return IterationCycleResult(record=record, accepted_summary=accepted_summary)
+        human_update = None
+        if self.narrator_backend is not None:
+            human_update = self.narrator_backend.summarize_iteration(
+                snapshot=snapshot,
+                candidate=candidate,
+                outcome=outcome,
+                reflection=reflection,
+                review=review,
+                accepted_summary=accepted_summary,
+            )
+            self.memory_store.append_agent_update(
+                AgentUpdate(
+                    stage="iteration",
+                    iteration_id=record.iteration_id,
+                    message=human_update,
+                )
+            )
+        return IterationCycleResult(record=record, accepted_summary=accepted_summary, human_update=human_update)
 
     def run(self, iterations: int | None = None) -> list[IterationCycleResult]:
         snapshot = self._load_snapshot()

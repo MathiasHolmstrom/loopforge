@@ -10,6 +10,7 @@ IterationResult = Literal["improved", "regressed", "inconclusive"]
 ReviewStatus = Literal["accepted", "rejected", "pending_human"]
 HumanInterventionType = Literal["note", "override", "hypothesis"]
 PreflightStatus = Literal["passed", "warning", "failed"]
+PreflightScope = Literal["bootstrap", "execution"]
 
 
 @dataclass(frozen=True)
@@ -271,6 +272,54 @@ class ReflectionSummary:
 
 
 @dataclass(frozen=True)
+class OpsConsultation:
+    focus: str
+    guidance: str
+    commands: list[str] = field(default_factory=list)
+    required_env_vars: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+    should_consult: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "OpsConsultation":
+        return cls(
+            focus=payload["focus"],
+            guidance=payload["guidance"],
+            commands=payload.get("commands", []),
+            required_env_vars=payload.get("required_env_vars", []),
+            risks=payload.get("risks", []),
+            should_consult=payload.get("should_consult", True),
+        )
+
+
+@dataclass(frozen=True)
+class AccessGuide:
+    summary: str
+    required_env_vars: list[str] = field(default_factory=list)
+    required_permissions: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    steps: list[str] = field(default_factory=list)
+    markdown: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "AccessGuide":
+        return cls(
+            summary=payload["summary"],
+            required_env_vars=payload.get("required_env_vars", []),
+            required_permissions=payload.get("required_permissions", []),
+            commands=payload.get("commands", []),
+            steps=payload.get("steps", []),
+            markdown=payload.get("markdown", ""),
+        )
+
+
+@dataclass(frozen=True)
 class ReviewDecision:
     status: ReviewStatus
     reason: str
@@ -398,6 +447,7 @@ class IterationRecord:
 class IterationCycleResult:
     record: IterationRecord
     accepted_summary: IterationSummary | None
+    human_update: str | None = None
 
 
 @dataclass(frozen=True)
@@ -455,6 +505,8 @@ class RoleModelConfig:
     worker: str
     reflection: str
     review: str
+    consultation: str
+    narrator: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -466,6 +518,8 @@ class RoleModelConfig:
             worker=payload["worker"],
             reflection=payload["reflection"],
             review=payload["review"],
+            consultation=payload.get("consultation", payload["worker"]),
+            narrator=payload.get("narrator", payload.get("reflection", payload["worker"])),
         )
 
 
@@ -475,6 +529,7 @@ class PreflightCheck:
     status: PreflightStatus
     detail: str
     required: bool = True
+    scope: PreflightScope = "execution"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -486,6 +541,7 @@ class PreflightCheck:
             status=payload["status"],
             detail=payload["detail"],
             required=payload.get("required", True),
+            scope=payload.get("scope", "execution"),
         )
 
 
@@ -497,6 +553,8 @@ class BootstrapTurn:
     preflight_checks: list[PreflightCheck] = field(default_factory=list)
     ready_to_start: bool = False
     missing_requirements: list[str] = field(default_factory=list)
+    human_update: str | None = None
+    access_guide_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -506,6 +564,8 @@ class BootstrapTurn:
             "preflight_checks": [item.to_dict() for item in self.preflight_checks],
             "ready_to_start": self.ready_to_start,
             "missing_requirements": self.missing_requirements,
+            "human_update": self.human_update,
+            "access_guide_path": self.access_guide_path,
         }
 
     @classmethod
@@ -517,6 +577,26 @@ class BootstrapTurn:
             preflight_checks=[PreflightCheck.from_dict(item) for item in payload.get("preflight_checks", [])],
             ready_to_start=payload.get("ready_to_start", False),
             missing_requirements=payload.get("missing_requirements", []),
+            human_update=payload.get("human_update"),
+            access_guide_path=payload.get("access_guide_path"),
+        )
+
+
+@dataclass(frozen=True)
+class AgentUpdate:
+    stage: str
+    message: str
+    iteration_id: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "AgentUpdate":
+        return cls(
+            stage=payload["stage"],
+            message=payload["message"],
+            iteration_id=payload.get("iteration_id"),
         )
 
 

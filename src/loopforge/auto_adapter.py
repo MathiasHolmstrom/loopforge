@@ -148,6 +148,7 @@ def _preflight_provider(spec, capability_context):
                 "Loopforge synthesized an adapter scaffold from repo inspection, but action handlers are still "
                 "placeholders. Fill in the generated adapter module before execution."
             ),
+            scope="execution",
         )
     ]
     for asset in capability_context.available_data_assets:
@@ -156,11 +157,12 @@ def _preflight_provider(spec, capability_context):
                 checks.append(
                     PreflightCheck(
                         name=f"asset:{{asset}}",
-                        status="passed",
-                        detail=f"Discovered repo path exists: {{asset_path}}",
-                        required=False,
-                    )
+                    status="passed",
+                    detail=f"Discovered repo path exists: {{asset_path}}",
+                    required=False,
+                    scope="bootstrap",
                 )
+            )
     return checks
 
 
