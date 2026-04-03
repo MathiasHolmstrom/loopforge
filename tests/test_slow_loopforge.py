@@ -25,19 +25,27 @@ from tests.support import (
 )
 
 pytestmark = pytest.mark.slow
-def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_with_real_subprocess(tmp_path) -> None:
+
+
+def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_with_real_subprocess(
+    tmp_path,
+) -> None:
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
     class StubBootstrapBackend:
-        def propose_bootstrap_turn(self, user_goal, capability_context, answer_history=None, role_models=None):
+        def propose_bootstrap_turn(
+            self, user_goal, capability_context, answer_history=None, role_models=None
+        ):
             return BootstrapTurn(
                 assistant_message="Generic executor is ready.",
                 proposal=ExperimentSpecProposal(
                     objective=user_goal,
                     recommended_spec=ExperimentSpec(
                         objective=user_goal,
-                        primary_metric=PrimaryMetric(name="ordinal_loss", goal="minimize"),
+                        primary_metric=PrimaryMetric(
+                            name="ordinal_loss", goal="minimize"
+                        ),
                         allowed_actions=["run_experiment", "fix_failure"],
                         stop_conditions={"max_iterations": 1},
                     ),
@@ -51,7 +59,9 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
             self.calls: list[tuple[int, str]] = []
             self.model = "anthropic/claude-opus-4-6-v1"
 
-        def fix_execution_plan(self, candidate, failed_step_index, failure_summary, step_results):
+        def fix_execution_plan(
+            self, candidate, failed_step_index, failure_summary, step_results
+        ):
             self.calls.append((failed_step_index, failure_summary))
             return [
                 ExecutionStep(
@@ -106,8 +116,12 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
         consultation_backend=FakeConsultationBackend(),
         access_advisor_backend=FakeAccessAdvisorBackend(),
         narrator_backend=FakeNarrationBackend(),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Recovered.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Recovered.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         progress_fn=lambda stage, msg: progress_log.append((stage, msg)),
     )
     app.execution_fix_backend = fix_backend
@@ -122,8 +136,14 @@ def test_loopforge_generic_executor_recovers_from_socketpair_permission_error_wi
     attempts = outcome["execution_details"]["attempts"]
     assert len(attempts) == 2
     assert attempts[0]["success"] is False
-    assert "self._ssock, self._csock = socket.socketpair()" in attempts[0]["step_results"][1]["stderr"]
+    assert (
+        "self._ssock, self._csock = socket.socketpair()"
+        in attempts[0]["step_results"][1]["stderr"]
+    )
     assert "asyncio\\proactor_events.py" in attempts[0]["step_results"][1]["stderr"]
     assert attempts[1]["success"] is True
-    assert any("[anthropic/claude-opus-4-6-v1] Step 2 failed" in message for _, message in progress_log)
+    assert any(
+        "[anthropic/claude-opus-4-6-v1] Step 2 failed" in message
+        for _, message in progress_log
+    )
     assert any("Revised plan with 2 step(s)" in message for _, message in progress_log)

@@ -5,7 +5,13 @@ import sys
 
 import pytest
 
-from loopforge import CapabilityContext, ExecutionStep, PrimaryMetric, ReflectionSummary, ReviewDecision
+from loopforge import (
+    CapabilityContext,
+    ExecutionStep,
+    PrimaryMetric,
+    ReflectionSummary,
+    ReviewDecision,
+)
 from loopforge.cli import main
 from tests.support import (
     build_adapter_setup,

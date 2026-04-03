@@ -25,5 +25,4 @@ repos:
         args: [--fix, --exit-non-zero-on-fix]
         stages: [pre-push]
       - id: ruff-format
-        args: [--check]
         stages: [pre-push]
