@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 import subprocess
@@ -181,9 +180,15 @@ def _describe_inline_python(command: str) -> str:
     if args is None:
         return "run inline Python"
     code = args[args.index("-c") + 1].lower()
-    if any(token in code for token in ("exists(", "is_file(", "is_dir(", "pathlib.path", "resolve(")):
+    if any(
+        token in code
+        for token in ("exists(", "is_file(", "is_dir(", "pathlib.path", "resolve(")
+    ):
         return "check file/path with inline Python"
-    if any(token in code for token in ("read_parquet", "read_csv", "read_json", "read_pickle")):
+    if any(
+        token in code
+        for token in ("read_parquet", "read_csv", "read_json", "read_pickle")
+    ):
         return "inspect data with inline Python"
     if "metric_results" in code or "primary_metric" in code:
         return "emit metric payload via inline Python"
@@ -244,9 +249,7 @@ def _replace_first_python_script(command: str, new_script_path: str) -> str:
     return pattern.sub(replacement, command, count=1)
 
 
-def _planned_python_paths(
-    steps: list[ExecutionStep], repo_root: Path
-) -> list[Path]:
+def _planned_python_paths(steps: list[ExecutionStep], repo_root: Path) -> list[Path]:
     planned: list[Path] = []
     for step in steps:
         if step.kind not in {"write_file", "append_file"} or not step.path:
@@ -291,7 +294,9 @@ def _local_fast_repair_missing_script(
     else:
         planned_paths = _planned_python_paths(current_steps, repo_root)
         basename_matches = [
-            path for path in planned_paths if path.name.lower() == missing_script.name.lower()
+            path
+            for path in planned_paths
+            if path.name.lower() == missing_script.name.lower()
         ]
         if len(basename_matches) == 1:
             replacement_target = basename_matches[0]
@@ -518,8 +523,12 @@ def _metric_name_aliases(spec: ExperimentSpec) -> dict[str, str]:
             if not isinstance(candidate, str) or not candidate.strip():
                 continue
             aliases.setdefault(_normalise_metric_name(candidate), metric.name)
-    aliases.setdefault(_normalise_metric_name("primary_metric"), spec.primary_metric.name)
-    aliases.setdefault(_normalise_metric_name("primary metric"), spec.primary_metric.name)
+    aliases.setdefault(
+        _normalise_metric_name("primary_metric"), spec.primary_metric.name
+    )
+    aliases.setdefault(
+        _normalise_metric_name("primary metric"), spec.primary_metric.name
+    )
     return aliases
 
 
@@ -688,18 +697,15 @@ def _extract_metric_payload_from_text(
             name, _, value = candidate.partition(separator)
             metric_name = name.strip()
             resolved_name = _resolve_metric_name(metric_name, spec)
-            if (
-                resolved_name is None
-                and _normalise_metric_name(metric_name)
-                != _normalise_metric_name("primary_metric_value")
-            ):
+            if resolved_name is None and _normalise_metric_name(
+                metric_name
+            ) != _normalise_metric_name("primary_metric_value"):
                 continue
             numeric = _coerce_float(value)
             if numeric is None:
                 continue
-            if (
-                _normalise_metric_name(metric_name)
-                == _normalise_metric_name("primary_metric_value")
+            if _normalise_metric_name(metric_name) == _normalise_metric_name(
+                "primary_metric_value"
             ):
                 return {
                     "metric_results": metric_results,
@@ -1075,7 +1081,9 @@ class GenericExecutionPlanExecutor:
     def _metrics_required_for_success(
         candidate: ExperimentCandidate, snapshot: MemorySnapshot
     ) -> bool:
-        return bool(candidate.execution_steps) and is_generic_autonomous(snapshot=snapshot)
+        return bool(candidate.execution_steps) and is_generic_autonomous(
+            snapshot=snapshot
+        )
 
     @staticmethod
     def _build_metricless_failure(
@@ -1088,7 +1096,9 @@ class GenericExecutionPlanExecutor:
         primary_metric_name = snapshot.effective_spec.primary_metric.name
         latest_stdout_preview = ""
         if step_results:
-            latest_stdout_preview = str(step_results[-1].get("stdout", "")).strip()[:500]
+            latest_stdout_preview = str(step_results[-1].get("stdout", "")).strip()[
+                :500
+            ]
         notes = [
             "Execution steps completed, but the runtime could not capture the configured metrics from stdout."
         ]
@@ -1191,7 +1201,9 @@ class GenericExecutionPlanExecutor:
             if not valid:
                 return ExperimentOutcome(
                     status="recoverable_failure",
-                    notes=[f"Execution plan pre-validation failed at step {failed_idx}."],
+                    notes=[
+                        f"Execution plan pre-validation failed at step {failed_idx}."
+                    ],
                     failure_type="InvalidExecutionPlan",
                     failure_summary=reason,
                     recoverable=True,
@@ -1237,9 +1249,8 @@ class GenericExecutionPlanExecutor:
                     metric_payload["metric_results"]
                     or metric_payload["primary_metric_value"] is not None
                 )
-                if (
-                    not metrics_captured
-                    and self._metrics_required_for_success(candidate, snapshot)
+                if not metrics_captured and self._metrics_required_for_success(
+                    candidate, snapshot
                 ):
                     failure_outcome = self._build_metricless_failure(
                         candidate=candidate,
@@ -1258,7 +1269,8 @@ class GenericExecutionPlanExecutor:
                             candidate,
                             current_steps,
                             len(step_results),
-                            failure_outcome.failure_summary or "Metrics were not reported",
+                            failure_outcome.failure_summary
+                            or "Metrics were not reported",
                             step_results,
                             attempt + 1,
                         )

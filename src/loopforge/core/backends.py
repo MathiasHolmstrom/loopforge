@@ -1,11 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import threading
 import time
 from collections.abc import Mapping
 from datetime import date, datetime
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -298,6 +297,7 @@ class _LiteLLMJsonBackend:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
+
         def run() -> str:
             if self._stream_fn and self._completion_fn is None:
                 return self._stream_completion(messages)
@@ -340,6 +340,7 @@ class _LiteLLMJsonBackend:
                 ),
             },
         ]
+
         def run() -> dict[str, Any]:
             if self._stream_fn and self._completion_fn is None:
                 try:
@@ -978,8 +979,8 @@ class BaselineFirstWorkerBackend:
                     kind="shell",
                     command=(
                         f'"{python_executable}" -c "from pathlib import Path; '
-                        f'p=Path(r\'{safe_path}\'); '
-                        'print(p.read_text(encoding=\'utf-8\')[:2000])"'
+                        f"p=Path(r'{safe_path}'); "
+                        "print(p.read_text(encoding='utf-8')[:2000])\""
                     ),
                     cwd=repo_root,
                     timeout_seconds=30,
@@ -1127,7 +1128,7 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "suggested_answer",
                         "options",
                     ],
-                "behavior": [
+                    "behavior": [
                         "Think like a skilled data scientist. Derive metrics, guardrails, and experiment design "
                         "from the objective and repo context. Don't ask the user to confirm what they already told you.",
                         "Start by grounding on the current implementation described in capability_context. "
@@ -1383,7 +1384,9 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                 metric.setdefault("scorer_ref", repo_meta["scorer_ref"])
             return metric
 
-        patched_spec["primary_metric"] = enrich(dict(recommended_spec["primary_metric"]))
+        patched_spec["primary_metric"] = enrich(
+            dict(recommended_spec["primary_metric"])
+        )
         patched_spec["secondary_metrics"] = [
             enrich(dict(metric))
             for metric in recommended_spec.get("secondary_metrics", [])
@@ -1841,4 +1844,3 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             f"Outcome: {outcome.status}."
         )
         return self._coerce_message(payload, fallback=fallback)
-

@@ -1143,9 +1143,7 @@ def _compact_capability_context_for_metric_repair(
             ranked_metrics.append((score, name, meta))
 
     ranked_metrics.sort(key=lambda item: (-item[0], item[1]))
-    compact_metrics = {
-        name: meta for _, name, meta in ranked_metrics[:limit]
-    }
+    compact_metrics = {name: meta for _, name, meta in ranked_metrics[:limit]}
     if not compact_metrics:
         compact_metrics = dict(list(metric_catalog.items())[:limit])
 
@@ -1183,7 +1181,9 @@ def _infer_local_execution_confidence(
         and (
             _looks_like_local_asset_path(target)
             or target.endswith(".py")
-            or target.startswith(("scripts/", "src/", "sports_predictions_orchestrator/"))
+            or target.startswith(
+                ("scripts/", "src/", "sports_predictions_orchestrator/")
+            )
         )
     ]
     if local_action_paths:
@@ -1460,6 +1460,7 @@ def refine_bootstrap_questions(
 ) -> list[SpecQuestion]:
     """Remove internal implementation questions but keep all domain questions the agent proposed."""
     return sanitise_bootstrap_questions(questions)
+
 
 class Loopforge:
     def __init__(
@@ -1851,7 +1852,8 @@ class Loopforge:
             return patched_spec
 
         self.progress_fn(
-            "fix_metrics", "Inferring incomplete metric details from planning context..."
+            "fix_metrics",
+            "Inferring incomplete metric details from planning context...",
         )
         compact_context = _compact_capability_context_for_metric_repair(
             objective=patched_spec.objective,

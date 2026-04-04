@@ -218,10 +218,12 @@ def _ready_plan_signature(turn: BootstrapTurn) -> str:
         "objective": turn.proposal.recommended_spec.objective,
         "primary_metric": turn.proposal.recommended_spec.primary_metric.to_dict(),
         "secondary_metrics": [
-            metric.to_dict() for metric in turn.proposal.recommended_spec.secondary_metrics
+            metric.to_dict()
+            for metric in turn.proposal.recommended_spec.secondary_metrics
         ],
         "guardrail_metrics": [
-            metric.to_dict() for metric in turn.proposal.recommended_spec.guardrail_metrics
+            metric.to_dict()
+            for metric in turn.proposal.recommended_spec.guardrail_metrics
         ],
         "allowed_actions": list(turn.proposal.recommended_spec.allowed_actions),
         "human_update": turn.human_update,
@@ -302,7 +304,9 @@ def _print_plan_summary(turn, *, print_fn=print) -> None:
         f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}"
     )
     if operator_guidance:
-        latest_guidance = _sanitize_human_text(" ".join(str(operator_guidance[-1]).split()))
+        latest_guidance = _sanitize_human_text(
+            " ".join(str(operator_guidance[-1]).split())
+        )
         if len(latest_guidance) > 120:
             latest_guidance = latest_guidance[:117] + "..."
         print_fn(f"  Guidance   : {latest_guidance}")

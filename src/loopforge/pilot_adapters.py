@@ -179,7 +179,9 @@ def _lol_preflight(repo_root: Path) -> list[PreflightCheck]:
 
 def _lol_capability_context(repo_root: Path) -> CapabilityContext:
     data_asset = repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet"
-    pipeline_example = repo_root / "examples" / "lol" / "pipeline_transformer_example.py"
+    pipeline_example = (
+        repo_root / "examples" / "lol" / "pipeline_transformer_example.py"
+    )
     ordinal_baseline = repo_root / "experiments" / "lol_kills_autonomous_baseline.py"
     empirical_bayes = repo_root / "experiments" / "lol_kills_empirical_bayes.py"
     end_to_end_test = repo_root / "tests" / "end_to_end" / "test_lol_player_kills.py"
