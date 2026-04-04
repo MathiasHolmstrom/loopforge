@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from loopforge import CapabilityContext, ExecutionStep, ExperimentCandidate, MemorySnapshot
+from loopforge import (
+    CapabilityContext,
+    ExecutionStep,
+    ExperimentCandidate,
+    MemorySnapshot,
+)
 from tests.support import build_spec
 
 
@@ -47,7 +52,7 @@ def test_generic_execution_plan_executor_rejects_plan_that_ignores_baseline_cont
             ),
             ExecutionStep(
                 kind="shell",
-                command='python scratch/new_model.py',
+                command="python scratch/new_model.py",
                 cwd=str(tmp_path),
             ),
         ],

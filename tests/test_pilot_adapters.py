@@ -34,4 +34,3 @@ def test_loopforge_does_not_prefer_builtin_lol_adapter_by_default(tmp_path) -> N
 
     assert resolution.kind == "planning_only"
     assert resolution.factory_path is None
-

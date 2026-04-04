@@ -39,10 +39,15 @@ def test_memory_store_load_snapshot_applies_human_interventions_and_markdown_mem
 
     assert snapshot.effective_spec.allowed_actions == ["train"]
     assert snapshot.effective_spec.metadata["force_next_action"] == "train"
-    assert any(note.path == "agent_markdown/execution_runbook.md" for note in snapshot.markdown_memory)
+    assert any(
+        note.path == "agent_markdown/execution_runbook.md"
+        for note in snapshot.markdown_memory
+    )
 
 
-def test_memory_store_initialize_reset_state_clears_records_and_best_summary(tmp_path) -> None:
+def test_memory_store_initialize_reset_state_clears_records_and_best_summary(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "memory")
     spec = build_spec()
     store.initialize(spec)
@@ -88,4 +93,3 @@ def test_memory_store_initialize_reset_state_clears_records_and_best_summary(tmp
     assert snapshot.recent_records == []
     assert snapshot.recent_summaries == []
     assert snapshot.best_summary is None
-

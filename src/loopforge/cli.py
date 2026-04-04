@@ -18,6 +18,7 @@ from loopforge.bootstrap import (
     run_preflight_checks,
 )
 from loopforge.core import (
+    BootstrapTurn,
     CapabilityContext,
     ExperimentInterrupted,
     ExperimentSpec,

@@ -27,7 +27,9 @@ def test_apply_bootstrap_execution_contract_enforces_baseline_reuse_from_operato
     None
 ):
     spec = build_spec(
-        metadata={"operator_guidance": ["keep the existing framework and copy the script"]}
+        metadata={
+            "operator_guidance": ["keep the existing framework and copy the script"]
+        }
     )
     capability_context = CapabilityContext(
         environment_facts={"baseline_code_paths": ["src/train.py"]}
@@ -59,4 +61,3 @@ def test_resolve_repo_root_from_objective_prefers_named_child_repo(tmp_path) -> 
     )
 
     assert resolved == target
-

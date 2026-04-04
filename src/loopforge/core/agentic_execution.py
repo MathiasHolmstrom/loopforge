@@ -245,7 +245,10 @@ def _replace_first_python_script(command: str, new_script_path: str) -> str:
         (?:"[^"]+\.py"|'[^']+\.py'|[^\s&|]+\.py)
         """
     )
-    replacement = lambda match: f'{match.group("prefix")}"{new_script_path}"'
+
+    def replacement(match: re.Match[str]) -> str:
+        return f'{match.group("prefix")}"{new_script_path}"'
+
     return pattern.sub(replacement, command, count=1)
 
 
@@ -279,7 +282,7 @@ def _local_fast_repair_missing_script(
         return None
     missing_script = Path(scripts[0])
     try:
-        workdir = _ensure_within_repo(_step_workdir(failed_step, repo_root), repo_root)
+        _ensure_within_repo(_step_workdir(failed_step, repo_root), repo_root)
     except Exception:
         return None
 

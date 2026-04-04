@@ -105,4 +105,3 @@ def test_litellm_backend_passes_max_completion_tokens_to_completion_fn() -> None
     worker.propose_next_experiment(snapshot)
 
     assert captured_kwargs["max_completion_tokens"] == 321
-

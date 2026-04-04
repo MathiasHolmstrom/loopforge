@@ -6,7 +6,12 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from loopforge.core.types import BootstrapTurn, CapabilityContext, ExperimentSpec, PreflightCheck
+from loopforge.core.types import (
+    BootstrapTurn,
+    CapabilityContext,
+    ExperimentSpec,
+    PreflightCheck,
+)
 
 
 EXISTING_FRAMEWORK_HINT_TOKENS = (
@@ -87,14 +92,6 @@ def apply_bootstrap_execution_contract(
     answer_summary: str,
 ) -> ExperimentSpec:
     metadata = dict(spec.metadata)
-    bootstrap_answers = {
-        **dict(metadata.get("bootstrap_answers", {})),
-        **{
-            str(key): value
-            for key, value in (answers or {}).items()
-            if value not in (None, "")
-        },
-    }
     operator_guidance = normalise_text_list(metadata.get("operator_guidance", []))
     baseline_paths = normalise_text_list(
         capability_context.environment_facts.get("baseline_code_paths", [])
@@ -126,8 +123,12 @@ def build_bootstrap_handoff(
         if value not in (None, ""):
             bootstrap_answers[str(key)] = value
     operator_guidance = normalise_text_list(metadata.get("operator_guidance", []))
-    planner_notes = [str(note).strip() for note in turn.proposal.notes if str(note).strip()]
-    capability_notes = [str(note).strip() for note in capability_context.notes if str(note).strip()]
+    planner_notes = [
+        str(note).strip() for note in turn.proposal.notes if str(note).strip()
+    ]
+    capability_notes = [
+        str(note).strip() for note in capability_context.notes if str(note).strip()
+    ]
     baseline_paths = normalise_text_list(
         capability_context.environment_facts.get("baseline_code_paths", [])
     )
@@ -136,7 +137,8 @@ def build_bootstrap_handoff(
         "# Bootstrap Handoff",
         "",
         "## Planner Summary",
-        turn.assistant_message.strip() or "Bootstrap completed without an explicit summary.",
+        turn.assistant_message.strip()
+        or "Bootstrap completed without an explicit summary.",
         "",
         "## Binding Execution Intent",
         f"- Objective: {spec.objective}",

@@ -14,9 +14,9 @@ from loopforge import (
 from tests.support import FakeReflectionBackend, FakeReviewBackend, build_spec
 
 
-def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(tmp_path) -> (
-    None
-):
+def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "memory")
     spec = build_spec(
         allowed_actions=["run_experiment"],
@@ -39,7 +39,9 @@ def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(tmp_
                 action_type="run_experiment",
                 change_type="baseline",
                 instructions="Run baseline.",
-                execution_steps=[ExecutionStep(kind="shell", command="python src/train.py")],
+                execution_steps=[
+                    ExecutionStep(kind="shell", command="python src/train.py")
+                ],
             )
 
         def continue_experiment(self, snapshot, previous_candidate, previous_outcome):
@@ -55,8 +57,12 @@ def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(tmp_
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor({}, plan_executor=Executor()),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="No metrics.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="No metrics.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         capability_provider=lambda spec: CapabilityContext(
             environment_facts={"execution_backend_kind": "generic_agentic"}
         ),
@@ -95,7 +101,9 @@ def test_orchestrator_does_not_attempt_same_iteration_repair_in_baseline_first_p
                 action_type="run_experiment",
                 change_type="baseline",
                 instructions="Run baseline.",
-                execution_steps=[ExecutionStep(kind="shell", command="python src/train.py")],
+                execution_steps=[
+                    ExecutionStep(kind="shell", command="python src/train.py")
+                ],
             )
 
         def continue_experiment(self, snapshot, previous_candidate, previous_outcome):
@@ -115,8 +123,12 @@ def test_orchestrator_does_not_attempt_same_iteration_repair_in_baseline_first_p
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor({}, plan_executor=Executor()),
-        reflection_backend=FakeReflectionBackend([ReflectionSummary(assessment="Failed.")]),
-        review_backend=FakeReviewBackend([ReviewDecision(status="accepted", reason="ok")]),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Failed.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
         capability_provider=lambda spec: CapabilityContext(
             environment_facts={"execution_backend_kind": "generic_agentic"}
         ),
