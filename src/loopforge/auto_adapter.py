@@ -168,6 +168,31 @@ def _extract_column_refs(tree: ast.AST) -> set[str]:
     return {c for c in columns if _looks_like_column(c)}
 
 
+def _extract_metric_symbol_usages(tree: ast.AST) -> set[str]:
+    symbols: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imported_name = alias.asname or alias.name
+                if any(token in imported_name.lower() for token in METRIC_TOKENS):
+                    symbols.add(imported_name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                imported_name = alias.asname or alias.name.split(".")[-1]
+                if any(token in imported_name.lower() for token in METRIC_TOKENS):
+                    symbols.add(imported_name)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            func_name = None
+            if isinstance(func, ast.Name):
+                func_name = func.id
+            elif isinstance(func, ast.Attribute):
+                func_name = func.attr
+            if func_name and any(token in func_name.lower() for token in METRIC_TOKENS):
+                symbols.add(func_name)
+    return symbols
+
+
 def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     metrics: dict[str, dict[str, Any]] = {}
@@ -202,6 +227,8 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
                 node, (ast.FunctionDef, ast.AsyncFunctionDef)
             ) and _is_candidate_action_name(name):
                 _record_symbol(name, path, root, actions)
+        for metric_name in _extract_metric_symbol_usages(tree):
+            _record_symbol(metric_name, path, root, metrics)
         # Extract column references from data manipulation code
         cols = _extract_column_refs(tree)
         if cols:

@@ -1,9 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
+import threading
+import time
 from collections.abc import Mapping
 from datetime import date, datetime
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Protocol
 
 from loopforge.core.types import (
@@ -16,7 +19,6 @@ from loopforge.core.types import (
     ExperimentSpecProposal,
     ExperimentOutcome,
     MemorySnapshot,
-    OpsConsultation,
     RoleModelConfig,
     ReflectionSummary,
     RunnerAuthoringRequest,
@@ -33,7 +35,7 @@ from loopforge.core.runtime import is_generic_autonomous
 DATA_SCIENCE_METRICS_REASONING = (
     "HOW TO THINK ABOUT EXPERIMENT DESIGN:\n"
     "\n"
-    "You are a skilled data scientist. Derive answers from the objective — don't ask the user "
+    "You are a skilled data scientist. Derive answers from the objective â€” don't ask the user "
     "to confirm what they already told you.\n"
     "\n"
     "1. PRIMARY METRIC: The user's objective directly implies it. "
@@ -44,7 +46,7 @@ DATA_SCIENCE_METRICS_REASONING = (
     "The key test: 'If I change the model to improve the primary metric, could this other metric get worse?' "
     "If yes, it's a guardrail. If no causal connection exists, ignore it.\n"
     "\n"
-    "Key pattern — the COMPLEMENT RULE: when optimizing for a subset (e.g. bench players), "
+    "Key pattern â€” the COMPLEMENT RULE: when optimizing for a subset (e.g. bench players), "
     "the complement subset's performance (e.g. starters) is naturally a guardrail, because "
     "model changes that help one group can hurt the other. The aggregate (overall) follows from the subsets.\n"
     "\n"
@@ -58,7 +60,7 @@ DATA_SCIENCE_METRICS_REASONING = (
     "4. METRIC GOAL DIRECTION: For every metric you propose, you MUST explicitly set goal to 'minimize' or 'maximize'. "
     "Reason from what the metric actually measures: if a perfect prediction yields 0 and worse predictions yield "
     "higher values, that is minimize. If a perfect prediction yields 1.0 and worse predictions yield lower, "
-    "that is maximize. Never leave goal unspecified or assume a default — there is no safe default. "
+    "that is maximize. Never leave goal unspecified or assume a default â€” there is no safe default. "
     "Think about the metric's semantics, not just its name.\n"
     "\n"
     "5. DON'T ASK WHAT YOU CAN DERIVE: "
@@ -66,7 +68,27 @@ DATA_SCIENCE_METRICS_REASONING = (
     "If the complement subset is obvious, make it a guardrail. "
     "If a column can be derived from existing data, propose the derivation. "
     "If a metric from the repo has no causal connection to your changes, exclude it silently. "
+    "Make a qualified guess when the objective and repo context make one path much more plausible than the others. "
     "Only ask when there is genuine ambiguity you cannot resolve from the objective and repo context."
+)
+
+EXISTING_IMPLEMENTATION_GROUNDING = (
+    "GROUNDING IN THE CURRENT IMPLEMENTATION:\n"
+    "\n"
+    "Before you propose changes, identify the current baseline implementation from the capability context. "
+    "Treat capability_context notes, environment facts, file paths, and discovered actions as the current source of truth.\n"
+    "\n"
+    "If the repo context already names baseline files, model types, scorers, feature generators, or CV strategy, "
+    "use that information directly in your reasoning. Do not ask the user to tell you what model currently exists "
+    "when the repo context already answers it.\n"
+    "\n"
+    "When the objective is to improve an existing model, anchor your proposal on how that model works today: "
+    "what target formulation it uses, which features it builds, which utilities it reuses, and how it is evaluated. "
+    "Do not defer this basic inspection to a future worker if the current repo context already contains it.\n"
+    "\n"
+    "Prefer extending or adapting the existing pipeline over inventing a brand-new formulation. "
+    "If you believe the current baseline should change from regression to ordinal/distribution or classification-like modeling, "
+    "justify that change by referencing the existing implementation and adjacent repo patterns rather than guessing.\n"
 )
 
 
@@ -103,10 +125,6 @@ class ReflectionBackend(Protocol):
         candidate: ExperimentCandidate,
         outcome: ExperimentOutcome,
     ) -> ReflectionSummary: ...
-
-
-class ConsultationBackend(Protocol):
-    def consult(self, snapshot: MemorySnapshot) -> OpsConsultation: ...
 
 
 class AccessAdvisorBackend(Protocol):
@@ -158,14 +176,33 @@ class _LiteLLMJsonBackend:
         model: str,
         completion_fn: Any | None = None,
         temperature: float = 0.2,
+        max_completion_tokens: int | None = None,
         extra_kwargs: dict[str, Any] | None = None,
         stream_fn: StreamFn | None = None,
+        progress_fn: ProgressFn | None = None,
+        heartbeat_seconds: float | None = None,
+        heartbeat_schedule_seconds: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0),
     ) -> None:
         self.model = model
         self.temperature = temperature
         self.extra_kwargs = extra_kwargs or {}
+        self.max_completion_tokens = max_completion_tokens
         self._completion_fn = completion_fn
         self._stream_fn = stream_fn
+        self._progress_fn: ProgressFn = progress_fn or _noop_progress
+        self._heartbeat_seconds = heartbeat_seconds
+        self._heartbeat_schedule_seconds = tuple(heartbeat_schedule_seconds)
+
+    def _completion_kwargs(self, **overrides: Any) -> dict[str, Any]:
+        kwargs = dict(self.extra_kwargs)
+        if (
+            self.max_completion_tokens is not None
+            and "max_completion_tokens" not in kwargs
+            and "max_tokens" not in kwargs
+        ):
+            kwargs["max_completion_tokens"] = self.max_completion_tokens
+        kwargs.update(overrides)
+        return kwargs
 
     def _stream_completion(self, messages: list[dict[str, str]], **kwargs: Any) -> str:
         """Call litellm with stream=True, emitting tokens via stream_fn."""
@@ -176,8 +213,7 @@ class _LiteLLMJsonBackend:
             messages=messages,
             temperature=self.temperature,
             stream=True,
-            **kwargs,
-            **self.extra_kwargs,
+            **self._completion_kwargs(**kwargs),
         )
         chunks: list[str] = []
         assert self._stream_fn is not None
@@ -195,29 +231,102 @@ class _LiteLLMJsonBackend:
         self._stream_fn("\n")
         return "".join(chunks)
 
-    def _complete_text(self, system_prompt: str, user_message: str) -> str:
-        """Lightweight text completion — no JSON parsing, just a plain response."""
+    def _run_with_progress(
+        self,
+        *,
+        progress_stage: str | None,
+        progress_label: str | None,
+        fn,
+    ):
+        if not progress_stage or not progress_label:
+            return fn()
+        stop_event = threading.Event()
+        started_at = time.monotonic()
+
+        def heartbeat() -> None:
+            tick = 0
+            if self._heartbeat_seconds is not None:
+                if self._heartbeat_seconds <= 0:
+                    return
+                while not stop_event.wait(self._heartbeat_seconds):
+                    tick += 1
+                    elapsed = int(time.monotonic() - started_at)
+                    self._progress_fn(
+                        f"{progress_stage}_wait_{tick}",
+                        f"[{self.model}] Still {progress_label.lower()} ({elapsed}s elapsed)...",
+                    )
+                return
+
+            checkpoints = self._heartbeat_schedule_seconds or (15.0, 30.0, 60.0, 120.0)
+            checkpoint_index = 0
+            next_target = checkpoints[0]
+            repeat_interval = checkpoints[-1]
+            while True:
+                remaining = max(0.0, next_target - (time.monotonic() - started_at))
+                if stop_event.wait(remaining):
+                    return
+                tick += 1
+                elapsed = int(time.monotonic() - started_at)
+                self._progress_fn(
+                    f"{progress_stage}_wait_{tick}",
+                    f"[{self.model}] Still {progress_label.lower()} ({elapsed}s elapsed)...",
+                )
+                checkpoint_index += 1
+                if checkpoint_index < len(checkpoints):
+                    next_target = checkpoints[checkpoint_index]
+                else:
+                    next_target += repeat_interval
+
+        thread = threading.Thread(target=heartbeat, daemon=True)
+        thread.start()
+        try:
+            return fn()
+        finally:
+            stop_event.set()
+            thread.join(timeout=0.01)
+
+    def _complete_text(
+        self,
+        system_prompt: str,
+        user_message: str,
+        *,
+        progress_stage: str | None = None,
+        progress_label: str | None = None,
+    ) -> str:
+        """Lightweight text completion â€” no JSON parsing, just a plain response."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
         ]
-        if self._stream_fn and self._completion_fn is None:
-            return self._stream_completion(messages)
-        completion_fn = self._completion_fn
-        if completion_fn is None:
-            from litellm import completion as litellm_completion
+        def run() -> str:
+            if self._stream_fn and self._completion_fn is None:
+                return self._stream_completion(messages)
+            completion_fn = self._completion_fn
+            if completion_fn is None:
+                from litellm import completion as litellm_completion
 
-            completion_fn = litellm_completion
-        response = completion_fn(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            **self.extra_kwargs,
+                completion_fn = litellm_completion
+            response = completion_fn(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                **self._completion_kwargs(),
+            )
+            return self._extract_content(response)
+
+        return self._run_with_progress(
+            progress_stage=progress_stage,
+            progress_label=progress_label,
+            fn=run,
         )
-        return self._extract_content(response)
 
     def _complete_json(
-        self, system_prompt: str, payload: dict[str, Any]
+        self,
+        system_prompt: str,
+        payload: dict[str, Any],
+        *,
+        progress_stage: str | None = None,
+        progress_label: str | None = None,
     ) -> dict[str, Any]:
         messages = [
             {
@@ -231,24 +340,38 @@ class _LiteLLMJsonBackend:
                 ),
             },
         ]
-        if self._stream_fn and self._completion_fn is None:
-            content = self._stream_completion(
-                messages, response_format={"type": "json_object"}
-            )
-            return json.loads(content)
-        completion_fn = self._completion_fn
-        if completion_fn is None:
-            from litellm import completion as litellm_completion
+        def run() -> dict[str, Any]:
+            if self._stream_fn and self._completion_fn is None:
+                try:
+                    content = self._stream_completion(
+                        messages, response_format={"type": "json_object"}
+                    )
+                    return json.loads(content)
+                except Exception:
+                    if progress_stage and progress_label:
+                        self._progress_fn(
+                            f"{progress_stage}_stream_fallback",
+                            f"[{self.model}] Streaming raw output is unavailable while {progress_label.lower()}; falling back to the standard response path.",
+                        )
+            completion_fn = self._completion_fn
+            if completion_fn is None:
+                from litellm import completion as litellm_completion
 
-            completion_fn = litellm_completion
-        response = completion_fn(
-            model=self.model,
-            messages=messages,
-            temperature=self.temperature,
-            response_format={"type": "json_object"},
-            **self.extra_kwargs,
+                completion_fn = litellm_completion
+            response = completion_fn(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature,
+                response_format={"type": "json_object"},
+                **self._completion_kwargs(),
+            )
+            return json.loads(self._extract_content(response))
+
+        return self._run_with_progress(
+            progress_stage=progress_stage,
+            progress_label=progress_label,
+            fn=run,
         )
-        return json.loads(self._extract_content(response))
 
     @staticmethod
     def _json_default(value: Any) -> Any:
@@ -298,6 +421,7 @@ class _LiteLLMJsonBackend:
 def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
     allowed_actions = list(snapshot.effective_spec.allowed_actions)
     generic_autonomous = is_generic_autonomous(snapshot=snapshot)
+    first_iteration = not snapshot.recent_records
     forced_next_action = snapshot.effective_spec.metadata.get("force_next_action")
     if forced_next_action not in allowed_actions:
         forced_next_action = None
@@ -323,6 +447,8 @@ def build_iteration_policy(snapshot: MemorySnapshot) -> dict[str, Any]:
         "name": "guided_observation",
         "allowed_actions": allowed_actions,
         "generic_autonomous": generic_autonomous,
+        "first_iteration": first_iteration,
+        "prefer_smallest_runnable_script": generic_autonomous and first_iteration,
         "must_finish_current_iteration_with_metrics_or_block": generic_autonomous,
         "recent_failures": [
             {
@@ -354,19 +480,52 @@ def _has_markdown_name(snapshot: MemorySnapshot, filename: str) -> bool:
     return _markdown_content_by_name(snapshot, filename) is not None
 
 
+def _worker_markdown_handoff(
+    snapshot: MemorySnapshot, *, iteration_policy: dict[str, Any]
+) -> list[dict[str, Any]]:
+    notes = [item.to_dict() for item in snapshot.markdown_memory]
+    if not (
+        iteration_policy.get("generic_autonomous")
+        and iteration_policy.get("first_iteration")
+    ):
+        return notes
+    preferred_suffixes = (
+        "bootstrap_handoff.md",
+        "execution_runbook.md",
+        "experiment_guide.md",
+        "ops_access_guide.md",
+    )
+    filtered = [
+        note
+        for note in notes
+        if isinstance(note.get("path"), str)
+        and note["path"].endswith(preferred_suffixes)
+    ]
+    return filtered or notes
+
+
 def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
     env = snapshot.capability_context.environment_facts
+    metadata = (
+        snapshot.effective_spec.metadata
+        if isinstance(snapshot.effective_spec.metadata, dict)
+        else {}
+    )
     return {
         "repo_root": env.get("repo_root"),
         "execution_shell": env.get("execution_shell"),
         "shell_family": env.get("shell_family"),
         "python_executable": env.get("python_executable"),
         "execution_backend_kind": env.get("execution_backend_kind"),
+        "execution_contract": metadata.get("execution_contract"),
         "verified_execution_lane": bool(env.get("python_executable"))
         and bool(env.get("repo_root")),
         "must_reuse_verified_lane": True,
         "available_bootstrap_handoff_files": sorted(
             item.path for item in snapshot.markdown_memory
+        ),
+        "bootstrap_handoff": _markdown_content_by_name(
+            snapshot, "bootstrap_handoff.md"
         ),
         "execution_runbook": _markdown_content_by_name(
             snapshot, "execution_runbook.md"
@@ -378,6 +537,17 @@ def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
 class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
     @staticmethod
     def _candidate_from_payload(payload: dict[str, Any]) -> ExperimentCandidate:
+        metadata = payload.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        for source_key, target_key in (
+            ("observation_summary", "observation_summary"),
+            ("reasoning_summary", "reasoning_summary"),
+            ("next_step_summary", "next_step_summary"),
+        ):
+            value = payload.get(source_key)
+            if isinstance(value, str) and value.strip() and target_key not in metadata:
+                metadata[target_key] = value.strip()
         return ExperimentCandidate(
             hypothesis=payload["hypothesis"],
             action_type=payload["action_type"],
@@ -388,7 +558,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 for step in payload.get("execution_steps", [])
             ],
             config_patch=payload.get("config_patch", {}),
-            metadata=payload.get("metadata", {}),
+            metadata=metadata,
         )
 
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
@@ -407,18 +577,32 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "Combine inspection, code writing, and execution into ONE iteration's execution_steps. "
                 "For example, a good iteration might: (1) read one key file to understand the API, (2) write a script that loads data/trains/evaluates, (3) run the script. "
                 "All three happen in the same iteration. Do NOT spend an entire iteration just reading files. "
-                "The only exception is the very first iteration when the repo is completely unknown — one initial inspection is acceptable. "
+                "The only exception is the very first iteration when the repo is completely unknown â€” one initial inspection is acceptable. "
                 "After that, every iteration must write and run code that produces measurable results. "
-                "If markdown_memory contains `execution_runbook.md` or `experiment_guide.md`, treat them as the bootstrap handoff for how to run the repo and what to build first. "
+                "For the first generic-autonomous iteration, prefer the smallest runnable script that tests the main path. "
+                "If one script can load the data, fit/evaluate, and print metrics, do that instead of creating helper scaffolding or multiple setup-only commands. "
+                "Prefer one self-contained script run that prints the configured metrics in a machine-readable way on the first attempt. "
+                "If you emit execution_steps without parseable metric output, the runtime will treat the iteration as unfinished and ask for a repair. "
+                "If execution_handoff.bootstrap_handoff, `execution_runbook.md`, or `experiment_guide.md` is present, treat that as the binding bootstrap handoff for how to run the repo and what to build first. "
+                "If the bootstrap handoff names an existing script, framework, or baseline code path, start there instead of inventing a new pipeline. "
+                "If execution_handoff.execution_contract.must_reference_baseline_paths is true, your execution_steps must explicitly inspect, copy, edit, or run one of execution_handoff.execution_contract.baseline_paths before branching into variants. "
                 "Do not ignore that handoff and rediscover the same execution mechanics from scratch unless a concrete execution failure proves the handoff is wrong or incomplete. "
                 "If the runbook says bootstrap already verified a repo root, Python executable, or command shape, reuse that verified lane instead of inventing activation commands, environment setup, or extra cd chains. "
                 "When recovering from a prior failure, your first step must directly address the specific failure_summary and recovery_actions from the latest record. "
                 "Do not repeat the same failing command unchanged. If you want to run a new repo-local script, create it in an earlier write_file step first. "
+                "Do NOT dump entire source files with shell commands like type, cat, head, more, or Get-Content. "
+                "If you need one API detail, use a short Python inspection or inspect it inside the runnable experiment script itself. "
                 "In generic autonomous mode, action_type is a lightweight label. The real work is in execution_steps. "
                 "In generic autonomous mode, an iteration is not complete until it produces the configured primary metric or hits a true non-recoverable blocker. "
                 "Do not return a bare action label without concrete execution_steps. "
                 "Read capability_context.environment_facts before you emit commands. Commands must match the actual execution shell. "
                 "If execution_shell is cmd.exe, do not use Unix tools like head, grep, find -maxdepth, or ls -la. Prefer Python-native scripts or cmd-compatible commands. "
+                "Use timeout_seconds on long-running shell steps when training is expected to take longer than a short diagnostic command. "
+                "Surface concise operator-facing reasoning in metadata. "
+                "Use metadata.observation_summary for what you observed from the repo/data/history, "
+                "metadata.reasoning_summary for why this plan is the next best move, and "
+                "metadata.next_step_summary for what the execution is trying to validate. "
+                "These are short user-visible summaries, not private chain-of-thought. "
                 "Return one bounded experiment that aims to produce metric results.\n\n"
                 + DATA_SCIENCE_METRICS_REASONING
             ),
@@ -439,9 +623,9 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                     item.to_dict() for item in snapshot.recent_human_interventions
                 ],
                 "lessons_learned": snapshot.lessons_learned,
-                "markdown_memory": [
-                    item.to_dict() for item in snapshot.markdown_memory
-                ],
+                "markdown_memory": _worker_markdown_handoff(
+                    snapshot, iteration_policy=iteration_policy
+                ),
                 "iteration_policy": iteration_policy,
                 "next_iteration_id": snapshot.next_iteration_id,
                 "instructions": {
@@ -454,13 +638,22 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                         "config_patch",
                         "metadata",
                     ],
+                    "metadata_fields": [
+                        "observation_summary",
+                        "reasoning_summary",
+                        "next_step_summary",
+                    ],
                     "generic_autonomous_rules": [
                         "execution_steps are required for generic autonomous execution.",
                         "Reuse execution_handoff instead of inventing new activation or cd logic.",
+                        "Treat execution_handoff.bootstrap_handoff as binding repo-specific guidance when present.",
+                        "If execution_handoff.execution_contract.must_reference_baseline_paths is true, explicitly touch one baseline path in execution_steps.",
                         "If a repo-local script does not exist yet, add a write_file step before running it.",
                     ],
                 },
             },
+            progress_stage="worker_propose_llm",
+            progress_label="planning the next experiment",
         )
         payload = self._normalise_candidate_payload(
             payload, snapshot, iteration_policy=iteration_policy
@@ -483,11 +676,16 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "1. Write a script that trains/runs a model using the APIs and data you already inspected. "
                 "2. Evaluate against the configured primary metric and guardrail metrics. "
                 "3. Print the metric results to stdout so the runtime can capture them. "
-                "Do NOT re-inspect files or re-read APIs. Use what you already learned from markdown_memory, especially `execution_runbook.md` and `experiment_guide.md`. "
+                "Return a self-contained continuation that ends with parseable metric output, not another setup-only step. "
+                "Do NOT re-inspect files or re-read APIs. Use what you already learned from markdown_memory, especially `bootstrap_handoff.md`, `execution_runbook.md`, and `experiment_guide.md`. "
+                "If execution_handoff.execution_contract.must_reference_baseline_paths is true, keep the continuation anchored on one of those baseline paths instead of switching to a new from-scratch script. "
                 "Reuse the verified execution lane from the runbook instead of inventing new shell setup or activation steps unless a concrete failure proved the runbook wrong. "
                 "Commands must match capability_context.environment_facts.execution_shell. "
+                "Do NOT dump files with shell commands like type, cat, head, more, or Get-Content. "
                 "If execution_shell is cmd.exe, do not emit Unix tools like head, grep, find -maxdepth, or ls -la. "
-                "Return JSON with: hypothesis, action_type, change_type, instructions, execution_steps."
+                "Return JSON with: hypothesis, action_type, change_type, instructions, execution_steps, metadata. "
+                "Use metadata.observation_summary, metadata.reasoning_summary, and metadata.next_step_summary "
+                "for concise user-visible reasoning updates."
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
@@ -506,13 +704,23 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                         "change_type",
                         "instructions",
                         "execution_steps",
+                        "metadata",
+                    ],
+                    "metadata_fields": [
+                        "observation_summary",
+                        "reasoning_summary",
+                        "next_step_summary",
                     ],
                     "generic_autonomous_rules": [
                         "execution_steps are required.",
                         "Reuse execution_handoff instead of inventing new activation or cd logic.",
+                        "Treat execution_handoff.bootstrap_handoff as binding repo-specific guidance when present.",
+                        "If execution_handoff.execution_contract.must_reference_baseline_paths is true, explicitly touch one baseline path in execution_steps.",
                     ],
                 },
             },
+            progress_stage="worker_continue_llm",
+            progress_label="extending the current iteration",
         )
         payload = self._normalise_candidate_payload(
             payload, snapshot, iteration_policy=build_iteration_policy(snapshot)
@@ -588,7 +796,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         metadata = candidate_payload.get("metadata")
         if not isinstance(metadata, dict):
             candidate_payload["metadata"] = {}
-        # Don't silently replace action_type — let the executor validate and raise if invalid.
+        # Don't silently replace action_type â€” let the executor validate and raise if invalid.
         # The agent's choice should be visible, even if wrong.
         return candidate_payload
 
@@ -604,6 +812,10 @@ class ExecutionFixBackend(Protocol):
 
 
 class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.last_repair_summary: str | None = None
+
     def fix_execution_plan(
         self,
         candidate: ExperimentCandidate,
@@ -625,6 +837,7 @@ class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
                 "Fix ONE concrete blocker at a time: directly address the first failing step, keep the rest of the plan as stable as possible, "
                 "and avoid redesigning the whole iteration unless the failure proves the whole plan is wrong. "
                 "Do NOT change the experiment objective or hypothesis. Only repair the execution plan. "
+                "If the prior execution completed but did not report parseable metrics, revise the final run so it prints a machine-readable metric payload or explicit metric_name=value lines. "
                 "Return JSON with exactly these fields: repair_summary (string) and execution_steps (array of step objects)."
             ),
             payload={
@@ -645,6 +858,14 @@ class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
                     ]
                 },
             },
+            progress_stage="execution_fix_llm",
+            progress_label="repairing the execution plan",
+        )
+        repair_summary = payload.get("repair_summary")
+        self.last_repair_summary = (
+            repair_summary.strip()
+            if isinstance(repair_summary, str) and repair_summary.strip()
+            else None
         )
         raw_steps = payload.get("execution_steps", [])
         if not isinstance(raw_steps, list):
@@ -660,129 +881,32 @@ class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
         return steps
 
 
-CONSULTATION_TRIGGER_TOKENS = (
-    "databricks",
-    "deploy",
-    "deployment",
-    "bundle",
-    "workspace",
-    "warehouse",
-    "catalog",
-    "secret",
-    "token",
-    "auth",
-    "credential",
-    "permission",
-    "environment variable",
-    "env var",
-    "cli",
-    "command",
-    "external service",
-    "service",
-    "job",
-    "cluster",
-    "sdk",
-    "api",
-    "endpoint",
-    "load data",
-    "data access",
-)
-
-
-def should_request_ops_consult(snapshot: MemorySnapshot) -> bool:
-    if snapshot.capability_context.environment_facts.get(
-        "execution_backend_kind"
-    ) == "generic_agentic" and _has_markdown_name(snapshot, "execution_runbook.md"):
-        return False
-    # Only trigger for genuine ops/infra topics — not generic data science work
-    search_space = [
-        snapshot.effective_spec.objective,
-        " ".join(snapshot.effective_spec.allowed_actions),
-        " ".join(snapshot.capability_context.notes),
-        " ".join(snapshot.capability_context.available_data_assets),
-        json.dumps(snapshot.capability_context.environment_facts, sort_keys=True),
-        json.dumps(snapshot.effective_spec.metadata, sort_keys=True),
-    ]
-    haystack = " ".join(part.lower() for part in search_space if part)
-    return any(token in haystack for token in CONSULTATION_TRIGGER_TOKENS)
-
-
-def _inject_consultation(
-    snapshot: MemorySnapshot, consultation: OpsConsultation
-) -> MemorySnapshot:
-    updated_notes = list(snapshot.capability_context.notes)
-    updated_notes.append(f"Helper consult focus: {consultation.focus}")
-    updated_notes.append(f"Helper consult guidance: {consultation.guidance}")
-    updated_notes.append(f"Ops consult focus: {consultation.focus}")
-    updated_notes.append(f"Ops consult guidance: {consultation.guidance}")
-    if consultation.commands:
-        updated_notes.append("Suggested commands: " + "; ".join(consultation.commands))
-    if consultation.required_env_vars:
-        updated_notes.append(
-            "Required env vars: " + ", ".join(consultation.required_env_vars)
-        )
-    if consultation.risks:
-        updated_notes.append("Operational risks: " + "; ".join(consultation.risks))
-    updated_environment_facts = dict(snapshot.capability_context.environment_facts)
-    updated_environment_facts["ops_consultation"] = consultation.to_dict()
-    updated_environment_facts["helper_consultation"] = consultation.to_dict()
-    updated_context = replace(
-        snapshot.capability_context,
-        notes=updated_notes,
-        environment_facts=updated_environment_facts,
-    )
-    return replace(snapshot, capability_context=updated_context)
-
-
-class ConsultingWorkerBackend:
+class BaselineFirstWorkerBackend:
     def __init__(
         self,
         worker_backend: WorkerBackend,
-        consultation_backend: ConsultationBackend | None = None,
         progress_fn: ProgressFn | None = None,
-        helper_label: str = "helper",
     ) -> None:
         self.worker_backend = worker_backend
-        self.consultation_backend = consultation_backend
         self.progress_fn: ProgressFn = progress_fn or _noop_progress
-        self.helper_label = helper_label
+
+    @property
+    def model(self) -> str | None:
+        return getattr(self.worker_backend, "model", None)
+
+    @property
+    def max_completion_tokens(self) -> int | None:
+        return getattr(self.worker_backend, "max_completion_tokens", None)
 
     def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
-        consultation = None
-        delegated_snapshot = snapshot
-        if self.consultation_backend is not None and should_request_ops_consult(
-            snapshot
-        ):
+        candidate = self._build_baseline_candidate(snapshot)
+        if candidate is not None:
             self.progress_fn(
-                "helper_consult",
-                f"[{self.helper_label}] Codex is asking helper agent for advice...",
+                "baseline_first",
+                "Using deterministic baseline-first execution plan from bootstrap contract.",
             )
-            try:
-                consultation = self.consultation_backend.consult(snapshot)
-            except Exception as exc:
-                consultation = OpsConsultation(
-                    focus="ops consultation unavailable",
-                    guidance=f"Consultation backend failed: {exc}",
-                    should_consult=False,
-                )
-            if (
-                consultation.should_consult
-                and consultation.guidance.strip()
-                and "unavailable" not in consultation.guidance.lower()
-                and "no concrete guidance" not in consultation.guidance.lower()
-            ):
-                self.progress_fn(
-                    "helper_consult_detail", self._format_consultation(consultation)
-                )
-            if consultation.should_consult:
-                delegated_snapshot = _inject_consultation(snapshot, consultation)
-        candidate = self.worker_backend.propose_next_experiment(delegated_snapshot)
-        if consultation is None or not consultation.should_consult:
             return candidate
-        merged_metadata = dict(candidate.metadata)
-        merged_metadata["ops_consultation"] = consultation.to_dict()
-        merged_metadata["helper_consultation"] = consultation.to_dict()
-        return replace(candidate, metadata=merged_metadata)
+        return self.worker_backend.propose_next_experiment(snapshot)
 
     def continue_experiment(
         self,
@@ -795,20 +919,96 @@ class ConsultingWorkerBackend:
         )
 
     @staticmethod
-    def _format_consultation(consultation: OpsConsultation) -> str:
-        lines = [
-            f"  Focus      : {consultation.focus}",
-            f"  Guidance   : {consultation.guidance}",
+    def _build_baseline_candidate(
+        snapshot: MemorySnapshot,
+    ) -> ExperimentCandidate | None:
+        metadata = (
+            snapshot.effective_spec.metadata
+            if isinstance(snapshot.effective_spec.metadata, dict)
+            else {}
+        )
+        contract = metadata.get("execution_contract")
+        if not isinstance(contract, dict):
+            return None
+        if not contract.get("must_reference_baseline_paths"):
+            return None
+        if snapshot.latest_summary is not None or snapshot.recent_records:
+            return None
+        baseline_paths = [
+            str(item).strip()
+            for item in contract.get("baseline_paths", [])
+            if str(item).strip()
         ]
-        if consultation.commands:
-            lines.append(f"  Commands   : {' ; '.join(consultation.commands[:3])}")
-        if consultation.required_env_vars:
-            lines.append(
-                f"  Env        : {', '.join(consultation.required_env_vars[:5])}"
+        if not baseline_paths:
+            return None
+        baseline_path = baseline_paths[0]
+        env = snapshot.capability_context.environment_facts
+        python_executable = str(env.get("python_executable") or "python")
+        repo_root = str(env.get("repo_root") or ".")
+        action_type = (
+            "run_experiment"
+            if "run_experiment" in snapshot.effective_spec.allowed_actions
+            else (
+                snapshot.effective_spec.allowed_actions[0]
+                if snapshot.effective_spec.allowed_actions
+                else "run_experiment"
             )
-        if consultation.risks:
-            lines.append(f"  Risks      : {' ; '.join(consultation.risks[:3])}")
-        return "\n".join(lines)
+        )
+        baseline_suffix = Path(baseline_path).suffix.lower()
+        if baseline_suffix == ".py":
+            execution_steps = [
+                ExecutionStep(
+                    kind="shell",
+                    command=f'"{python_executable}" "{baseline_path}"',
+                    cwd=repo_root,
+                    timeout_seconds=120,
+                    rationale=(
+                        "Baseline-first contract: run the existing baseline path before inventing variants."
+                    ),
+                )
+            ]
+            instructions = (
+                f"Run the existing baseline script at {baseline_path} exactly as the first iteration. "
+                "Do not create a new standalone pipeline before this baseline path has been exercised."
+            )
+        else:
+            safe_path = baseline_path.replace("\\", "\\\\").replace('"', '\\"')
+            execution_steps = [
+                ExecutionStep(
+                    kind="shell",
+                    command=(
+                        f'"{python_executable}" -c "from pathlib import Path; '
+                        f'p=Path(r\'{safe_path}\'); '
+                        'print(p.read_text(encoding=\'utf-8\')[:2000])"'
+                    ),
+                    cwd=repo_root,
+                    timeout_seconds=30,
+                    rationale=(
+                        "Baseline-first contract: inspect the existing baseline artifact before proposing changes."
+                    ),
+                )
+            ]
+            instructions = (
+                f"Inspect the existing baseline artifact at {baseline_path} first. "
+                "Do not branch into a new implementation before grounding on that baseline path."
+            )
+        return ExperimentCandidate(
+            hypothesis=(
+                f"Reproduce or ground on the existing baseline path {baseline_path} before any new experimentation."
+            ),
+            action_type=action_type,
+            change_type="baseline_reuse",
+            instructions=instructions,
+            execution_steps=execution_steps,
+            metadata={
+                "observation_summary": f"Bootstrap identified baseline path {baseline_path}.",
+                "reasoning_summary": (
+                    "The first iteration is deterministic to enforce reuse of the existing framework."
+                ),
+                "next_step_summary": f"Exercise baseline path {baseline_path} before broader experimentation.",
+                "baseline_first_contract": True,
+            },
+        )
 
 
 class LiteLLMSpecBackend(_LiteLLMJsonBackend):
@@ -852,6 +1052,8 @@ class LiteLLMSpecBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="runner_author_llm",
+            progress_label="authoring the repo-specific runner",
         )
         raw_notes = payload.get("notes", [])
         if isinstance(raw_notes, str):
@@ -885,6 +1087,8 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                 "confirm metric choices with the user. "
                 "Ask only the highest-value remaining questions, recommend a concrete experiment spec, "
                 "and set ready_to_start=true only when the spec is specific enough to begin execution.\n\n"
+                + EXISTING_IMPLEMENTATION_GROUNDING
+                + "\n"
                 + DATA_SCIENCE_METRICS_REASONING
             ),
             payload={
@@ -910,10 +1114,10 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                     ],
                     "CRITICAL_recommended_spec_rules": [
                         "The recommended_spec JSON is what drives execution. Describing metrics in assistant_message "
-                        "is NOT enough — you MUST populate the actual JSON fields.",
+                        "is NOT enough â€” you MUST populate the actual JSON fields.",
                         "primary_metric MUST have 'name' (string, the actual metric/scorer name) and 'goal' ('minimize' or 'maximize').",
                         "guardrail_metrics MUST be an array of metric objects, each with 'name' and 'goal'.",
-                        "DO NOT leave primary_metric as an empty object — fill in the name and goal you decided on.",
+                        "DO NOT leave primary_metric as an empty object â€” fill in the name and goal you decided on.",
                     ],
                     "question_fields": [
                         "key",
@@ -923,17 +1127,24 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "suggested_answer",
                         "options",
                     ],
-                    "behavior": [
+                "behavior": [
                         "Think like a skilled data scientist. Derive metrics, guardrails, and experiment design "
                         "from the objective and repo context. Don't ask the user to confirm what they already told you.",
+                        "Start by grounding on the current implementation described in capability_context. "
+                        "If the repo context already names the baseline model, scorer, feature pipeline, or code paths, "
+                        "reference that directly instead of asking the user what exists.",
+                        "Use the user's initial instruction as a binding constraint, then refine it with repo evidence. "
+                        "If the user says the model already exists in this repo and asks you to inspect it, do that mentally from the repo context before asking follow-up questions.",
+                        "Prefer a qualified guess over a clarifying question when the repo evidence points strongly in one direction. "
+                        "Reserve questions for cases where multiple materially different execution paths remain plausible.",
                         "You have creative freedom to suggest new metrics, evaluation approaches, or analysis "
-                        "strategies based on your domain expertise — as long as you explain your reasoning.",
+                        "strategies based on your domain expertise â€” as long as you explain your reasoning.",
                         "Use prior run memory (summaries, lessons, markdown memory) to avoid repeating mistakes.",
                         "Only ask a question when there is genuine ambiguity you cannot resolve yourself. "
                         "Keep questions minimal, concrete, and high-value.",
                         "Be direct. If you can't find what the user asked for, say so plainly and ask. "
                         "Don't discuss unrelated things that happen to exist in the repo.",
-                        "Don't explain obvious decisions. If you excluded an irrelevant metric, just exclude it — "
+                        "Don't explain obvious decisions. If you excluded an irrelevant metric, just exclude it â€” "
                         "don't write a note saying 'I intentionally excluded X because...'. The user already knows.",
                         "Ask at most ONE required question per turn. Don't bundle multiple questions or generate "
                         "fallback alternatives ('do you want X instead?') alongside the primary question. "
@@ -941,6 +1152,8 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="bootstrap_plan_llm",
+            progress_label="drafting the experiment plan",
         )
         proposal_payload = self._normalise_bootstrap_proposal(
             payload.get("proposal"),
@@ -979,6 +1192,10 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                 "It must expose real handlers, a discovery_provider or capability_provider, and a preflight_provider. "
                 "Do not generate placeholders or NotImplementedError stubs. "
                 "Do not intentionally block in preflight. Build the best runnable baseline path you can from the repo. "
+                "Ground the runner in the existing implementation described in request.capability_context. "
+                "If baseline files, feature generators, scorers, or model patterns are already identified there, "
+                "reuse and adapt them instead of inventing a disconnected pipeline. "
+                "When improving an existing model, start from the current code path and keep feature engineering on the repo's existing tooling stack. "
                 "If request.bootstrap_answers contains high-level user hints about the data source or execution environment, "
                 "use them to resolve the integration details yourself rather than asking for exact internal paths. "
                 "Prefer baseline/eda/slice_analysis/targeted_tune actions over raw helper function names."
@@ -1003,6 +1220,8 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="runner_author_llm",
+            progress_label="authoring the repo-specific runner",
         )
         return RunnerAuthoringResult.from_dict(payload)
 
@@ -1016,7 +1235,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a senior data scientist writing a concise experiment guide for a worker agent "
                 "that will execute this experiment. The worker has never seen the repo or the user conversation. "
-                "Write only what the worker needs to get started. Be specific — include file paths, function names, "
+                "Write only what the worker needs to get started. Be specific â€” include file paths, function names, "
                 "column names, and code patterns. No preamble."
             ),
             user_message=json.dumps(
@@ -1038,6 +1257,8 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                 },
                 indent=2,
             ),
+            progress_stage="experiment_guide_llm",
+            progress_label="writing the experiment guide",
         )
 
     @staticmethod
@@ -1064,7 +1285,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             or not recommended_spec.get("objective", "").strip()
         ):
             recommended_spec["objective"] = proposal_payload["objective"]
-        # Normalise metrics — structural only, never inject domain decisions
+        # Normalise metrics â€” structural only, never inject domain decisions
         recommended_spec["primary_metric"] = (
             LiteLLMBootstrapBackend._normalise_metric_payload(
                 recommended_spec.get("primary_metric"),
@@ -1078,7 +1299,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             LiteLLMBootstrapBackend._normalise_metric_payload(metric_payload)
             for metric_payload in recommended_spec.get("guardrail_metrics", [])
         ]
-        # Normalise allowed_actions — keep what the agent proposed
+        # Normalise allowed_actions â€” keep what the agent proposed
         allowed_actions = recommended_spec.get("allowed_actions", [])
         if not isinstance(allowed_actions, list):
             allowed_actions = [str(allowed_actions)] if allowed_actions else []
@@ -1101,7 +1322,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                         merged_actions.append(action)
                 normalized_actions = merged_actions
         recommended_spec["allowed_actions"] = normalized_actions
-        # Structural defaults — empty containers and infrastructure safety limits
+        # Structural defaults â€” empty containers and infrastructure safety limits
         recommended_spec.setdefault("constraints", {})
         recommended_spec.setdefault("search_space", {})
         recommended_spec.setdefault("stop_conditions", {})
@@ -1129,10 +1350,10 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         if isinstance(payload, str):
             payload = {"name": payload}
         metric_payload = dict(payload or {})
-        # name and goal are required by MetricSpec — use visible sentinels if agent omitted them
+        # name and goal are required by MetricSpec â€” use visible sentinels if agent omitted them
         metric_payload.setdefault("name", "[unspecified]")
         metric_payload.setdefault("goal", "unspecified")
-        # Structural defaults — empty containers
+        # Structural defaults â€” empty containers
         metric_payload.setdefault("params", {})
         metric_payload.setdefault("slice_by", [])
         metric_payload.setdefault("constraints", {})
@@ -1144,19 +1365,34 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         *,
         capability_context: CapabilityContext,
     ) -> dict[str, Any]:
-        """Enrich agent-proposed metrics with repo metadata (scorer_ref). Never override agent decisions."""
+        """Enrich agent-proposed metrics with repo metadata without overriding explicit agent choices."""
         metric_catalog = capability_context.available_metrics
-        primary_metric = dict(recommended_spec["primary_metric"])
-        metric_name = primary_metric.get("name", "primary_metric")
-        if metric_name in metric_catalog:
-            # Agent named a real metric — enrich with repo's scorer_ref if agent didn't specify
+        patched_spec = dict(recommended_spec)
+
+        def enrich(metric_payload: dict[str, Any]) -> dict[str, Any]:
+            metric = dict(metric_payload)
+            metric_name = metric.get("name")
+            if metric_name not in metric_catalog:
+                return metric
             repo_meta = metric_catalog[metric_name]
+            if metric.get("goal") not in {"maximize", "minimize"}:
+                repo_goal = repo_meta.get("goal")
+                if repo_goal in {"maximize", "minimize"}:
+                    metric["goal"] = repo_goal
             if "scorer_ref" in repo_meta:
-                primary_metric.setdefault("scorer_ref", repo_meta["scorer_ref"])
-        recommended_spec["primary_metric"] = primary_metric
-        # Don't auto-inject guardrails — the agent already has the full metric catalog
-        # in the capability context and can propose guardrails if it decides they're needed.
-        return recommended_spec
+                metric.setdefault("scorer_ref", repo_meta["scorer_ref"])
+            return metric
+
+        patched_spec["primary_metric"] = enrich(dict(recommended_spec["primary_metric"]))
+        patched_spec["secondary_metrics"] = [
+            enrich(dict(metric))
+            for metric in recommended_spec.get("secondary_metrics", [])
+        ]
+        patched_spec["guardrail_metrics"] = [
+            enrich(dict(metric))
+            for metric in recommended_spec.get("guardrail_metrics", [])
+        ]
+        return patched_spec
 
 
 LiteLLMBootstrapBackend.build_experiment_guide = (
@@ -1171,67 +1407,6 @@ LiteLLMBootstrapBackend._normalise_metric_payload = staticmethod(
 LiteLLMBootstrapBackend._apply_capability_metric_defaults = staticmethod(
     LiteLLMRunnerAuthoringBackend._apply_capability_metric_defaults
 )
-
-
-class LiteLLMConsultationBackend(_LiteLLMJsonBackend):
-    def consult(self, snapshot: MemorySnapshot) -> OpsConsultation:
-        try:
-            payload = self._complete_json(
-                system_prompt=(
-                    "You are a specialist operations consult agent. "
-                    "Help the primary coding agent with external services, CLI workflows, environment variables, "
-                    "deployment steps, data access setup, and authentication issues. "
-                    "Give concise, concrete guidance without taking ownership of the main task."
-                ),
-                payload={
-                    "effective_spec": snapshot.effective_spec.to_dict(),
-                    "capability_context": snapshot.capability_context.to_dict(),
-                    "recent_human_interventions": [
-                        item.to_dict() for item in snapshot.recent_human_interventions
-                    ],
-                    "best_summary": snapshot.best_summary.to_dict()
-                    if snapshot.best_summary is not None
-                    else None,
-                    "markdown_memory": [
-                        item.to_dict() for item in snapshot.markdown_memory
-                    ],
-                    "instructions": {
-                        "return_fields": [
-                            "focus",
-                            "guidance",
-                            "commands",
-                            "required_env_vars",
-                            "risks",
-                            "should_consult",
-                        ],
-                        "behavior": [
-                            "Prioritize exact operational steps.",
-                            "Call out missing credentials, env vars, or permissions explicitly.",
-                            "Prefer bounded commands over long prose.",
-                        ],
-                    },
-                },
-            )
-        except Exception as exc:
-            return OpsConsultation(
-                focus="helper consultation unavailable",
-                guidance=f"Consultation backend failed: {exc}",
-                should_consult=False,
-            )
-        if isinstance(payload, Mapping):
-            nested_payload = payload.get("consultation")
-            if isinstance(nested_payload, Mapping):
-                payload = dict(nested_payload)
-        try:
-            return OpsConsultation.from_dict(
-                dict(payload) if isinstance(payload, Mapping) else {}
-            )
-        except Exception as exc:
-            return OpsConsultation(
-                focus="helper consultation unavailable",
-                guidance=f"Consultation response could not be parsed: {exc}",
-                should_consult=False,
-            )
 
 
 class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
@@ -1268,6 +1443,8 @@ class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="access_guide_llm",
+            progress_label="building the access guide",
         )
         return AccessGuide.from_dict(payload)
 
@@ -1410,6 +1587,8 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="reflect_llm",
+            progress_label="reflecting on the latest outcome",
         )
         payload = self._normalise_reflection_payload(payload, outcome=outcome)
         return ReflectionSummary(
@@ -1453,6 +1632,8 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
                     item.to_dict() for item in snapshot.markdown_memory
                 ],
             },
+            progress_stage="review_llm",
+            progress_label="reviewing whether to accept the iteration",
         )
         if payload.get("status") not in {"accepted", "rejected", "pending_human"}:
             payload["status"] = "pending_human"
@@ -1509,11 +1690,13 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                         "Write for a human following the run.",
                         "Mention blockers and next steps briefly.",
                         "Be direct and concise. Don't explain obvious decisions.",
-                        "Don't mention things you excluded or decided against — just focus on what matters.",
+                        "Don't mention things you excluded or decided against â€” just focus on what matters.",
                         "If something wasn't found, say so plainly. Don't discuss unrelated things in the repo.",
                     ],
                 },
             },
+            progress_stage="narrate_bootstrap_llm",
+            progress_label="preparing the bootstrap summary",
         )
         return self._coerce_message(
             payload,
@@ -1538,9 +1721,11 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a skilled data scientist discussing an experiment plan with the user. "
                 "Answer their question directly and concisely based on the current context. "
-                "Don't repeat the full plan — just answer what they asked."
+                "Don't repeat the full plan â€” just answer what they asked."
             ),
             user_message=f"Current context:\n{context}\n\nUser question: {question}",
+            progress_stage="answer_question_llm",
+            progress_label="answering the plan question",
         )
 
     def interpret_feedback(
@@ -1574,29 +1759,42 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                 "user_feedback": feedback,
                 "capability_context": capability_context.to_dict(),
             },
+            progress_stage="feedback_llm",
+            progress_label="interpreting the feedback",
         )
 
     def fix_incomplete_metrics(
         self,
         current_spec: dict[str, Any],
         assistant_message: str,
+        objective: str | None = None,
+        capability_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Ask the agent to fix incomplete metrics by extracting info from its own prose."""
         return self._complete_json(
             system_prompt=(
                 "You are fixing an experiment spec where the metric fields were left incomplete. "
-                "The agent already described the metrics in its message but forgot to fill them into the JSON. "
-                "Extract the metric names and goals from the assistant_message and return the corrected spec fields. "
+                "Infer the missing metric names and goals from the objective, discovered metric catalog, "
+                "and the assistant_message. The user's objective is valid source material even when the assistant_message "
+                "is generic. Use the metric catalog whenever it already defines a goal. "
+                "If the catalog does not settle it, reason from the metric semantics and the user's objective. "
+                "If one metric is clearly named or strongly implied by the objective and repo context, choose it. "
+                "Do not leave any metric goal unspecified if you can logically determine it. "
+                "Do not return an empty object unless the objective and repo context genuinely provide no credible metric clue. "
                 "Return JSON with: primary_metric (object with name and goal), "
                 "guardrail_metrics (array of objects with name and goal), "
                 "secondary_metrics (array of objects with name and goal). "
-                "For goal: 'minimize' means lower is better (losses, errors), 'maximize' means higher is better (scores, accuracies). "
-                "Only include metrics the agent actually described."
+                "For goal: 'minimize' means lower-is-better metrics; 'maximize' means higher-is-better metrics. "
+                "Only include metrics that are already present in the spec or clearly implied by the assistant_message."
             ),
             payload={
                 "current_spec": current_spec,
+                "objective": objective,
+                "capability_context": capability_context,
                 "assistant_message": assistant_message,
             },
+            progress_stage="fix_metrics_llm",
+            progress_label="inferring incomplete metric details",
         )
 
     def summarize_iteration(
@@ -1635,9 +1833,12 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                     ],
                 },
             },
+            progress_stage="narrate_iteration_llm",
+            progress_label="writing the iteration summary",
         )
         fallback = (
             f"Iteration {snapshot.next_iteration_id} completed with review status {review.status}. "
             f"Outcome: {outcome.status}."
         )
         return self._coerce_message(payload, fallback=fallback)
+

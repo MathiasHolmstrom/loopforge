@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
 
+from loopforge.core.runtime import is_generic_autonomous
 from loopforge.core.types import (
     ExecutionStep,
     ExperimentCandidate,
@@ -17,6 +20,9 @@ from loopforge.core.types import (
     MemorySnapshot,
     MetricResult,
 )
+
+
+STEP_PROGRESS_CHECKPOINTS = (10.0, 30.0, 60.0, 120.0)
 
 
 def _step_workdir(step: ExecutionStep, repo_root: Path) -> Path:
@@ -41,7 +47,7 @@ def _referenced_python_scripts(command: str) -> list[str]:
         r"""(?ix)
         (?:^|&&|\|\|)
         \s*
-        (?:python|py)(?:\.exe)?
+        (?:"[^"]*python(?:\.exe)?"|'[^']*python(?:\.exe)?'|[^\s&|]*python(?:\.exe)?|py(?:\.exe)?)
         \s+
         (?:"([^"]+\.py)"|'([^']+\.py)'|([^\s&|]+\.py))
         """
@@ -51,6 +57,266 @@ def _referenced_python_scripts(command: str) -> list[str]:
         if script:
             matches.append(script)
     return matches
+
+
+def _execution_contract(snapshot: MemorySnapshot) -> dict[str, Any]:
+    metadata = (
+        snapshot.effective_spec.metadata
+        if isinstance(snapshot.effective_spec.metadata, dict)
+        else {}
+    )
+    contract = metadata.get("execution_contract")
+    return contract if isinstance(contract, dict) else {}
+
+
+def _baseline_reference_tokens(path_str: str) -> set[str]:
+    normalized = path_str.replace("\\", "/").strip().lower()
+    if not normalized:
+        return set()
+    path = Path(normalized)
+    tokens = {
+        normalized,
+        normalized.replace("/", "\\"),
+        path.name.lower(),
+    }
+    if path.suffix == ".py":
+        module_token = ".".join(part for part in path.with_suffix("").parts if part)
+        if module_token:
+            tokens.add(module_token.lower())
+    return {token for token in tokens if token}
+
+
+def _step_mentions_baseline(step: ExecutionStep, baseline_paths: list[str]) -> bool:
+    haystacks = [step.command, step.path or "", step.content or ""]
+    lowered_haystacks = [item.lower() for item in haystacks if item]
+    for baseline_path in baseline_paths:
+        for token in _baseline_reference_tokens(baseline_path):
+            if any(token in haystack for haystack in lowered_haystacks):
+                return True
+    return False
+
+
+def _validate_baseline_reuse_contract(
+    steps: list[ExecutionStep],
+    snapshot: MemorySnapshot,
+) -> tuple[bool, int, str]:
+    contract = _execution_contract(snapshot)
+    if not contract.get("must_reference_baseline_paths"):
+        return True, 0, ""
+    if contract.get("enforcement_scope") == "until_first_successful_iteration" and (
+        snapshot.latest_summary is not None
+    ):
+        return True, 0, ""
+    baseline_paths = [
+        str(item).strip()
+        for item in contract.get("baseline_paths", [])
+        if str(item).strip()
+    ]
+    if not baseline_paths:
+        return True, 0, ""
+    if any(_step_mentions_baseline(step, baseline_paths) for step in steps):
+        return True, 0, ""
+    preview = ", ".join(baseline_paths[:3])
+    return (
+        False,
+        1,
+        "Bootstrap contract requires the first execution plan to explicitly inspect, copy, edit, or run one of the existing baseline paths before branching into variants: "
+        f"{preview}. Re-anchor on the existing framework instead of inventing a new from-scratch script.",
+    )
+
+
+def _short_command(command: str, limit: int = 100) -> str:
+    compact = " ".join(command.split())
+    if len(compact) > limit:
+        return compact[: limit - 3] + "..."
+    return compact
+
+
+def _short_path_label(path_str: str, keep_parts: int = 3) -> str:
+    normalized = path_str.replace("/", "\\")
+    parts = [part for part in normalized.split("\\") if part]
+    if len(parts) <= keep_parts:
+        return normalized
+    return "\\".join(parts[-keep_parts:])
+
+
+def _effective_shell_segment(command: str) -> str:
+    segments = [
+        segment.strip()
+        for segment in re.split(r"\s*(?:&&|\|\|)\s*", command)
+        if segment.strip()
+    ]
+    if not segments:
+        return command.strip()
+    for segment in reversed(segments):
+        lowered = segment.lower()
+        if lowered.startswith("cd ") or lowered.startswith("cd /d "):
+            continue
+        return segment
+    return segments[-1]
+
+
+def _strip_cmd_prefix(command: str) -> str:
+    stripped = command.strip()
+    lowered = stripped.lower()
+    for prefix in ("cmd /c ", "cmd.exe /c "):
+        if lowered.startswith(prefix):
+            return stripped[len(prefix) :].strip()
+    return stripped
+
+
+def _looks_like_raw_file_dump_command(command: str) -> bool:
+    effective = _strip_cmd_prefix(_effective_shell_segment(command))
+    lowered = effective.lower()
+    if lowered.startswith("get-content "):
+        return True
+    for prefix in ("type ", "cat ", "head ", "more "):
+        if lowered.startswith(prefix):
+            return True
+    return False
+
+
+def _describe_inline_python(command: str) -> str:
+    args = _inline_python_command_args(command)
+    if args is None:
+        return "run inline Python"
+    code = args[args.index("-c") + 1].lower()
+    if any(token in code for token in ("exists(", "is_file(", "is_dir(", "pathlib.path", "resolve(")):
+        return "check file/path with inline Python"
+    if any(token in code for token in ("read_parquet", "read_csv", "read_json", "read_pickle")):
+        return "inspect data with inline Python"
+    if "metric_results" in code or "primary_metric" in code:
+        return "emit metric payload via inline Python"
+    if "print(" in code:
+        return "inspect values with inline Python"
+    return "run inline Python"
+
+
+def _describe_shell_command(command: str) -> str:
+    effective = _effective_shell_segment(command)
+    if _inline_python_command_args(effective) is not None:
+        return _describe_inline_python(effective)
+    scripts = _referenced_python_scripts(effective)
+    if len(scripts) == 1:
+        return f"run {_short_path_label(scripts[0])}"
+    lowered = effective.lower()
+    if "pytest" in lowered:
+        return "run pytest"
+    if lowered.startswith("git diff"):
+        return "inspect git diff"
+    if lowered.startswith("git status"):
+        return "inspect git status"
+    return _short_command(effective)
+
+
+def _describe_step(step: ExecutionStep) -> str:
+    if step.kind == "write_file" and step.path:
+        return f"write {_short_path_label(step.path)}"
+    if step.kind == "append_file" and step.path:
+        return f"append {_short_path_label(step.path)}"
+    if step.kind == "shell":
+        return _describe_shell_command(step.command)
+    return step.kind
+
+
+def _step_progress_label(step: ExecutionStep) -> str:
+    label = _describe_step(step)
+    rationale = " ".join(step.rationale.split())
+    if not rationale:
+        return label
+    if len(rationale) > 140:
+        rationale = rationale[:137] + "..."
+    return f"{label} - {rationale}"
+
+
+def _replace_first_python_script(command: str, new_script_path: str) -> str:
+    pattern = re.compile(
+        r"""(?ix)
+        (?P<prefix>
+            (?:^|&&|\|\|)\s*
+            (?:"[^"]*python(?:\.exe)?"|'[^']*python(?:\.exe)?'|[^\s&|]*python(?:\.exe)?|py(?:\.exe)?)
+            \s+
+        )
+        (?:"[^"]+\.py"|'[^']+\.py'|[^\s&|]+\.py)
+        """
+    )
+    replacement = lambda match: f'{match.group("prefix")}"{new_script_path}"'
+    return pattern.sub(replacement, command, count=1)
+
+
+def _planned_python_paths(
+    steps: list[ExecutionStep], repo_root: Path
+) -> list[Path]:
+    planned: list[Path] = []
+    for step in steps:
+        if step.kind not in {"write_file", "append_file"} or not step.path:
+            continue
+        if not step.path.lower().endswith(".py"):
+            continue
+        try:
+            planned.append(_ensure_within_repo(repo_root / step.path, repo_root))
+        except Exception:
+            continue
+    return planned
+
+
+def _local_fast_repair_missing_script(
+    *,
+    current_steps: list[ExecutionStep],
+    repo_root: Path,
+    failed_step_index: int,
+) -> list[ExecutionStep] | None:
+    if failed_step_index <= 0 or failed_step_index > len(current_steps):
+        return None
+    failed_step = current_steps[failed_step_index - 1]
+    if failed_step.kind != "shell":
+        return None
+    scripts = _referenced_python_scripts(failed_step.command)
+    if len(scripts) != 1:
+        return None
+    missing_script = Path(scripts[0])
+    try:
+        workdir = _ensure_within_repo(_step_workdir(failed_step, repo_root), repo_root)
+    except Exception:
+        return None
+
+    replacement_target: Path | None = None
+    direct_repo_candidate = (
+        (repo_root / missing_script).resolve()
+        if not missing_script.is_absolute()
+        else missing_script.resolve()
+    )
+    if direct_repo_candidate.exists():
+        replacement_target = direct_repo_candidate
+    else:
+        planned_paths = _planned_python_paths(current_steps, repo_root)
+        basename_matches = [
+            path for path in planned_paths if path.name.lower() == missing_script.name.lower()
+        ]
+        if len(basename_matches) == 1:
+            replacement_target = basename_matches[0]
+        elif len(planned_paths) == 1:
+            replacement_target = planned_paths[0]
+
+    if replacement_target is None:
+        return None
+
+    rewritten_command = _replace_first_python_script(
+        failed_step.command, str(replacement_target)
+    )
+    if rewritten_command == failed_step.command:
+        return None
+
+    revised_steps = list(current_steps)
+    revised_steps[failed_step_index - 1] = replace(
+        failed_step,
+        command=rewritten_command,
+        rationale=(
+            failed_step.rationale
+            or f"Run the repaired script path {replacement_target.relative_to(repo_root) if replacement_target.is_relative_to(repo_root) else replacement_target}."
+        ),
+    )
+    return revised_steps
 
 
 def _strip_outer_quotes(token: str) -> str:
@@ -141,6 +407,73 @@ def _classify_shell_failure(stdout: str, stderr: str) -> tuple[str, bool, list[s
     )
 
 
+def _run_subprocess_with_progress(
+    *,
+    command: str | list[str],
+    cwd: Path,
+    shell: bool,
+    timeout_seconds: int,
+    progress_fn,
+    step_index: int,
+    total_steps: int,
+    step_description: str,
+) -> subprocess.CompletedProcess[str]:
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        shell=shell,
+    )
+    started_at = time.monotonic()
+    checkpoints = STEP_PROGRESS_CHECKPOINTS
+    checkpoint_index = 0
+    next_target = checkpoints[0]
+    repeat_interval = checkpoints[-1]
+    tick = 0
+
+    while True:
+        elapsed = time.monotonic() - started_at
+        remaining_timeout = timeout_seconds - elapsed
+        if remaining_timeout <= 0:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                cmd=command,
+                timeout=timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            )
+
+        time_until_checkpoint = max(0.0, next_target - elapsed)
+        if time_until_checkpoint > 0:
+            wait_for = min(1.0, remaining_timeout, time_until_checkpoint)
+        else:
+            wait_for = min(0.1, remaining_timeout)
+        try:
+            stdout, stderr = process.communicate(timeout=wait_for)
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=process.returncode,
+                stdout=stdout,
+                stderr=stderr,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed = time.monotonic() - started_at
+            if progress_fn is not None and elapsed >= next_target:
+                tick += 1
+                progress_fn(
+                    f"step_{step_index}_wait_{tick}",
+                    f"Still running step {step_index}/{total_steps}: {step_description} ({int(elapsed)}s elapsed, waiting for process exit)...",
+                )
+                checkpoint_index += 1
+                if checkpoint_index < len(checkpoints):
+                    next_target = checkpoints[checkpoint_index]
+                else:
+                    next_target += repeat_interval
+
+
 def _coerce_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -170,11 +503,41 @@ def _known_metric_specs(spec: ExperimentSpec) -> dict[str, Any]:
     }
 
 
+def _normalise_metric_name(name: str) -> str:
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
+def _metric_name_aliases(spec: ExperimentSpec) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for metric in (
+        spec.primary_metric,
+        *spec.secondary_metrics,
+        *spec.guardrail_metrics,
+    ):
+        for candidate in (metric.name, metric.display_name):
+            if not isinstance(candidate, str) or not candidate.strip():
+                continue
+            aliases.setdefault(_normalise_metric_name(candidate), metric.name)
+    aliases.setdefault(_normalise_metric_name("primary_metric"), spec.primary_metric.name)
+    aliases.setdefault(_normalise_metric_name("primary metric"), spec.primary_metric.name)
+    return aliases
+
+
+def _resolve_metric_name(name: str, spec: ExperimentSpec) -> str | None:
+    known_metrics = _known_metric_specs(spec)
+    if name in known_metrics:
+        return name
+    aliases = _metric_name_aliases(spec)
+    return aliases.get(_normalise_metric_name(name))
+
+
 def _coerce_metric_result(
     name: str, raw_value: Any, spec: ExperimentSpec
 ) -> MetricResult | None:
     known_metrics = _known_metric_specs(spec)
-    metric_spec = known_metrics.get(name)
+    resolved_name = _resolve_metric_name(name, spec)
+    metric_name = resolved_name or name
+    metric_spec = known_metrics.get(metric_name)
     if isinstance(raw_value, dict):
         value = _coerce_float(raw_value.get("value"))
         passed = raw_value.get("passed")
@@ -185,7 +548,7 @@ def _coerce_metric_result(
         if value is None and passed is None:
             return None
         return MetricResult(
-            name=name,
+            name=metric_name,
             value=value,
             passed=passed,
             scorer_ref=str(scorer_ref)
@@ -197,7 +560,7 @@ def _coerce_metric_result(
     if value is None:
         return None
     return MetricResult(
-        name=name,
+        name=metric_name,
         value=value,
         scorer_ref=metric_spec.scorer_ref if metric_spec is not None else None,
     )
@@ -315,7 +678,6 @@ def _extract_metric_payload_from_text(
     guardrail_metrics: dict[str, float] = {}
     secondary_names = {metric.name for metric in spec.secondary_metrics}
     guardrail_names = {metric.name for metric in spec.guardrail_metrics}
-    known_metrics = set(_known_metric_specs(spec))
     for line in stripped.splitlines():
         candidate = line.strip()
         if not candidate:
@@ -325,29 +687,34 @@ def _extract_metric_payload_from_text(
                 continue
             name, _, value = candidate.partition(separator)
             metric_name = name.strip()
+            resolved_name = _resolve_metric_name(metric_name, spec)
             if (
-                metric_name not in known_metrics
-                and metric_name != "primary_metric_value"
+                resolved_name is None
+                and _normalise_metric_name(metric_name)
+                != _normalise_metric_name("primary_metric_value")
             ):
                 continue
             numeric = _coerce_float(value)
             if numeric is None:
                 continue
-            if metric_name == "primary_metric_value":
+            if (
+                _normalise_metric_name(metric_name)
+                == _normalise_metric_name("primary_metric_value")
+            ):
                 return {
                     "metric_results": metric_results,
                     "primary_metric_value": numeric,
                     "secondary_metrics": secondary_metrics,
                     "guardrail_metrics": guardrail_metrics,
                 }
-            result = _coerce_metric_result(metric_name, numeric, spec)
+            result = _coerce_metric_result(resolved_name or metric_name, numeric, spec)
             if result is None:
                 continue
-            metric_results[metric_name] = result
-            if metric_name in secondary_names:
-                secondary_metrics[metric_name] = numeric
-            if metric_name in guardrail_names:
-                guardrail_metrics[metric_name] = numeric
+            metric_results[result.name] = result
+            if result.name in secondary_names:
+                secondary_metrics[result.name] = numeric
+            if result.name in guardrail_names:
+                guardrail_metrics[result.name] = numeric
             break
 
     primary_metric = metric_results.get(spec.primary_metric.name)
@@ -396,8 +763,15 @@ def _extract_metric_payload(
 def _validate_steps_pre_execution(
     steps: list[ExecutionStep],
     repo_root: Path,
+    snapshot: MemorySnapshot | None = None,
 ) -> tuple[bool, int, str]:
     """Quick pre-validation. Returns (ok, failed_step_index, reason)."""
+    if snapshot is not None and is_generic_autonomous(snapshot=snapshot):
+        contract_ok, contract_failed_idx, contract_reason = (
+            _validate_baseline_reuse_contract(steps, snapshot)
+        )
+        if not contract_ok:
+            return contract_ok, contract_failed_idx, contract_reason
     planned_files: set[Path] = set()
     for index, step in enumerate(steps, start=1):
         if step.kind in {"write_file", "append_file"}:
@@ -413,6 +787,16 @@ def _validate_steps_pre_execution(
                     False,
                     index,
                     f"Step {index} uses cwd outside the repo root: {step.cwd}",
+                )
+            if _looks_like_raw_file_dump_command(step.command):
+                return (
+                    False,
+                    index,
+                    (
+                        f"Step {index} uses a raw file-dump shell command ({_effective_shell_segment(step.command)}). "
+                        "Do not dump source files with shell commands like type/cat/head/more/Get-Content; "
+                        "use one bounded Python inspection or go straight to write_file plus a runnable script."
+                    ),
                 )
             for script in _referenced_python_scripts(step.command):
                 script_path = Path(script)
@@ -446,8 +830,15 @@ def _run_steps(
     """Execute steps sequentially. Returns (failure_outcome_or_None, step_results)."""
     step_results: list[dict[str, Any]] = []
     planned_files: set[Path] = set()
+    total_steps = len(steps)
 
     for index, step in enumerate(steps, start=1):
+        step_description = _step_progress_label(step)
+        if progress_fn is not None:
+            progress_fn(
+                f"step_{index}",
+                f"Running step {index}/{total_steps}: {step_description}",
+            )
         try:
             workdir = _ensure_within_repo(_step_workdir(step, repo_root), repo_root)
         except Exception:
@@ -532,24 +923,26 @@ def _run_steps(
         try:
             inline_python_args = _inline_python_command_args(step.command)
             if inline_python_args is not None:
-                completed = subprocess.run(
-                    inline_python_args,
+                completed = _run_subprocess_with_progress(
+                    command=inline_python_args,
                     cwd=workdir,
-                    capture_output=True,
-                    text=True,
                     shell=False,
-                    timeout=timeout_seconds,
-                    check=False,
+                    timeout_seconds=timeout_seconds,
+                    progress_fn=progress_fn,
+                    step_index=index,
+                    total_steps=total_steps,
+                    step_description=step_description,
                 )
             else:
-                completed = subprocess.run(
-                    step.command,
+                completed = _run_subprocess_with_progress(
+                    command=step.command,
                     cwd=workdir,
-                    capture_output=True,
-                    text=True,
                     shell=True,
-                    timeout=timeout_seconds,
-                    check=False,
+                    timeout_seconds=timeout_seconds,
+                    progress_fn=progress_fn,
+                    step_index=index,
+                    total_steps=total_steps,
+                    step_description=step_description,
                 )
         except subprocess.TimeoutExpired as exc:
             step_results.append(
@@ -648,6 +1041,7 @@ class GenericExecutionPlanExecutor:
         self.default_timeout_seconds = default_timeout_seconds
         self.max_captured_chars = max_captured_chars
         self.progress_fn = progress_fn or (lambda stage, msg: None)
+        self.last_fix_summary: str | None = None
 
     def _fix_backend_label(self) -> str:
         model = getattr(self.fix_backend, "model", None)
@@ -659,17 +1053,67 @@ class GenericExecutionPlanExecutor:
     def _preview_steps(steps: list[ExecutionStep], limit: int = 3) -> str:
         previews: list[str] = []
         for step in steps[:limit]:
-            if step.kind == "shell":
-                previews.append(f"$ {step.command[:120]}")
-            elif step.kind in {"write_file", "append_file"}:
-                previews.append(f"{step.kind} {step.path}")
-            else:
-                previews.append(step.kind)
+            previews.append(_describe_step(step))
         return " | ".join(previews)
+
+    @staticmethod
+    def _preview_repair_summary(summary: str | None, limit: int = 220) -> str | None:
+        if not isinstance(summary, str):
+            return None
+        compact = " ".join(summary.split())
+        if not compact:
+            return None
+        if len(compact) > limit:
+            return compact[: limit - 3] + "..."
+        return compact
 
     @staticmethod
     def _steps_equal(left: list[ExecutionStep], right: list[ExecutionStep]) -> bool:
         return [step.to_dict() for step in left] == [step.to_dict() for step in right]
+
+    @staticmethod
+    def _metrics_required_for_success(
+        candidate: ExperimentCandidate, snapshot: MemorySnapshot
+    ) -> bool:
+        return bool(candidate.execution_steps) and is_generic_autonomous(snapshot=snapshot)
+
+    @staticmethod
+    def _build_metricless_failure(
+        *,
+        candidate: ExperimentCandidate,
+        snapshot: MemorySnapshot,
+        step_results: list[dict[str, Any]],
+        attempts: list[dict[str, Any]],
+    ) -> ExperimentOutcome:
+        primary_metric_name = snapshot.effective_spec.primary_metric.name
+        latest_stdout_preview = ""
+        if step_results:
+            latest_stdout_preview = str(step_results[-1].get("stdout", "")).strip()[:500]
+        notes = [
+            "Execution steps completed, but the runtime could not capture the configured metrics from stdout."
+        ]
+        if latest_stdout_preview:
+            notes.append(f"Latest stdout preview: {latest_stdout_preview}")
+        return ExperimentOutcome(
+            status="recoverable_failure",
+            notes=notes,
+            failure_type="MetricsNotReported",
+            failure_summary=(
+                f"Execution succeeded but did not print a parseable value for the primary metric "
+                f"{primary_metric_name!r} or a machine-readable metric payload."
+            ),
+            recoverable=True,
+            recovery_actions=[
+                "Revise the execution steps so the final run prints the configured metrics to stdout.",
+                "Prefer a single JSON payload with metric_results or explicit metric_name=value lines.",
+            ],
+            execution_details={
+                "step_results": step_results,
+                "latest_stdout_preview": latest_stdout_preview,
+                "attempts": attempts,
+                "candidate": candidate.to_dict(),
+            },
+        )
 
     def execute(
         self, candidate: ExperimentCandidate, snapshot: MemorySnapshot
@@ -693,8 +1137,21 @@ class GenericExecutionPlanExecutor:
         for attempt in range(1 + self.max_retries):
             # Pre-validate before running
             valid, failed_idx, reason = _validate_steps_pre_execution(
-                current_steps, self.repo_root
+                current_steps, self.repo_root, snapshot
             )
+            if not valid:
+                local_fixed_steps = _local_fast_repair_missing_script(
+                    current_steps=current_steps,
+                    repo_root=self.repo_root,
+                    failed_step_index=failed_idx,
+                )
+                if local_fixed_steps is not None:
+                    self.progress_fn(
+                        f"local_fix_attempt_{attempt}",
+                        f"Applied local fast repair for MissingScriptFile: {self._preview_steps(local_fixed_steps)}",
+                    )
+                    current_steps = local_fixed_steps
+                    continue
             if (
                 not valid
                 and self.fix_backend is not None
@@ -715,27 +1172,53 @@ class GenericExecutionPlanExecutor:
                     attempt + 1,
                 )
                 if fixed_steps:
+                    repair_summary = self._preview_repair_summary(self.last_fix_summary)
                     self.progress_fn(
                         f"fix_attempt_{attempt}_detail",
                         f"[{fixer_label}] Revised plan with {len(fixed_steps)} step(s): {self._preview_steps(fixed_steps)}",
                     )
+                    if repair_summary:
+                        self.progress_fn(
+                            f"fix_attempt_{attempt}_summary",
+                            f"[{fixer_label}] Repair reasoning: {repair_summary}",
+                        )
                     current_steps = fixed_steps
                     continue
                 self.progress_fn(
                     f"fix_attempt_{attempt}_detail",
                     f"[{fixer_label}] Did not return a revised execution plan.",
                 )
-                # Fix backend returned nothing — fall through to try anyway
+            if not valid:
+                return ExperimentOutcome(
+                    status="recoverable_failure",
+                    notes=[f"Execution plan pre-validation failed at step {failed_idx}."],
+                    failure_type="InvalidExecutionPlan",
+                    failure_summary=reason,
+                    recoverable=True,
+                    recovery_actions=[
+                        "Replace shell-only file inspection with one bounded Python inspection or a write_file + python script run.",
+                        "Keep the iteration end-to-end so the final step prints metrics.",
+                    ],
+                    execution_details={
+                        "step_results": [],
+                        "attempts": all_attempt_results,
+                        "candidate": candidate.to_dict(),
+                    },
+                )
 
             # Execute
             if attempt > 0:
-                self.progress_fn(f"retry_{attempt}", f"Retry attempt {attempt + 1}...")
+                self.progress_fn(
+                    f"retry_{attempt}",
+                    f"Retry attempt {attempt + 1}: {self._preview_steps(current_steps)}",
+                )
 
             failure_outcome, step_results = _run_steps(
                 current_steps,
                 self.repo_root,
                 self.default_timeout_seconds,
                 self.max_captured_chars,
+                self.progress_fn,
             )
             all_attempt_results.append(
                 {
@@ -750,15 +1233,53 @@ class GenericExecutionPlanExecutor:
                 metric_payload = _extract_metric_payload(
                     step_results, snapshot.effective_spec
                 )
+                metrics_captured = bool(
+                    metric_payload["metric_results"]
+                    or metric_payload["primary_metric_value"] is not None
+                )
+                if (
+                    not metrics_captured
+                    and self._metrics_required_for_success(candidate, snapshot)
+                ):
+                    failure_outcome = self._build_metricless_failure(
+                        candidate=candidate,
+                        snapshot=snapshot,
+                        step_results=step_results,
+                        attempts=all_attempt_results,
+                    )
+                    if attempt < self.max_retries and self.fix_backend is not None:
+                        fixer_label = self._fix_backend_label()
+                        self.progress_fn(
+                            f"fix_attempt_{attempt}",
+                            f"[{fixer_label}] Execution produced no parseable metrics: {failure_outcome.failure_summary[:160]}",
+                        )
+                        fixed_steps = self._ask_for_fix(
+                            snapshot,
+                            candidate,
+                            current_steps,
+                            len(step_results),
+                            failure_outcome.failure_summary or "Metrics were not reported",
+                            step_results,
+                            attempt + 1,
+                        )
+                        if fixed_steps:
+                            self.progress_fn(
+                                f"fix_attempt_{attempt}_detail",
+                                f"[{fixer_label}] Revised plan with {len(fixed_steps)} step(s): {self._preview_steps(fixed_steps)}",
+                            )
+                            current_steps = fixed_steps
+                            continue
+                        self.progress_fn(
+                            f"fix_attempt_{attempt}_detail",
+                            f"[{fixer_label}] Did not return a revised execution plan.",
+                        )
+                    return failure_outcome
                 notes = [
                     f"Executed {len(current_steps)} step(s) successfully"
                     + (f" (after {attempt} fix(es))" if attempt > 0 else "")
                     + "."
                 ]
-                if (
-                    metric_payload["metric_results"]
-                    or metric_payload["primary_metric_value"] is not None
-                ):
+                if metrics_captured:
                     notes.append("Captured metric output from execution stdout.")
                 # Success!
                 return ExperimentOutcome(
@@ -779,6 +1300,19 @@ class GenericExecutionPlanExecutor:
                 # Non-recoverable — don't retry
                 return failure_outcome
 
+            local_fixed_steps = self._try_local_fast_repair(
+                failure_outcome=failure_outcome,
+                current_steps=current_steps,
+                failed_step_index=len(step_results),
+            )
+            if local_fixed_steps is not None:
+                self.progress_fn(
+                    f"local_fix_attempt_{attempt}",
+                    f"Applied local fast repair for {failure_outcome.failure_type}: {self._preview_steps(local_fixed_steps)}",
+                )
+                current_steps = local_fixed_steps
+                continue
+
             if attempt < self.max_retries and self.fix_backend is not None:
                 fixer_label = self._fix_backend_label()
                 self.progress_fn(
@@ -795,10 +1329,16 @@ class GenericExecutionPlanExecutor:
                     attempt + 1,
                 )
                 if fixed_steps:
+                    repair_summary = self._preview_repair_summary(self.last_fix_summary)
                     self.progress_fn(
                         f"fix_attempt_{attempt}_detail",
                         f"[{fixer_label}] Revised plan with {len(fixed_steps)} step(s): {self._preview_steps(fixed_steps)}",
                     )
+                    if repair_summary:
+                        self.progress_fn(
+                            f"fix_attempt_{attempt}_summary",
+                            f"[{fixer_label}] Repair reasoning: {repair_summary}",
+                        )
                     current_steps = fixed_steps
                     continue
                 self.progress_fn(
@@ -837,6 +1377,7 @@ class GenericExecutionPlanExecutor:
         attempt_number: int,
     ) -> list[ExecutionStep] | None:
         try:
+            self.last_fix_summary = None
             repair_candidate = replace(
                 candidate,
                 execution_steps=list(current_steps),
@@ -856,8 +1397,29 @@ class GenericExecutionPlanExecutor:
                 failure_summary=failure_summary,
                 step_results=step_results,
             )
+            repair_summary = getattr(self.fix_backend, "last_repair_summary", None)
+            self.last_fix_summary = (
+                repair_summary.strip()
+                if isinstance(repair_summary, str) and repair_summary.strip()
+                else None
+            )
             if not fixed or self._steps_equal(fixed, current_steps):
                 return None
             return fixed
         except Exception:
             return None
+
+    def _try_local_fast_repair(
+        self,
+        *,
+        failure_outcome: ExperimentOutcome,
+        current_steps: list[ExecutionStep],
+        failed_step_index: int,
+    ) -> list[ExecutionStep] | None:
+        if failure_outcome.failure_type == "MissingScriptFile":
+            return _local_fast_repair_missing_script(
+                current_steps=current_steps,
+                repo_root=self.repo_root,
+                failed_step_index=failed_step_index,
+            )
+        return None

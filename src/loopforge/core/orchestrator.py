@@ -157,18 +157,22 @@ class ExperimentOrchestrator:
     def run_iteration(self) -> IterationCycleResult:
         snapshot = self._load_snapshot()
         generic_autonomous = self._is_generic_autonomous(snapshot)
+        baseline_first_phase = self._is_baseline_first_phase(snapshot)
         max_continuations = int(
             snapshot.effective_spec.stop_conditions.get(
                 "max_metricless_continuations",
-                12 if generic_autonomous else 5,
+                1 if generic_autonomous else 5,
             )
         )
         max_same_iteration_repairs = int(
             snapshot.effective_spec.stop_conditions.get(
                 "max_same_iteration_repairs",
-                8 if generic_autonomous else 0,
+                2 if generic_autonomous else 0,
             )
         )
+        if baseline_first_phase:
+            max_continuations = 0
+            max_same_iteration_repairs = 0
         intra_iteration_attempts: list[dict[str, object]] = []
         pending_success_outcome: ExperimentOutcome | None = None
 
@@ -185,7 +189,11 @@ class ExperimentOrchestrator:
         repair_round = 0
         while True:
             if candidate.execution_steps:
-                self.progress_fn("executor_run", "Executing autonomous agent plan...")
+                step_preview = self._candidate_step_preview(candidate)
+                detail = f" Executing: {step_preview}" if step_preview else ""
+                self.progress_fn(
+                    "executor_run", f"Executing autonomous agent plan...{detail}"
+                )
             else:
                 self.progress_fn(
                     "executor_run", f"Executing {candidate.action_type}..."
@@ -429,9 +437,28 @@ class ExperimentOrchestrator:
 
     @staticmethod
     def _format_candidate(candidate: ExperimentCandidate) -> str:
+        def _short_text(value: object, limit: int = 220) -> str | None:
+            if not isinstance(value, str):
+                return None
+            text = " ".join(value.split())
+            if not text:
+                return None
+            if len(text) > limit:
+                return text[: limit - 3] + "..."
+            return text
+
         lines = [
             f"  Hypothesis : {candidate.hypothesis}",
         ]
+        observation = _short_text(candidate.metadata.get("observation_summary"))
+        if observation:
+            lines.append(f"  Observed   : {observation}")
+        reasoning = _short_text(candidate.metadata.get("reasoning_summary"))
+        if reasoning:
+            lines.append(f"  Why now    : {reasoning}")
+        next_step = _short_text(candidate.metadata.get("next_step_summary"))
+        if next_step:
+            lines.append(f"  Next check : {next_step}")
         if candidate.instructions:
             instr = candidate.instructions
             if len(instr) > 400:
@@ -467,6 +494,24 @@ class ExperimentOrchestrator:
         return "\n".join(lines)
 
     @staticmethod
+    def _candidate_step_preview(candidate: ExperimentCandidate, limit: int = 2) -> str:
+        previews: list[str] = []
+        for step in candidate.execution_steps[:limit]:
+            if step.rationale:
+                previews.append(step.rationale)
+            elif step.kind in ("write_file", "append_file") and step.path:
+                verb = "write" if step.kind == "write_file" else "append"
+                previews.append(f"{verb} {step.path}")
+            elif step.kind == "shell":
+                command = " ".join(step.command.split())
+                if len(command) > 80:
+                    command = command[:77] + "..."
+                previews.append(command)
+            else:
+                previews.append(step.kind)
+        return " -> ".join(previews)
+
+    @staticmethod
     def _format_outcome(outcome: ExperimentOutcome, spec: ExperimentSpec) -> str:
         lines = []
         # Metrics first — this is what the user cares about most
@@ -487,6 +532,19 @@ class ExperimentOrchestrator:
             if len(summary) > 200:
                 summary = summary[:200] + "..."
             lines.append(f"  Issue      : {summary}")
+            step_results = outcome.execution_details.get("step_results", [])
+            if isinstance(step_results, list) and step_results:
+                latest = step_results[-1]
+                if isinstance(latest, dict):
+                    command = latest.get("command")
+                    path = latest.get("path")
+                    if isinstance(command, str) and command.strip():
+                        short = " ".join(command.split())
+                        if len(short) > 120:
+                            short = short[:117] + "..."
+                        lines.append(f"  Failed step: {short}")
+                    elif isinstance(path, str) and path.strip():
+                        lines.append(f"  Failed step: {path}")
             if outcome.recovery_actions:
                 lines.append(f"  Next       : {outcome.recovery_actions[0]}")
         # Key notes (skip noise)
@@ -642,6 +700,22 @@ class ExperimentOrchestrator:
             human_window=self.human_window,
             capability_context=capability_context,
         )
+
+    @staticmethod
+    def _is_baseline_first_phase(snapshot: MemorySnapshot) -> bool:
+        metadata = (
+            snapshot.effective_spec.metadata
+            if isinstance(snapshot.effective_spec.metadata, dict)
+            else {}
+        )
+        contract = metadata.get("execution_contract")
+        if not isinstance(contract, dict):
+            return False
+        if not contract.get("must_reference_baseline_paths"):
+            return False
+        if contract.get("enforcement_scope") != "until_first_successful_iteration":
+            return False
+        return snapshot.latest_summary is None
 
     def _build_summary(
         self, snapshot: MemorySnapshot, record: IterationRecord

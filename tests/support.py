@@ -8,7 +8,6 @@ from loopforge import (
     ExperimentCandidate,
     ExperimentOutcome,
     ExperimentSpec,
-    OpsConsultation,
     PreflightCheck,
     PrimaryMetric,
     ReflectionSummary,
@@ -67,22 +66,14 @@ class FakeNarrationBackend:
         )
         return f"iteration:{candidate.action_type}:{review.status}"
 
-
-class FakeConsultationBackend:
-    def __init__(self, focus: str = "databricks deploy") -> None:
-        self.focus = focus
-        self.calls = []
-
-    def consult(self, snapshot):
-        self.calls.append(snapshot)
-        return OpsConsultation(
-            focus=self.focus,
-            guidance="Use bundle deploy and verify env vars first.",
-            commands=["databricks bundle validate", "databricks bundle deploy -t dev"],
-            required_env_vars=["DATABRICKS_HOST", "DATABRICKS_TOKEN"],
-            risks=["Missing workspace permissions"],
-            should_consult=True,
-        )
+    def fix_incomplete_metrics(
+        self,
+        current_spec,
+        assistant_message,
+        objective=None,
+        capability_context=None,
+    ):
+        return {}
 
 
 class FakeAccessAdvisorBackend:

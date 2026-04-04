@@ -179,6 +179,10 @@ def _lol_preflight(repo_root: Path) -> list[PreflightCheck]:
 
 def _lol_capability_context(repo_root: Path) -> CapabilityContext:
     data_asset = repo_root / "examples" / "lol" / "data" / "subsample_lol_data.parquet"
+    pipeline_example = repo_root / "examples" / "lol" / "pipeline_transformer_example.py"
+    ordinal_baseline = repo_root / "experiments" / "lol_kills_autonomous_baseline.py"
+    empirical_bayes = repo_root / "experiments" / "lol_kills_empirical_bayes.py"
+    end_to_end_test = repo_root / "tests" / "end_to_end" / "test_lol_player_kills.py"
     return CapabilityContext(
         available_actions={
             "baseline": "Run the current LoL kills baseline on the sample data.",
@@ -212,10 +216,22 @@ def _lol_capability_context(repo_root: Path) -> CapabilityContext:
             "diagnostic_actions": ["eda", "slice_analysis"],
             "change_actions": ["targeted_tune"],
             "default_model_type": "point_prediction",
+            "feature_engineering_stack": "spforge",
+            "baseline_code_paths": [
+                str(ordinal_baseline),
+                str(empirical_bayes),
+                str(pipeline_example),
+                str(end_to_end_test),
+            ],
         },
         notes=[
             "Built-in LoL kills runner uses the player-performance-ratings sample dataset and feature pipeline.",
             "The current autonomous runner is point-prediction first: LightGBM regressor with player/team/rating lag features.",
+            f"Inspect {ordinal_baseline} for an existing ordinal/distribution baseline with capped kills classes, probability outputs, RankedProbabilityScorer, and OrdinalLossScorer.",
+            f"Inspect {empirical_bayes} for a stronger follow-up baseline that still predicts kills as ordered classes.",
+            f"Inspect {pipeline_example} for the existing spforge pipeline example: LagTransformer, RollingWindowTransformer, EstimatorTransformer, and NegativeBinomialEstimator.",
+            f"Inspect {end_to_end_test} for the full player kills feature pipeline using spforge FeatureGeneratorPipeline, PlayerRatingGenerator, and MatchKFoldCrossValidator.",
+            "Feature engineering changes should reuse spforge tooling rather than introducing a separate feature stack.",
             "Diagnostics report worst positions and worst kills buckets before any targeted tuning.",
         ],
     )

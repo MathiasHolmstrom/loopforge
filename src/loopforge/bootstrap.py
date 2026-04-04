@@ -13,11 +13,18 @@ from pathlib import Path
 from typing import Any, Literal
 
 from loopforge.auto_adapter import build_repo_scan_context
+from loopforge.core.bootstrap_contracts import (
+    apply_bootstrap_execution_contract,
+    build_bootstrap_handoff,
+    build_execution_runbook,
+    resolve_repo_root_from_objective,
+    should_prepare_access_guide,
+)
 from loopforge.core import (
     AdapterSetup,
+    BaselineFirstWorkerBackend,
     BootstrapTurn,
     CapabilityContext,
-    ConsultingWorkerBackend,
     DataAssetSchema,
     ExperimentCandidate,
     ExperimentInterrupted,
@@ -27,7 +34,6 @@ from loopforge.core import (
     FileMemoryStore,
     LiteLLMAccessAdvisorBackend,
     LiteLLMBootstrapBackend,
-    LiteLLMConsultationBackend,
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
@@ -48,6 +54,7 @@ from loopforge.core import (
     _noop_progress,
 )
 from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
+from loopforge.core.runtime import is_generic_autonomous
 
 
 DEFAULT_OPENAI_MODEL = "openai/gpt-5.4"
@@ -72,10 +79,8 @@ REMOTE_EXECUTION_HINT_TOKENS = (
     "catalog",
     "spark",
     "delta",
-    "table",
     "bucket",
 )
-
 MODEL_PROFILES: dict[str, dict[str, str]] = {
     "all_codex": {
         "planner": DEFAULT_OPENAI_MODEL,
@@ -93,6 +98,18 @@ MODEL_PROFILES: dict[str, dict[str, str]] = {
         "consultation": DEFAULT_CLAUDE_MODEL,
         "narrator": DEFAULT_CLAUDE_MODEL,
     },
+}
+
+DEFAULT_ROLE_MAX_COMPLETION_TOKENS: dict[str, int] = {
+    "planner": 1800,
+    "worker": 2200,
+    "runner_authoring": 5000,
+    "consultation": 1200,
+    "access_advisor": 1200,
+    "reflection": 900,
+    "review": 700,
+    "narrator": 700,
+    "execution_fix": 1400,
 }
 
 
@@ -295,6 +312,99 @@ def _validate_runner_factory(
         preflight_checks=checks,
         smoke_test_passed=smoke_test_passed,
     )
+
+
+def _metric_is_incomplete(metric: PrimaryMetric) -> bool:
+    return metric.name == "[unspecified]" or metric.goal not in (
+        "maximize",
+        "minimize",
+    )
+
+
+def _apply_metric_catalog_defaults(
+    spec_dict: dict[str, Any], capability_context: CapabilityContext
+) -> dict[str, Any]:
+    metric_catalog = capability_context.available_metrics or {}
+
+    def enrich(metric_payload: dict[str, Any] | None) -> dict[str, Any]:
+        metric_data = dict(metric_payload or {})
+        metric_name = metric_data.get("name")
+        if not metric_name or metric_name not in metric_catalog:
+            return metric_data
+        repo_meta = metric_catalog[metric_name]
+        if metric_data.get("goal") not in {"maximize", "minimize"}:
+            repo_goal = repo_meta.get("goal")
+            if repo_goal in {"maximize", "minimize"}:
+                metric_data["goal"] = repo_goal
+        if not metric_data.get("scorer_ref") and repo_meta.get("scorer_ref"):
+            metric_data["scorer_ref"] = repo_meta["scorer_ref"]
+        return metric_data
+
+    patched = dict(spec_dict)
+    patched["primary_metric"] = enrich(spec_dict.get("primary_metric"))
+    patched["secondary_metrics"] = [
+        enrich(metric) for metric in spec_dict.get("secondary_metrics", [])
+    ]
+    patched["guardrail_metrics"] = [
+        enrich(metric) for metric in spec_dict.get("guardrail_metrics", [])
+    ]
+    return patched
+
+
+def _normalise_metric_name(name: str) -> str:
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _extract_primary_metric_from_feedback(
+    feedback: str, capability_context: CapabilityContext
+) -> str | None:
+    text = " ".join(str(feedback).split())
+    if not text:
+        return None
+
+    metric_catalog = capability_context.available_metrics or {}
+    normalised_feedback = _normalise_metric_name(text)
+    if "primarymetric" not in normalised_feedback:
+        return None
+
+    for metric_name in sorted(metric_catalog, key=len, reverse=True):
+        if _is_generic_metric_placeholder(metric_name):
+            continue
+        if _normalise_metric_name(metric_name) in normalised_feedback:
+            return metric_name
+
+    patterns = (
+        r"([A-Za-z0-9_][A-Za-z0-9_ \-]{0,80}?)\s+as\s+primary\s+metric\b",
+        r"primary\s+metric\s*(?:to|=|is|should\s+be)?\s*[:\-]?\s*([A-Za-z0-9_][A-Za-z0-9_ \-]{0,80})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" .,:;!-")
+        if candidate:
+            normalised_candidate = _normalise_metric_name(candidate)
+            for metric_name in metric_catalog:
+                if _is_generic_metric_placeholder(metric_name):
+                    continue
+                if _normalise_metric_name(metric_name) == normalised_candidate:
+                    return metric_name
+            return candidate
+    return None
+
+
+def _is_generic_metric_placeholder(name: str | None) -> bool:
+    normalised = _normalise_metric_name(name or "")
+    return normalised in {
+        "",
+        "metric",
+        "primarymetric",
+        "secondarymetric",
+        "guardrailmetric",
+        "scorer",
+        "score",
+        "loss",
+    }
 
 
 def _smoke_validate_runner(
@@ -991,6 +1101,127 @@ def _summarise_bootstrap_answers(answers: dict[str, Any] | None) -> str:
     return "\n".join(parts)
 
 
+def _text_tokens(value: str) -> set[str]:
+    normalized = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", value)
+    normalized = normalized.replace("_", " ")
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", normalized.lower())
+        if len(token) >= 3
+    }
+
+
+def _compact_capability_context_for_metric_repair(
+    *,
+    objective: str,
+    assistant_message: str,
+    capability_context: CapabilityContext,
+    limit: int = 24,
+) -> dict[str, Any]:
+    query_text = f"{objective}\n{assistant_message}"
+    query_tokens = _text_tokens(query_text)
+    metric_catalog = capability_context.available_metrics or {}
+    ranked_metrics: list[tuple[int, str, dict[str, Any]]] = []
+
+    for name, meta in metric_catalog.items():
+        if not isinstance(name, str):
+            continue
+        metric_text = " ".join(
+            [
+                name,
+                str(meta.get("scorer_ref", "")),
+                str(meta.get("path", "")),
+                str(meta.get("goal", "")),
+                str(meta.get("preferred_role", "")),
+            ]
+        )
+        metric_tokens = _text_tokens(metric_text)
+        overlap = len(query_tokens & metric_tokens)
+        exact_name_match = int(name.lower() in query_text.lower())
+        score = overlap * 10 + exact_name_match * 100
+        if score > 0:
+            ranked_metrics.append((score, name, meta))
+
+    ranked_metrics.sort(key=lambda item: (-item[0], item[1]))
+    compact_metrics = {
+        name: meta for _, name, meta in ranked_metrics[:limit]
+    }
+    if not compact_metrics:
+        compact_metrics = dict(list(metric_catalog.items())[:limit])
+
+    return {
+        "available_metrics": compact_metrics,
+        "environment_facts": capability_context.environment_facts,
+        "notes": capability_context.notes[:20],
+        "available_actions": capability_context.available_actions,
+        "available_data_assets": capability_context.available_data_assets[:20],
+    }
+
+
+def _infer_local_execution_confidence(
+    *,
+    user_goal: str,
+    capability_context: CapabilityContext,
+    answers: dict[str, Any] | None,
+) -> int:
+    score = 0
+    local_assets = [
+        asset
+        for asset in capability_context.available_data_assets
+        if isinstance(asset, str)
+        and asset.strip()
+        and _looks_like_local_asset_path(asset)
+    ]
+    if local_assets:
+        score += 1
+
+    local_action_paths = [
+        target
+        for target in capability_context.available_actions.values()
+        if isinstance(target, str)
+        and target.strip()
+        and (
+            _looks_like_local_asset_path(target)
+            or target.endswith(".py")
+            or target.startswith(("scripts/", "src/", "sports_predictions_orchestrator/"))
+        )
+    ]
+    if local_action_paths:
+        score += 1
+
+    env_facts = capability_context.environment_facts or {}
+    if env_facts.get("repo_root") or env_facts.get("python_executable"):
+        score += 1
+    baseline_paths = env_facts.get("baseline_code_paths")
+    if isinstance(baseline_paths, list) and any(
+        isinstance(path, str) and _looks_like_local_asset_path(path)
+        for path in baseline_paths
+    ):
+        score += 1
+
+    local_language = " ".join(
+        [
+            user_goal.lower(),
+            _summarise_bootstrap_answers(answers).lower(),
+            " ".join(capability_context.notes).lower(),
+        ]
+    )
+    if any(
+        phrase in local_language
+        for phrase in (
+            "this repo",
+            "existing frame",
+            "existing pipeline",
+            "local python",
+            "find where",
+            "check lol data",
+            "work within existing",
+        )
+    ):
+        score += 1
+    return score
+
+
 def _detect_execution_guidance_gap(
     *,
     user_goal: str,
@@ -1019,6 +1250,15 @@ def _detect_execution_guidance_gap(
     matched_tokens = list(dict.fromkeys(matched_tokens))
     if not remote_assets and not matched_tokens:
         return None
+    if (
+        _infer_local_execution_confidence(
+            user_goal=user_goal,
+            capability_context=capability_context,
+            answers=answers,
+        )
+        >= 2
+    ):
+        return None
 
     evidence: list[str] = []
     if remote_assets:
@@ -1038,6 +1278,13 @@ def _detect_execution_guidance_gap(
         "code or through the remote platform the repo points at. A short directional answer is enough; exact paths "
         "or internal module names are not required."
     )
+
+
+def _has_execution_guidance_answer(answers: dict[str, Any] | None) -> bool:
+    if not isinstance(answers, dict):
+        return False
+    hint = answers.get(EXECUTION_GUIDANCE_QUESTION_KEY)
+    return isinstance(hint, str) and bool(hint.strip())
 
 
 def _build_execution_guidance_question(
@@ -1214,153 +1461,6 @@ def refine_bootstrap_questions(
     """Remove internal implementation questions but keep all domain questions the agent proposed."""
     return sanitise_bootstrap_questions(questions)
 
-
-def should_prepare_access_guide(
-    *,
-    capability_context: CapabilityContext,
-    preflight_checks: list[PreflightCheck],
-) -> bool:
-    import re
-
-    if capability_context.available_data_assets:
-        return True
-    if any(check.status != "passed" for check in preflight_checks):
-        return True
-    joined_notes = " ".join(capability_context.notes).lower()
-    joined_env = str(capability_context.environment_facts).lower()
-    access_patterns = (
-        r"\bpermission(s)?\b",
-        r"\bauth\b",
-        r"\bauthentication\b",
-        r"\bcredential(s)?\b",
-        r"\btoken(s)?\b",
-        r"\benv\b",
-        r"\benvironment variable(s)?\b",
-        r"\bsecret(s)?\b",
-        r"\bdatabricks\b",
-        r"\bwarehouse\b",
-    )
-    haystack = f"{joined_notes}\n{joined_env}"
-    return any(re.search(pattern, haystack) for pattern in access_patterns)
-
-
-def build_execution_runbook(
-    *,
-    repo_root: Path,
-    capability_context: CapabilityContext,
-    turn: BootstrapTurn,
-    preflight_checks: list[PreflightCheck],
-) -> str:
-    env = capability_context.environment_facts
-    shell_name = str(env.get("execution_shell", "unknown"))
-    python_executable = str(env.get("python_executable", sys.executable))
-    runner_kind = str(env.get("runner_kind", "unknown"))
-    probe_check = next(
-        (
-            check
-            for check in preflight_checks
-            if check.name == "generic_agentic_execution_probe"
-        ),
-        None,
-    )
-    lines = [
-        "# Execution Runbook",
-        "",
-        "## Environment",
-        f"- Repo root: {repo_root.resolve()}",
-        f"- Execution shell for shell steps: {shell_name}",
-        f"- Python executable: {python_executable}",
-        f"- Runner kind: {runner_kind}",
-        "",
-    ]
-    if probe_check is not None:
-        lines.extend(
-            [
-                "## Verified Execution Lane",
-                f"- Bootstrap verification: {probe_check.status}",
-                f"- Detail: {probe_check.detail}",
-                f'- Preferred command shape: "{python_executable}" path\\to\\script.py',
-                "",
-            ]
-        )
-    lines.extend(
-        [
-            "## Ground Rules",
-            "- Treat this file as the execution handoff from bootstrap. Prefer these instructions over rediscovering obvious repo mechanics.",
-            "- Bootstrap has already verified the execution lane above. Reuse that verified repo root and Python executable instead of inventing new activation commands, shell setup, or extra cd chains.",
-            "- Aim for one end-to-end iteration that writes/runs code and prints metrics, not a long chain of disconnected inspection-only retries.",
-            "- Fix one blocker at a time. Do not redesign the whole plan when a single command or import fails.",
-            "- If you want to run a repo-local script that does not exist yet, create it first with a write step, then run it.",
-        ]
-    )
-    if env.get("shell_family") == "windows_cmd":
-        lines.extend(
-            [
-                "- Shell commands run through cmd.exe on Windows. Do not use Unix tools like `head`, `grep`, `find -maxdepth`, or `ls -la`.",
-                '- Prefer `write_file` + `"<python_executable>" script.py`, or short cmd-compatible commands. Python-native inspection is usually the safest choice.',
-            ]
-        )
-    else:
-        lines.append(
-            "- Shell commands should stay portable and repo-local. Prefer Python-native inspection when shell portability is uncertain."
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Immediate Objective",
-            f"- Goal: {turn.proposal.recommended_spec.objective}",
-            f"- Primary metric: {turn.proposal.recommended_spec.primary_metric.name} ({turn.proposal.recommended_spec.primary_metric.goal})",
-        ]
-    )
-    if capability_context.available_data_assets:
-        lines.append("")
-        lines.append("## Known Data Assets")
-        for asset in capability_context.available_data_assets[:10]:
-            lines.append(f"- {asset}")
-    if turn.proposal.notes:
-        lines.append("")
-        lines.append("## Planner Notes")
-        for note in turn.proposal.notes[:12]:
-            lines.append(f"- {note}")
-    lines.extend(
-        [
-            "",
-            "## First Iteration Guidance",
-            "- Reuse the experiment guide and discovered repo paths to build the smallest runnable script that loads data, computes the configured metrics, and prints them clearly.",
-            "- If repo APIs are still uncertain, do one bounded inspection step first, then immediately write and run the experiment script in the same iteration whenever possible.",
-        ]
-    )
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def resolve_repo_root_from_objective(objective: str, current_root: Path) -> Path:
-    """If the objective mentions a repo name, try to find it as a sibling or child directory."""
-    import re
-
-    resolved = current_root.resolve()
-    # Extract potential repo names — hyphenated or underscored multi-word names
-    candidates = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}(?:-[a-zA-Z0-9_]+)+", objective)
-    # Also try single words that look like repo names (before "repo" keyword)
-    repo_match = re.search(
-        r"(?:inside|in|from|of)\s+(\S+?)(?:\s+repo|\s+repository)?(?:\s|$)",
-        objective,
-        re.IGNORECASE,
-    )
-    if repo_match:
-        candidates.insert(0, repo_match.group(1).strip().rstrip("."))
-    for name in candidates:
-        # Check sibling directory
-        sibling = resolved.parent / name
-        if sibling.is_dir() and sibling.resolve() != resolved:
-            return sibling
-        # Check child directory
-        child = resolved / name
-        if child.is_dir():
-            return child
-    return current_root
-
-
 class Loopforge:
     def __init__(
         self,
@@ -1379,7 +1479,6 @@ class Loopforge:
         bootstrap_backend: Any | None = None,
         worker_backend: Any | None = None,
         runner_authoring_backend: RunnerAuthoringBackend | None = None,
-        consultation_backend: Any | None = None,
         access_advisor_backend: Any | None = None,
         reflection_backend: Any | None = None,
         review_backend: Any | None = None,
@@ -1425,13 +1524,17 @@ class Loopforge:
         self.bootstrap_backend = bootstrap_backend or LiteLLMBootstrapBackend(
             model=self.role_models.planner,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["planner"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.planner),
         )
         primary_worker_backend = worker_backend or LiteLLMWorkerBackend(
             model=self.role_models.worker,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["worker"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.worker),
         )
         self.runner_authoring_backend = (
@@ -1439,53 +1542,61 @@ class Loopforge:
             or LiteLLMRunnerAuthoringBackend(
                 model=self.role_models.worker,
                 temperature=temperature,
+                max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS[
+                    "runner_authoring"
+                ],
                 stream_fn=stream_fn,
+                progress_fn=self.progress_fn,
                 **_extra(self.role_models.worker),
             )
-        )
-        self.consultation_backend = consultation_backend or LiteLLMConsultationBackend(
-            model=self.role_models.consultation,
-            temperature=temperature,
-            stream_fn=stream_fn,
-            **_extra(self.role_models.consultation),
         )
         self.access_advisor_backend = (
             access_advisor_backend
             or LiteLLMAccessAdvisorBackend(
                 model=self.role_models.consultation,
                 temperature=temperature,
+                max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS[
+                    "access_advisor"
+                ],
                 stream_fn=stream_fn,
+                progress_fn=self.progress_fn,
                 **_extra(self.role_models.consultation),
             )
         )
-        self.worker_backend = ConsultingWorkerBackend(
+        self.worker_backend = BaselineFirstWorkerBackend(
             worker_backend=primary_worker_backend,
-            consultation_backend=self.consultation_backend,
             progress_fn=self.progress_fn,
-            helper_label=self.role_models.consultation,
         )
         self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
             model=self.role_models.reflection,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["reflection"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.reflection),
         )
         self.review_backend = review_backend or LiteLLMReviewBackend(
             model=self.role_models.review,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["review"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.review),
         )
         self.narrator_backend = narrator_backend or LiteLLMNarrationBackend(
             model=self.role_models.narrator,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["narrator"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.narrator),
         )
         self.execution_fix_backend = LiteLLMExecutionFixBackend(
             model=self.role_models.consultation,
             temperature=temperature,
+            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["execution_fix"],
             stream_fn=stream_fn,
+            progress_fn=self.progress_fn,
             **_extra(self.role_models.consultation),
         )
 
@@ -1567,6 +1678,10 @@ class Loopforge:
             objective=objective,
             executor_factory_path=executor_factory_path,
         )
+        generic_autonomous = is_generic_autonomous(
+            capability_context=runtime.capability_context,
+            effective_spec=spec,
+        )
         orchestrator = ExperimentOrchestrator(
             memory_store=memory_store or FileMemoryStore(self.memory_root),
             worker_backend=self.worker_backend,
@@ -1575,6 +1690,8 @@ class Loopforge:
                 plan_executor=GenericExecutionPlanExecutor(
                     repo_root=self.repo_root,
                     fix_backend=self.execution_fix_backend,
+                    max_retries=2 if generic_autonomous else 8,
+                    default_timeout_seconds=30 if generic_autonomous else 120,
                     progress_fn=self.progress_fn,
                 ),
                 recovery_handler=self._make_execution_recovery_handler(),
@@ -1704,6 +1821,72 @@ class Loopforge:
                 except OSError:
                     pass
 
+    def _repair_incomplete_metrics(
+        self,
+        *,
+        spec: ExperimentSpec,
+        capability_context: CapabilityContext,
+        assistant_message: str,
+    ) -> ExperimentSpec:
+        all_metrics = [
+            spec.primary_metric,
+            *spec.secondary_metrics,
+            *spec.guardrail_metrics,
+        ]
+        if not any(_metric_is_incomplete(metric) for metric in all_metrics):
+            return spec
+
+        spec_dict = _apply_metric_catalog_defaults(spec.to_dict(), capability_context)
+        try:
+            patched_spec = ExperimentSpec.from_dict(spec_dict)
+        except Exception:
+            patched_spec = spec
+
+        all_metrics = [
+            patched_spec.primary_metric,
+            *patched_spec.secondary_metrics,
+            *patched_spec.guardrail_metrics,
+        ]
+        if not any(_metric_is_incomplete(metric) for metric in all_metrics):
+            return patched_spec
+
+        self.progress_fn(
+            "fix_metrics", "Inferring incomplete metric details from planning context..."
+        )
+        compact_context = _compact_capability_context_for_metric_repair(
+            objective=patched_spec.objective,
+            assistant_message=assistant_message,
+            capability_context=capability_context,
+        )
+        try:
+            try:
+                fixes = self.narrator_backend.fix_incomplete_metrics(
+                    current_spec=patched_spec.to_dict(),
+                    assistant_message=assistant_message,
+                    objective=patched_spec.objective,
+                    capability_context=compact_context,
+                )
+            except TypeError:
+                fixes = self.narrator_backend.fix_incomplete_metrics(
+                    current_spec=patched_spec.to_dict(),
+                    assistant_message=assistant_message,
+                )
+        except Exception:
+            return patched_spec
+
+        if not fixes:
+            return patched_spec
+
+        spec_dict = patched_spec.to_dict()
+        for key in ("primary_metric", "secondary_metrics", "guardrail_metrics"):
+            if key in fixes:
+                spec_dict[key] = fixes[key]
+        spec_dict = _apply_metric_catalog_defaults(spec_dict, capability_context)
+        try:
+            return ExperimentSpec.from_dict(spec_dict)
+        except Exception:
+            return patched_spec
+
     def bootstrap(
         self,
         *,
@@ -1745,9 +1928,11 @@ class Loopforge:
             )
             self._cached_capability_key = capability_key
         capability_context = self._cached_capability_context
+        guidance_gap_detail = None
         if (
             resolution.kind == "planning_only"
             and self.explicit_executor_factory_path is None
+            and _has_execution_guidance_answer(answers)
         ):
             self.progress_fn(
                 "author_runner",
@@ -1777,7 +1962,6 @@ class Loopforge:
             elif authored_resolution.reason:
                 self._cached_authoring_failure_reason = authored_resolution.reason
                 resolution = authored_resolution
-        guidance_gap_detail = None
         if resolution.kind == "planning_only":
             guidance_gap_detail = _detect_execution_guidance_gap(
                 user_goal=user_goal,
@@ -1799,6 +1983,7 @@ class Loopforge:
                     **capability_context.environment_facts,
                     "execution_resolution_reason": resolution.reason,
                     "autonomous_execution_supported": True,
+                    "execution_guidance_required": False,
                     "execution_backend_kind": "generic_agentic",
                     "runner_kind": "generic_agentic_executor",
                     "generic_autonomous_actions": list(GENERIC_AUTONOMOUS_ACTIONS),
@@ -1872,46 +2057,31 @@ class Loopforge:
         )
         # Auto-fix incomplete metrics — the agent often describes metrics in prose but
         # leaves the JSON fields empty. Extract from the agent's own message.
-        spec = turn.proposal.recommended_spec
-        all_metrics = [
-            spec.primary_metric,
-            *spec.secondary_metrics,
-            *spec.guardrail_metrics,
-        ]
-        has_incomplete = any(
-            m.name == "[unspecified]" or m.goal not in ("maximize", "minimize")
-            for m in all_metrics
-        )
-        if has_incomplete:
-            self.progress_fn(
-                "fix_metrics", "Extracting metric details from agent's analysis..."
-            )
-            try:
-                fixes = self.narrator_backend.fix_incomplete_metrics(
-                    current_spec=spec.to_dict(),
+        turn = replace(
+            turn,
+            proposal=replace(
+                turn.proposal,
+                recommended_spec=self._repair_incomplete_metrics(
+                    spec=turn.proposal.recommended_spec,
+                    capability_context=capability_context,
                     assistant_message=turn.assistant_message,
-                )
-                if fixes:
-                    spec_dict = spec.to_dict()
-                    for key in (
-                        "primary_metric",
-                        "secondary_metrics",
-                        "guardrail_metrics",
-                    ):
-                        if key in fixes:
-                            spec_dict[key] = fixes[key]
-                    try:
-                        patched_spec = ExperimentSpec.from_dict(spec_dict)
-                        turn = replace(
-                            turn,
-                            proposal=replace(
-                                turn.proposal, recommended_spec=patched_spec
-                            ),
-                        )
-                    except Exception:
-                        pass
-            except Exception:
-                pass  # Preflight check will catch remaining issues
+                ),
+            ),
+        )
+        turn = replace(
+            turn,
+            proposal=replace(
+                turn.proposal,
+                recommended_spec=apply_bootstrap_execution_contract(
+                    spec=turn.proposal.recommended_spec,
+                    capability_context=capability_context,
+                    user_goal=user_goal,
+                    assistant_message=turn.assistant_message,
+                    answers=answers,
+                    answer_summary=_summarise_bootstrap_answers(answers),
+                ),
+            ),
+        )
 
         preflight_checks = run_preflight_checks(
             spec=turn.proposal.recommended_spec,
@@ -1953,6 +2123,10 @@ class Loopforge:
             missing_requirements=missing_requirements,
             access_guide_path=access_guide_path,
         )
+        generic_autonomous = (
+            capability_context.environment_facts.get("execution_backend_kind")
+            == "generic_agentic"
+        )
         try:
             self.progress_fn("execution_runbook", "Writing execution runbook...")
             runbook_text = build_execution_runbook(
@@ -1967,10 +2141,24 @@ class Loopforge:
             runbook_path.write_text(runbook_text, encoding="utf-8")
         except Exception:
             pass
-        # Write experiment guide when ready (or close to ready)
-        if ready_to_start or not [
-            r for r in missing_requirements if r.startswith("answer:")
-        ]:
+        try:
+            self.progress_fn("bootstrap_handoff", "Writing bootstrap handoff...")
+            handoff_text = build_bootstrap_handoff(
+                capability_context=capability_context,
+                turn=resolved_turn,
+                answers=answers,
+            )
+            agent_markdown_dir = self.memory_root / "agent_markdown"
+            agent_markdown_dir.mkdir(parents=True, exist_ok=True)
+            handoff_path = agent_markdown_dir / "bootstrap_handoff.md"
+            handoff_path.write_text(handoff_text, encoding="utf-8")
+        except Exception:
+            pass
+        # Write experiment guide only for non-generic execution paths.
+        if (not generic_autonomous) and (
+            ready_to_start
+            or not [r for r in missing_requirements if r.startswith("answer:")]
+        ):
             try:
                 self.progress_fn("experiment_guide", "Writing experiment guide...")
                 guide_text = self.bootstrap_backend.build_experiment_guide(
@@ -1984,15 +2172,18 @@ class Loopforge:
                 guide_path.write_text(guide_text.rstrip() + "\n", encoding="utf-8")
             except Exception:
                 pass
-        self.progress_fn(
-            "narrate", f"[{self.role_models.narrator}] Preparing summary..."
-        )
-        try:
-            human_update = self.narrator_backend.summarize_bootstrap(
-                resolved_turn, capability_context
-            )
-        except Exception:
+        if generic_autonomous:
             human_update = resolved_turn.assistant_message
+        else:
+            self.progress_fn(
+                "narrate", f"[{self.role_models.narrator}] Preparing summary..."
+            )
+            try:
+                human_update = self.narrator_backend.summarize_bootstrap(
+                    resolved_turn, capability_context
+                )
+            except Exception:
+                human_update = resolved_turn.assistant_message
         if resolved_turn.access_guide_path:
             human_update = (
                 f"{human_update}\n\nAccess guide: {resolved_turn.access_guide_path}"
@@ -2036,11 +2227,93 @@ class Loopforge:
         try:
             result = self.narrator_backend.interpret_feedback(turn, feedback, cap_ctx)
         except Exception:
+            result = None
+        fallback_primary_metric = _extract_primary_metric_from_feedback(
+            feedback, cap_ctx
+        )
+        if not result and not fallback_primary_metric:
             return None  # Fall through to full replan
+        action = (result or {}).get("action", "replan")
+        spec_updates = (result or {}).get("spec_updates", {})
+        if action == "replan" and fallback_primary_metric:
+            current_primary = turn.proposal.recommended_spec.primary_metric
+            existing_metadata = dict(turn.proposal.recommended_spec.metadata)
+            existing_bootstrap_answers = dict(
+                existing_metadata.get("bootstrap_answers", {})
+            )
+            existing_operator_guidance = existing_metadata.get("operator_guidance", [])
+            if not isinstance(existing_operator_guidance, list):
+                existing_operator_guidance = [str(existing_operator_guidance)]
+            merged_operator_guidance = [
+                item for item in existing_operator_guidance if str(item).strip()
+            ]
+            if feedback not in merged_operator_guidance:
+                merged_operator_guidance.append(feedback)
+            spec_updates = {
+                **spec_updates,
+                "primary_metric": {
+                    "name": fallback_primary_metric,
+                    "goal": current_primary.goal,
+                    **(
+                        {"display_name": current_primary.display_name}
+                        if current_primary.display_name
+                        else {}
+                    ),
+                },
+                "metadata": {
+                    "operator_guidance": merged_operator_guidance,
+                    "bootstrap_answers": {
+                        **existing_bootstrap_answers,
+                        "user_feedback": feedback,
+                    },
+                },
+            }
+            action = "patch"
+            result = {
+                "action": "patch",
+                "spec_updates": spec_updates,
+                "message": f"Updated the primary metric to {fallback_primary_metric} and carried your guidance into execution.",
+            }
         action = result.get("action", "replan")
         if action == "replan":
             return None
         spec_updates = result.get("spec_updates", {})
+        if fallback_primary_metric:
+            patched_primary = (
+                spec_updates.get("primary_metric")
+                if isinstance(spec_updates.get("primary_metric"), dict)
+                else None
+            )
+            patched_primary_name = (
+                patched_primary.get("name") if patched_primary is not None else None
+            )
+            metric_catalog = cap_ctx.available_metrics or {}
+            if _is_generic_metric_placeholder(patched_primary_name) or (
+                isinstance(patched_primary_name, str)
+                and patched_primary_name not in metric_catalog
+                and fallback_primary_metric in metric_catalog
+            ):
+                current_primary = turn.proposal.recommended_spec.primary_metric
+                spec_updates = {
+                    **spec_updates,
+                    "primary_metric": {
+                        **(patched_primary or {}),
+                        "name": fallback_primary_metric,
+                        "goal": (
+                            patched_primary.get("goal")
+                            if patched_primary
+                            and patched_primary.get("goal") in {"minimize", "maximize"}
+                            else current_primary.goal
+                        ),
+                    },
+                }
+                result = {
+                    **result,
+                    "spec_updates": spec_updates,
+                    "message": (
+                        f"Updated the primary metric to {fallback_primary_metric} and carried your guidance into execution."
+                    ),
+                }
         if not spec_updates:
             return None
         # Apply the patch to the existing spec
@@ -2055,20 +2328,34 @@ class Loopforge:
             patched_spec = ExperimentSpec.from_dict(spec_dict)
         except Exception:
             return None  # Malformed patch — fall through to replan
+        patched_spec = self._repair_incomplete_metrics(
+            spec=patched_spec,
+            capability_context=cap_ctx,
+            assistant_message=result.get("message", turn.assistant_message),
+        )
         patched_proposal = replace(turn.proposal, recommended_spec=patched_spec)
         # Re-run preflight checks on the patched spec
         executor_factory_path = self.resolve_executor_factory_path(
             patched_spec.objective
         )
+        # Clear stale execution_guidance_required if the hint was already answered
+        bootstrap_answers = patched_spec.metadata.get("bootstrap_answers", {})
+        if not isinstance(bootstrap_answers, dict):
+            bootstrap_answers = {}
+        if bootstrap_answers.get(EXECUTION_GUIDANCE_QUESTION_KEY):
+            cap_ctx = replace(
+                cap_ctx,
+                environment_facts={
+                    **cap_ctx.environment_facts,
+                    "execution_guidance_required": False,
+                },
+            )
         preflight_checks = run_preflight_checks(
             spec=patched_spec,
             capability_context=cap_ctx,
             memory_root=self.memory_root,
             executor_factory_path=executor_factory_path,
         )
-        bootstrap_answers = patched_spec.metadata.get("bootstrap_answers", {})
-        if not isinstance(bootstrap_answers, dict):
-            bootstrap_answers = {}
         missing_requirements = missing_requirements_from_bootstrap(
             questions=patched_proposal.questions,
             answers=bootstrap_answers,

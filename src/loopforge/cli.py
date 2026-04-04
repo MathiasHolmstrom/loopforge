@@ -32,6 +32,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run or steer the experimentation loop."
     )
+    parser.add_argument(
+        "--stream-llm-output",
+        action="store_true",
+        help="Stream raw model output during interactive planning and execution.",
+    )
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     run_parser = subparsers.add_parser("run")
@@ -130,6 +135,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--answers-json", default="{}")
     start_parser.add_argument("--iterations", type=int, default=None)
     start_parser.add_argument("--temperature", type=float, default=0.2)
+    start_parser.add_argument(
+        "--stream-llm-output",
+        action="store_true",
+        help="Stream raw model output during interactive planning and execution.",
+    )
 
     interject_parser = subparsers.add_parser("interject")
     interject_parser.add_argument("--memory-root", required=True)
@@ -173,6 +183,51 @@ def _sanitize_human_text(text: str) -> str:
     return sanitized.encode(encoding, errors="replace").decode(
         encoding, errors="replace"
     )
+
+
+def _looks_like_accidental_ready_prompt_feedback(
+    response: str, *, user_goal: str, turn: BootstrapTurn
+) -> bool:
+    cleaned = response.strip().lower()
+    if len(cleaned) < 20:
+        return False
+    goal = user_goal.strip().lower()
+    objective = (turn.proposal.recommended_spec.objective or "").strip().lower()
+    if cleaned == goal or cleaned == objective:
+        return True
+    if cleaned in goal or cleaned in objective:
+        return True
+    if goal and (goal in cleaned or objective in cleaned):
+        return True
+    return False
+
+
+def _should_confirm_first_ready_prompt_feedback(
+    response: str, *, just_bootstrapped_ready_turn: bool
+) -> bool:
+    if not just_bootstrapped_ready_turn:
+        return False
+    cleaned = response.strip()
+    if len(cleaned) < 20:
+        return False
+    return not _is_start_intent(cleaned)
+
+
+def _ready_plan_signature(turn: BootstrapTurn) -> str:
+    payload = {
+        "objective": turn.proposal.recommended_spec.objective,
+        "primary_metric": turn.proposal.recommended_spec.primary_metric.to_dict(),
+        "secondary_metrics": [
+            metric.to_dict() for metric in turn.proposal.recommended_spec.secondary_metrics
+        ],
+        "guardrail_metrics": [
+            metric.to_dict() for metric in turn.proposal.recommended_spec.guardrail_metrics
+        ],
+        "allowed_actions": list(turn.proposal.recommended_spec.allowed_actions),
+        "human_update": turn.human_update,
+        "ready_to_start": turn.ready_to_start,
+    }
+    return json.dumps(payload, sort_keys=True)
 
 
 def _friendly_requirement(requirement: str) -> str:
@@ -227,6 +282,9 @@ def _print_plan_summary(turn, *, print_fn=print) -> None:
     generic_autonomous = (
         spec.metadata.get("execution_backend_kind") == "generic_agentic"
     )
+    operator_guidance = spec.metadata.get("operator_guidance", [])
+    if isinstance(operator_guidance, str):
+        operator_guidance = [operator_guidance]
     print_fn("\n--- Experiment plan ---")
     print_fn(f"  Goal       : {_sanitize_human_text(spec.objective)}")
     print_fn(
@@ -243,6 +301,11 @@ def _print_plan_summary(turn, *, print_fn=print) -> None:
     print_fn(
         f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}"
     )
+    if operator_guidance:
+        latest_guidance = _sanitize_human_text(" ".join(str(operator_guidance[-1]).split()))
+        if len(latest_guidance) > 120:
+            latest_guidance = latest_guidance[:117] + "..."
+        print_fn(f"  Guidance   : {latest_guidance}")
     print_fn("")
 
 
@@ -434,10 +497,12 @@ def run_interactive_start(
     narrator_model: str | None = None,
     iterations: int | None = None,
     temperature: float = 0.2,
+    stream_llm_output: bool = False,
     input_fn=input,
     print_fn=print,
 ) -> int:
     progress_fn = _make_progress_fn(print_fn)
+    stream_fn = _make_stream_fn() if stream_llm_output else None
     app = Loopforge(
         executor_factory_path=executor_factory,
         repo_root=repo_root,
@@ -451,6 +516,7 @@ def run_interactive_start(
         narrator_model=narrator_model,
         temperature=temperature,
         progress_fn=progress_fn,
+        stream_fn=stream_fn,
     )
     user_goal = _prompt_non_empty(
         "What problem are we solving? ", input_fn=input_fn, print_fn=print_fn
@@ -460,6 +526,8 @@ def run_interactive_start(
     first_run = True
     resume_existing_run = False
     turn = None
+    last_ready_plan_signature: str | None = None
+    first_ready_prompt_after_bootstrap = False
     planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
     narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
@@ -476,6 +544,8 @@ def run_interactive_start(
             first_run = False
             try:
                 turn = app.bootstrap(user_goal=user_goal, answers=answers)
+                last_ready_plan_signature = None
+                first_ready_prompt_after_bootstrap = bool(turn.ready_to_start)
             except KeyboardInterrupt:
                 print_fn("\n\n--- Interrupted during planning ---")
                 try:
@@ -634,7 +704,10 @@ def run_interactive_start(
 
         # Show the plan summary if ready
         if turn.ready_to_start:
-            _print_plan_summary(turn, print_fn=print_fn)
+            plan_signature = _ready_plan_signature(turn)
+            if plan_signature != last_ready_plan_signature:
+                _print_plan_summary(turn, print_fn=print_fn)
+                last_ready_plan_signature = plan_signature
 
         # Always prompt the user — whether ready, blocked, or anything else
         if not response:
@@ -648,6 +721,24 @@ def run_interactive_start(
         if response.lower() in ("quit", "exit"):
             print_fn("Aborted.")
             return 0
+        if turn.ready_to_start and _should_confirm_first_ready_prompt_feedback(
+            response,
+            just_bootstrapped_ready_turn=first_ready_prompt_after_bootstrap,
+        ):
+            confirm = input_fn(
+                "Treat that text as feedback for the current plan? [y/N] "
+            ).strip()
+            first_ready_prompt_after_bootstrap = False
+            if confirm.lower() not in ("y", "yes"):
+                continue
+            user_goal = f"{user_goal.rstrip()} {response.lstrip()}".strip()
+            answers = {
+                key: value
+                for key, value in answers.items()
+                if key not in {"user_feedback", "discussion"}
+            }
+            replan_reason = "feedback"
+            continue
         if turn.ready_to_start and _is_start_intent(response):
             print_fn("\nStarting experiment loop...\n")
             try:
@@ -705,6 +796,15 @@ def run_interactive_start(
                 continue
             _print_result_summary(result, print_fn=print_fn)
             return 0
+        if turn.ready_to_start and _looks_like_accidental_ready_prompt_feedback(
+            response, user_goal=user_goal, turn=turn
+        ):
+            confirm = input_fn(
+                "That looks like pasted objective text. Update the plan with it? [y/N] "
+            ).strip()
+            if confirm.lower() not in ("y", "yes"):
+                continue
+        first_ready_prompt_after_bootstrap = False
         # If it looks like a question, answer it directly — no full re-plan
         if response.rstrip().endswith("?") or response.lower().startswith(
             ("what ", "why ", "how ", "can ", "do ", "is ", "are ")
@@ -737,6 +837,7 @@ def run_interactive_start(
                 _print_blocked_summary(turn, print_fn=print_fn)
             elif turn.ready_to_start:
                 _print_plan_summary(turn, print_fn=print_fn)
+                last_ready_plan_signature = _ready_plan_signature(turn)
             continue
         # Feedback requires full replan
         answers["user_feedback"] = response
@@ -865,7 +966,7 @@ def append_human_intervention(
 def main(argv: list[str] | None = None) -> int:
     args = build_argument_parser().parse_args(argv)
     if args.command is None:
-        return run_interactive_start()
+        return run_interactive_start(stream_llm_output=args.stream_llm_output)
     if args.command == "run":
         try:
             results = run_from_spec(
@@ -920,6 +1021,7 @@ def main(argv: list[str] | None = None) -> int:
                 narrator_model=args.narrator_model,
                 iterations=args.iterations,
                 temperature=args.temperature,
+                stream_llm_output=args.stream_llm_output,
             )
         app = Loopforge(
             executor_factory_path=args.executor_factory,

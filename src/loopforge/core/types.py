@@ -392,45 +392,6 @@ class ReflectionSummary:
 
 
 @dataclass(frozen=True)
-class OpsConsultation:
-    focus: str
-    guidance: str
-    commands: list[str] = field(default_factory=list)
-    required_env_vars: list[str] = field(default_factory=list)
-    risks: list[str] = field(default_factory=list)
-    should_consult: bool = True
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "OpsConsultation":
-        focus = payload.get("focus")
-        guidance = payload.get("guidance")
-        if not isinstance(focus, str) or not focus.strip():
-            focus = str(
-                payload.get("topic")
-                or payload.get("problem")
-                or "general execution help"
-            )
-        if not isinstance(guidance, str) or not guidance.strip():
-            guidance = str(
-                payload.get("advice")
-                or payload.get("recommendation")
-                or payload.get("summary")
-                or "No concrete guidance was returned."
-            )
-        return cls(
-            focus=focus,
-            guidance=guidance,
-            commands=payload.get("commands", []),
-            required_env_vars=payload.get("required_env_vars", []),
-            risks=payload.get("risks", []),
-            should_consult=payload.get("should_consult", True),
-        )
-
-
-@dataclass(frozen=True)
 class AccessGuide:
     summary: str
     required_env_vars: list[str] = field(default_factory=list)
