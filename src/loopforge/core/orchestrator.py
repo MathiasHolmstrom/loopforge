@@ -360,7 +360,11 @@ class ExperimentOrchestrator:
         if review.status == "accepted" and review.should_update_memory:
             accepted_summary = self._build_summary(snapshot, record)
             self.memory_store.append_accepted_summary(accepted_summary)
-            if accepted_summary.result == "improved":
+            if accepted_summary.result == "improved" or (
+                snapshot.best_summary is None
+                and accepted_summary.result == "unchanged"
+                and accepted_summary.primary_metric_value is not None
+            ):
                 self.memory_store.write_best_summary(accepted_summary)
         human_update = None
         if self.narrator_backend is not None:
@@ -860,12 +864,16 @@ class ExperimentOrchestrator:
         if action_type in inconclusive_actions:
             return "inconclusive"
         if best_value is None:
-            return "improved"
+            return "unchanged"
         if primary_metric.is_improvement(
             candidate=candidate_value, incumbent=best_value
         ):
             return "improved"
-        return "regressed"
+        if primary_metric.is_improvement(
+            candidate=best_value, incumbent=candidate_value
+        ):
+            return "regressed"
+        return "unchanged"
 
     @staticmethod
     def _guardrail_failures(
@@ -909,10 +917,11 @@ class ExperimentOrchestrator:
         failure_type = exc.__class__.__name__
         failure_summary = str(exc).strip() or failure_type
         lower_summary = failure_summary.lower()
+        lower_summary_with_type = f"{failure_type}: {failure_summary}".lower()
         recoverable = isinstance(
             exc, (ImportError, ModuleNotFoundError, FileNotFoundError)
         ) or any(
-            token in lower_summary
+            token in lower_summary_with_type
             for token in (
                 "no module named",
                 "file not found",
@@ -922,10 +931,12 @@ class ExperimentOrchestrator:
         )
         recovery_actions: list[str] = []
         if (
-            "permissionerror" in lower_summary
-            and "access is denied" in lower_summary
+            isinstance(exc, PermissionError)
+            or "permissionerror" in lower_summary_with_type
+        ) and (
+            "access is denied" in lower_summary
             and any(
-                token in lower_summary
+                token in lower_summary_with_type
                 for token in ("socketpair", "multiprocessing", "_ssock", "_csock")
             )
         ):

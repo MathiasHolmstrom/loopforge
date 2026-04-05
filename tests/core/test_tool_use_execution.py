@@ -416,6 +416,55 @@ class TestToolUseExecutor:
         assert "rmse" in outcome.metric_results
         assert outcome.metric_results["rmse"].value == 0.5
 
+    def test_stdout_metrics_from_failed_command_do_not_count_as_success(
+        self, tmp_path, monkeypatch
+    ):
+        executor = ToolUseExecutor(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+
+        responses = [
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1", "run_command", {"command": "python train.py"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _mock_response(content="Done.", tool_calls=None, finish_reason="stop"),
+        ]
+        call_idx = 0
+
+        def mock_completion(**kwargs):
+            nonlocal call_idx
+            resp = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return resp
+
+        import unittest.mock
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 1
+        mock_proc.stdout = '{"metric_results": {"rmse": 0.5}}'
+        mock_proc.stderr = "Traceback..."
+
+        with (
+            unittest.mock.patch("litellm.completion", mock_completion),
+            unittest.mock.patch(
+                "loopforge.core.tool_use_execution._run_subprocess_with_progress",
+                return_value=mock_proc,
+            ),
+        ):
+            outcome = executor.execute(candidate, snapshot)
+
+        assert outcome.status == "recoverable_failure"
+        assert outcome.failure_type == "MetricsNotReported"
+
 
 # ---------------------------------------------------------------------------
 # Utility tests

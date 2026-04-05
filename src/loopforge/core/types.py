@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 
 MetricGoal = Literal["maximize", "minimize", "unspecified"]
-IterationResult = Literal["improved", "regressed", "inconclusive"]
+IterationResult = Literal["improved", "regressed", "unchanged", "inconclusive"]
 OutcomeStatus = Literal["success", "recoverable_failure", "blocked"]
 ReviewStatus = Literal["accepted", "rejected", "pending_human"]
 HumanInterventionType = Literal["note", "override", "hypothesis"]

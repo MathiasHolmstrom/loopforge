@@ -455,6 +455,8 @@ def _make_iteration_callback(print_fn=print):
 
         # Review
         print_fn(f"  Review     : {review.status} — {review.reason}")
+        if reflection.recommended_next_action:
+            print_fn(f"  Next       : {reflection.recommended_next_action}")
 
         # Accepted summary result
         if cycle_result.accepted_summary is not None:
@@ -872,9 +874,10 @@ def run_interactive_start(
                     response, turn, cap_ctx
                 )
                 print_fn(f"\n{narrator_tag} {quick_reply}\n")
-            except Exception:
-                answers["user_feedback"] = response
-                replan_reason = "feedback"
+            except Exception as exc:
+                print_fn(
+                    f"\n{narrator_tag} I couldn't answer that question directly because the narrator failed: {exc}\n"
+                )
             continue
         # Try to patch the existing plan with the feedback (no full replan)
         self_progress = _make_progress_fn(print_fn)

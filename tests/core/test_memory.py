@@ -93,3 +93,22 @@ def test_memory_store_initialize_reset_state_clears_records_and_best_summary(
     assert snapshot.recent_records == []
     assert snapshot.recent_summaries == []
     assert snapshot.best_summary is None
+
+
+def test_memory_store_initialize_reset_state_clears_stale_agent_markdown(
+    tmp_path,
+) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    spec = build_spec()
+    store.initialize(spec)
+    stale_path = tmp_path / "memory" / "agent_markdown" / "bootstrap_handoff.md"
+    stale_path.write_text("# Old handoff\n", encoding="utf-8")
+
+    store.initialize(spec, reset_state=True)
+    snapshot = store.load_snapshot(capability_context=CapabilityContext())
+
+    assert not stale_path.exists()
+    assert all(
+        note.path != "agent_markdown/bootstrap_handoff.md"
+        for note in snapshot.markdown_memory
+    )

@@ -47,6 +47,13 @@ class FileMemoryStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self._artifacts_dir.mkdir(parents=True, exist_ok=True)
         self._agent_markdown_dir.mkdir(parents=True, exist_ok=True)
+        if reset_state and self._agent_markdown_dir.exists():
+            for path in sorted(self._agent_markdown_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self._agent_markdown_dir.mkdir(parents=True, exist_ok=True)
         self._objective_path.write_text(spec.objective.strip() + "\n", encoding="utf-8")
         self._spec_path.write_text(
             json.dumps(spec.to_dict(), indent=2, sort_keys=True) + "\n",

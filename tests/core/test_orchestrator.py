@@ -11,7 +11,12 @@ from loopforge import (
     ReviewDecision,
     RoutingExperimentExecutor,
 )
-from tests.support import FakeReflectionBackend, FakeReviewBackend, build_spec
+from tests.support import (
+    FakeReflectionBackend,
+    FakeReviewBackend,
+    FakeWorkerBackend,
+    build_spec,
+)
 
 
 def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(
@@ -150,6 +155,98 @@ def test_orchestrator_attempts_same_iteration_repair_in_baseline_first_phase(
     assert cycle.record.outcome.failure_type == "MetriclessIterationExhausted"
 
 
+def test_orchestrator_classifies_first_metric_bearing_iteration_as_unchanged_and_sets_best_summary(
+    tmp_path,
+) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    spec = build_spec()
+    orchestrator = ExperimentOrchestrator(
+        memory_store=store,
+        worker_backend=FakeWorkerBackend([ExperimentCandidate(
+            hypothesis="Run baseline.",
+            action_type="baseline",
+            change_type="baseline",
+            instructions="Run the baseline once.",
+        )]),
+        executor=RoutingExperimentExecutor(
+            {}, plan_executor=StaticExecutor([ExperimentOutcome(primary_metric_value=0.5)])
+        ),
+        reflection_backend=FakeReflectionBackend(
+            [ReflectionSummary(assessment="Baseline established.")]
+        ),
+        review_backend=FakeReviewBackend(
+            [ReviewDecision(status="accepted", reason="ok")]
+        ),
+        capability_provider=lambda spec: CapabilityContext(),
+    )
+    orchestrator.initialize(spec)
+
+    cycle = orchestrator.run_iteration()
+    snapshot = store.load_snapshot(capability_context=CapabilityContext())
+
+    assert cycle.accepted_summary is not None
+    assert cycle.accepted_summary.result == "unchanged"
+    assert snapshot.best_summary is not None
+    assert snapshot.best_summary.result == "unchanged"
+    assert snapshot.best_summary.primary_metric_value == 0.5
+
+
+def test_orchestrator_classifies_metric_ties_as_unchanged(tmp_path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    spec = build_spec()
+
+    orchestrator = ExperimentOrchestrator(
+        memory_store=store,
+        worker_backend=FakeWorkerBackend(
+            [
+                ExperimentCandidate(
+                    hypothesis="Run baseline.",
+                    action_type="baseline",
+                    change_type="baseline",
+                    instructions="Run the baseline once.",
+                ),
+                ExperimentCandidate(
+                    hypothesis="Repeat with same score.",
+                    action_type="train",
+                    change_type="train",
+                    instructions="Train again.",
+                ),
+            ]
+        ),
+        executor=RoutingExperimentExecutor(
+            {},
+            plan_executor=StaticExecutor(
+                [
+                    ExperimentOutcome(primary_metric_value=0.5),
+                    ExperimentOutcome(primary_metric_value=0.5),
+                ]
+            ),
+        ),
+        reflection_backend=FakeReflectionBackend(
+            [
+                ReflectionSummary(assessment="Baseline established."),
+                ReflectionSummary(assessment="No change."),
+            ]
+        ),
+        review_backend=FakeReviewBackend(
+            [
+                ReviewDecision(status="accepted", reason="ok"),
+                ReviewDecision(status="accepted", reason="ok"),
+            ]
+        ),
+        capability_provider=lambda spec: CapabilityContext(),
+    )
+    orchestrator.initialize(spec)
+
+    first_cycle = orchestrator.run_iteration()
+    second_cycle = orchestrator.run_iteration()
+
+    assert first_cycle.accepted_summary is not None
+    assert first_cycle.accepted_summary.result == "unchanged"
+    assert second_cycle.accepted_summary is not None
+    assert second_cycle.accepted_summary.result == "unchanged"
+
+
 def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
     tmp_path,
 ) -> None:
@@ -214,3 +311,23 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
     assert all(
         result.record.outcome.status == "recoverable_failure" for result in results
     )
+
+
+class StaticExecutor:
+    def __init__(self, outcomes) -> None:
+        self._outcomes = list(outcomes)
+
+    def execute(self, candidate, snapshot):
+        return self._outcomes.pop(0)
+
+
+def test_build_failure_outcome_treats_windows_multiprocessing_permission_error_as_recoverable() -> None:
+    exc = PermissionError(
+        "[WinError 5] Access is denied: '_multiprocessing.socketpair _ssock _csock'"
+    )
+
+    outcome = ExperimentOrchestrator._build_failure_outcome(exc)
+
+    assert outcome.status == "recoverable_failure"
+    assert outcome.failure_type == "MultiprocessingPermissionError"
+    assert outcome.recoverable is True

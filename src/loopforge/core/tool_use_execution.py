@@ -648,6 +648,11 @@ def _execute_run_command(
     return "\n".join(parts)
 
 
+def _command_succeeded(output: str) -> bool:
+    first_line = output.splitlines()[0] if output else ""
+    return first_line.startswith("exit_code=0")
+
+
 def _execute_report_metrics(
     args: dict[str, Any], spec: ExperimentSpec
 ) -> tuple[str, dict[str, MetricResult], float | None]:
@@ -913,7 +918,7 @@ class ToolUseExecutor:
         # State accumulated during the loop
         reported_metrics: dict[str, MetricResult] = {}
         reported_primary_value: float | None = None
-        command_outputs: list[str] = []  # stdout from run_command calls
+        successful_command_outputs: list[str] = []
         tool_call_log: list[dict[str, Any]] = []
         files_written: list[str] = []
         metrics_reported = False
@@ -940,7 +945,7 @@ class ToolUseExecutor:
                     spec=spec,
                     reported_metrics=reported_metrics,
                     reported_primary_value=reported_primary_value,
-                    command_outputs=command_outputs,
+                    successful_command_outputs=successful_command_outputs,
                     tool_call_log=tool_call_log,
                     files_written=files_written,
                     metrics_reported=metrics_reported,
@@ -1028,7 +1033,8 @@ class ToolUseExecutor:
 
                 # Track side effects
                 if tool_name == "run_command":
-                    command_outputs.append(tool_result)
+                    if _command_succeeded(tool_result):
+                        successful_command_outputs.append(tool_result)
                     if tool_result.startswith(
                         "exit_code="
                     ) and not tool_result.startswith("exit_code=0"):
@@ -1076,7 +1082,7 @@ class ToolUseExecutor:
             spec=spec,
             reported_metrics=reported_metrics,
             reported_primary_value=reported_primary_value,
-            command_outputs=command_outputs,
+            successful_command_outputs=successful_command_outputs,
             tool_call_log=tool_call_log,
             files_written=files_written,
             metrics_reported=metrics_reported,
@@ -1120,7 +1126,7 @@ class ToolUseExecutor:
         spec: ExperimentSpec,
         reported_metrics: dict[str, MetricResult],
         reported_primary_value: float | None,
-        command_outputs: list[str],
+        successful_command_outputs: list[str],
         tool_call_log: list[dict[str, Any]],
         files_written: list[str],
         metrics_reported: bool,
@@ -1132,7 +1138,7 @@ class ToolUseExecutor:
 
         # Fallback: try to extract metrics from command stdout
         if not metric_results:
-            for output in reversed(command_outputs):
+            for output in reversed(successful_command_outputs):
                 parsed = _extract_metric_payload_from_text(output, spec)
                 if parsed["metric_results"]:
                     metric_results.update(parsed["metric_results"])

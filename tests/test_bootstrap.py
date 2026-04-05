@@ -7,6 +7,7 @@ from loopforge import (
     BootstrapTurn,
     CapabilityContext,
     ExperimentSpecProposal,
+    FileMemoryStore,
     Loopforge,
 )
 from loopforge.auto_adapter import build_repo_scan_context
@@ -245,3 +246,159 @@ def test_apply_feedback_does_not_persist_free_text_as_bootstrap_answer(
         "bootstrap_answers", {}
     )
     assert "user_feedback" not in bootstrap_answers
+
+
+def test_bootstrap_surfaces_runbook_generation_warning_without_failing(
+    tmp_path, monkeypatch
+) -> None:
+    progress: list[tuple[str, str]] = []
+
+    class StubBootstrapBackend:
+        def build_experiment_guide(self, turn, capability_context, answers):
+            return "# Guide"
+
+    class StubNarrator:
+        def summarize_bootstrap(self, turn, capability_context):
+            return "Ready to start."
+
+    app = Loopforge(
+        memory_root=tmp_path / "memory",
+        bootstrap_backend=StubBootstrapBackend(),
+        narrator_backend=StubNarrator(),
+        progress_fn=lambda stage, message: progress.append((stage, message)),
+    )
+
+    monkeypatch.setattr(
+        app,
+        "resolve_execution_backend",
+        lambda objective: bootstrap_module.ExecutionBackendResolution(
+            kind="supported", factory_path="fake.module:build_adapter"
+        ),
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.discover_capabilities_for_objective",
+        lambda **kwargs: CapabilityContext(
+            environment_facts={
+                "execution_backend_kind": "supported",
+                "python_executable": "python",
+                "repo_root": str(tmp_path),
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap._trace_data_source",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.run_preflight_checks",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap._verify_execution_environment",
+        lambda **kwargs: {},
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.should_prepare_access_guide",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.build_execution_runbook",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("runbook failed")),
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.build_bootstrap_handoff",
+        lambda **kwargs: "# Handoff",
+    )
+
+    class StubPlanner:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        def plan(self, **kwargs):
+            return {
+                "contract": {
+                    "source_script": "src/train.py",
+                    "baseline_function": "train_model",
+                    "data_loading": "load_data()",
+                    "target_column": "target",
+                    "primary_metric": "rmse",
+                    "primary_metric_goal": "minimize",
+                },
+                "questions": [],
+            }
+
+    monkeypatch.setattr("loopforge.bootstrap.ToolUsePlanner", StubPlanner)
+
+    turn = app.bootstrap(user_goal="Improve the baseline model")
+
+    assert "Could not write execution runbook: runbook failed" in turn.human_update
+    assert any(
+        "Could not write execution runbook: runbook failed" == note
+        for note in turn.proposal.notes
+    )
+    assert any(stage == "execution_runbook_warning" for stage, _ in progress)
+
+
+def test_metric_repair_surfaces_warning_when_inference_fails(tmp_path) -> None:
+    progress: list[tuple[str, str]] = []
+
+    class StubNarrator:
+        def fix_incomplete_metrics(self, *args, **kwargs):
+            raise RuntimeError("LLM unavailable")
+
+    app = Loopforge(
+        memory_root=tmp_path / "memory",
+        narrator_backend=StubNarrator(),
+        progress_fn=lambda stage, message: progress.append((stage, message)),
+    )
+    spec = build_spec(
+        primary_metric=bootstrap_module.PrimaryMetric(
+            name="primary_metric",
+            goal="unspecified",
+        )
+    )
+
+    repaired = app._repair_incomplete_metrics(
+        spec=spec,
+        capability_context=CapabilityContext(),
+        assistant_message="Need to infer the metric goal.",
+    )
+
+    assert repaired == spec
+    assert any(
+        stage == "fix_metrics_warning_llm" and "LLM unavailable" in message
+        for stage, message in progress
+    )
+
+
+def test_start_from_bootstrap_turn_blocks_on_unreadable_persisted_state(
+    tmp_path,
+) -> None:
+    memory_root = tmp_path / "memory"
+    spec = build_spec(objective="Improve the baseline model")
+    store = FileMemoryStore(memory_root)
+    store.initialize(spec)
+    (memory_root / "experiment_spec.json").write_text("{bad json", encoding="utf-8")
+
+    app = Loopforge(memory_root=memory_root)
+    turn = BootstrapTurn(
+        assistant_message="Ready.",
+        proposal=ExperimentSpecProposal(
+            objective=spec.objective,
+            recommended_spec=spec,
+            questions=[],
+        ),
+        role_models=bootstrap_module.default_role_models(),
+        ready_to_start=True,
+    )
+
+    result = app.start_from_bootstrap_turn(
+        bootstrap_turn=turn,
+        user_goal=spec.objective,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["error"]["type"] == "PersistedStateLoadFailed"
+    assert "Refusing to reset persisted memory automatically" in result["error"][
+        "message"
+    ]

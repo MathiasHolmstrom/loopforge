@@ -2071,7 +2071,11 @@ class Loopforge:
         spec_dict = _apply_metric_catalog_defaults(spec.to_dict(), capability_context)
         try:
             patched_spec = ExperimentSpec.from_dict(spec_dict)
-        except Exception:
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_catalog",
+                f"Metric catalog defaults could not be applied cleanly: {exc}",
+            )
             patched_spec = spec
 
         all_metrics = [
@@ -2104,7 +2108,11 @@ class Loopforge:
                     current_spec=patched_spec.to_dict(),
                     assistant_message=assistant_message,
                 )
-        except Exception:
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_llm",
+                f"Metric repair inference failed; keeping the current spec unchanged: {exc}",
+            )
             return patched_spec
 
         if not fixes:
@@ -2117,7 +2125,11 @@ class Loopforge:
         spec_dict = _apply_metric_catalog_defaults(spec_dict, capability_context)
         try:
             return ExperimentSpec.from_dict(spec_dict)
-        except Exception:
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_patch",
+                f"Metric repair returned an invalid spec patch; keeping the current spec unchanged: {exc}",
+            )
             return patched_spec
 
     def _resolve_explicit_primary_metric_goal(
@@ -2159,9 +2171,17 @@ class Loopforge:
                     current_spec=spec.to_dict(),
                     assistant_message=assistant_message,
                 )
-            except Exception:
+            except Exception as exc:
+                self.progress_fn(
+                    "fix_metrics_warning_primary_goal",
+                    f"Primary metric goal inference failed; keeping the current goal unchanged: {exc}",
+                )
                 return spec
-        except Exception:
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_primary_goal",
+                f"Primary metric goal inference failed; keeping the current goal unchanged: {exc}",
+            )
             return spec
 
         if not isinstance(fixes, dict):
@@ -2180,7 +2200,11 @@ class Loopforge:
         }
         try:
             return ExperimentSpec.from_dict(spec_dict)
-        except Exception:
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_primary_patch",
+                f"Primary metric goal patch was invalid; keeping the current goal unchanged: {exc}",
+            )
             return spec
 
     def bootstrap(
@@ -2497,6 +2521,13 @@ class Loopforge:
                 progress_fn=self.progress_fn,
             )
 
+        bootstrap_warnings: list[str] = []
+
+        def add_bootstrap_warning(stage: str, message: str) -> None:
+            if message not in bootstrap_warnings:
+                bootstrap_warnings.append(message)
+            self.progress_fn(stage, message)
+
         access_guide_path = None
         if should_prepare_access_guide(
             capability_context=capability_context,
@@ -2516,8 +2547,11 @@ class Loopforge:
                     access_guide.markdown.rstrip() + "\n", encoding="utf-8"
                 )
                 access_guide_path = str(guide_path)
-            except Exception:
-                pass
+            except Exception as exc:
+                add_bootstrap_warning(
+                    "access_guide_warning",
+                    f"Could not build the access guide: {exc}",
+                )
         resolved_turn = replace(
             turn,
             preflight_checks=preflight_checks,
@@ -2541,8 +2575,11 @@ class Loopforge:
             agent_markdown_dir.mkdir(parents=True, exist_ok=True)
             runbook_path = agent_markdown_dir / "execution_runbook.md"
             runbook_path.write_text(runbook_text, encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            add_bootstrap_warning(
+                "execution_runbook_warning",
+                f"Could not write execution runbook: {exc}",
+            )
         try:
             self.progress_fn("bootstrap_handoff", "Writing bootstrap handoff...")
             handoff_text = build_bootstrap_handoff(
@@ -2555,8 +2592,11 @@ class Loopforge:
             agent_markdown_dir.mkdir(parents=True, exist_ok=True)
             handoff_path = agent_markdown_dir / "bootstrap_handoff.md"
             handoff_path.write_text(handoff_text, encoding="utf-8")
-        except Exception:
-            pass
+        except Exception as exc:
+            add_bootstrap_warning(
+                "bootstrap_handoff_warning",
+                f"Could not write bootstrap handoff: {exc}",
+            )
         if ready_to_start or not [
             r for r in missing_requirements if r.startswith("answer:")
         ]:
@@ -2571,8 +2611,11 @@ class Loopforge:
                 agent_markdown_dir.mkdir(parents=True, exist_ok=True)
                 guide_path = agent_markdown_dir / "experiment_guide.md"
                 guide_path.write_text(guide_text.rstrip() + "\n", encoding="utf-8")
-            except Exception:
-                pass
+            except Exception as exc:
+                add_bootstrap_warning(
+                    "experiment_guide_warning",
+                    f"Could not write experiment guide: {exc}",
+                )
         if generic_autonomous:
             human_update = resolved_turn.assistant_message
         else:
@@ -2583,8 +2626,26 @@ class Loopforge:
                 human_update = self.narrator_backend.summarize_bootstrap(
                     resolved_turn, capability_context
                 )
-            except Exception:
+            except Exception as exc:
+                add_bootstrap_warning(
+                    "bootstrap_summary_warning",
+                    f"Could not prepare the bootstrap summary; falling back to the planner message: {exc}",
+                )
                 human_update = resolved_turn.assistant_message
+        if bootstrap_warnings:
+            resolved_turn = replace(
+                resolved_turn,
+                proposal=replace(
+                    resolved_turn.proposal,
+                    notes=[*resolved_turn.proposal.notes, *bootstrap_warnings],
+                ),
+            )
+            warning_block = "Warnings:\n" + "\n".join(
+                f"- {warning}" for warning in bootstrap_warnings
+            )
+            human_update = (
+                f"{human_update}\n\n{warning_block}" if human_update else warning_block
+            )
         if resolved_turn.access_guide_path:
             human_update = (
                 f"{human_update}\n\nAccess guide: {resolved_turn.access_guide_path}"
@@ -2899,10 +2960,26 @@ class Loopforge:
         if not reset_state and memory_store.has_persisted_state():
             try:
                 stored_spec = memory_store.load_spec()
-            except Exception:
-                reset_state = True
+            except Exception as exc:
+                return {
+                    "status": "blocked",
+                    "bootstrap": bootstrap_turn.to_dict(),
+                    "error": {
+                        "type": "PersistedStateLoadFailed",
+                        "message": (
+                            "Existing loop state could not be read. Refusing to reset "
+                            "persisted memory automatically."
+                        ),
+                        "detail": str(exc),
+                        "cause_type": exc.__class__.__name__,
+                    },
+                }
             else:
                 if stored_spec.to_dict() != spec.to_dict():
+                    self.progress_fn(
+                        "state_reset_warning",
+                        "Stored experiment spec differs from the current bootstrap plan; resetting persisted loop state for a fresh run.",
+                    )
                     reset_state = True
         orchestrator, _runtime = self.build_orchestrator(
             spec=spec,
