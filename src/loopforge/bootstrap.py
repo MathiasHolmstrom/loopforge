@@ -265,7 +265,9 @@ def _coerce_optional_positive_float(
     raise ValueError(f"{path}: `{key}` must be a number when provided.")
 
 
-def _parse_repo_loop_settings(payload: dict[str, Any], *, path: Path) -> RepoLoopSettings:
+def _parse_repo_loop_settings(
+    payload: dict[str, Any], *, path: Path
+) -> RepoLoopSettings:
     stop_payload = payload.get("stop_conditions")
     if stop_payload is None:
         stop_payload = {}
@@ -296,7 +298,9 @@ def _parse_repo_loop_settings(payload: dict[str, Any], *, path: Path) -> RepoLoo
     )
 
 
-def load_repo_loop_settings(repo_root: Path | str) -> tuple[RepoLoopSettings, Path | None]:
+def load_repo_loop_settings(
+    repo_root: Path | str,
+) -> tuple[RepoLoopSettings, Path | None]:
     root = Path(repo_root)
     for relative_path in REPO_SETTINGS_FILENAMES:
         candidate = root / relative_path
@@ -2149,7 +2153,9 @@ class Loopforge:
                 parts.append(f"{', '.join(roles)} -> {model}")
             model_summary = " | ".join(parts)
         max_iter = loop.max_iterations if loop.max_iterations is not None else 30
-        max_hours = loop.max_autonomous_hours if loop.max_autonomous_hours is not None else 6
+        max_hours = (
+            loop.max_autonomous_hours if loop.max_autonomous_hours is not None else 6
+        )
         lines = [
             "Configuration:",
             f"  Models     : {model_summary}",
@@ -2449,9 +2455,26 @@ class Loopforge:
                 "fix_metrics_warning_llm",
                 f"Metric repair inference failed; keeping the current spec unchanged: {exc}",
             )
-        return patched_spec
+        if not fixes:
+            return patched_spec
 
-    def _apply_repo_stop_condition_defaults(self, spec: ExperimentSpec) -> ExperimentSpec:
+        spec_dict = patched_spec.to_dict()
+        for key in ("primary_metric", "secondary_metrics", "guardrail_metrics"):
+            if key in fixes:
+                spec_dict[key] = fixes[key]
+        spec_dict = _apply_metric_catalog_defaults(spec_dict, capability_context)
+        try:
+            return ExperimentSpec.from_dict(spec_dict)
+        except Exception as exc:
+            self.progress_fn(
+                "fix_metrics_warning_patch",
+                f"Metric repair returned an invalid spec patch; keeping the current spec unchanged: {exc}",
+            )
+            return patched_spec
+
+    def _apply_repo_stop_condition_defaults(
+        self, spec: ExperimentSpec
+    ) -> ExperimentSpec:
         stop_conditions = dict(spec.stop_conditions)
         changed = False
         if (
@@ -2471,23 +2494,6 @@ class Loopforge:
         if not changed:
             return spec
         return replace(spec, stop_conditions=stop_conditions)
-
-        if not fixes:
-            return patched_spec
-
-        spec_dict = patched_spec.to_dict()
-        for key in ("primary_metric", "secondary_metrics", "guardrail_metrics"):
-            if key in fixes:
-                spec_dict[key] = fixes[key]
-        spec_dict = _apply_metric_catalog_defaults(spec_dict, capability_context)
-        try:
-            return ExperimentSpec.from_dict(spec_dict)
-        except Exception as exc:
-            self.progress_fn(
-                "fix_metrics_warning_patch",
-                f"Metric repair returned an invalid spec patch; keeping the current spec unchanged: {exc}",
-            )
-            return patched_spec
 
     def _resolve_explicit_primary_metric_goal(
         self,

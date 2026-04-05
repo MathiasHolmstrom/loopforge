@@ -15,8 +15,10 @@ from loopforge.auto_adapter import synthesize_auto_adapter
 
 
 def test_installable_python_dependency_suggests_pip_command() -> None:
-    package_name, install_command = pilot_adapters_module._installable_python_dependency(
-        ModuleNotFoundError("No module named 'sklearn'")
+    package_name, install_command = (
+        pilot_adapters_module._installable_python_dependency(
+            ModuleNotFoundError("No module named 'sklearn'")
+        )
     )
 
     assert package_name == "sklearn"

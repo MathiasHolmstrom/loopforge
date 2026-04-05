@@ -939,9 +939,9 @@ class TestToolUseReviewer:
         assert len(captured_messages) >= 2
         nudge_msgs = captured_messages[1]  # messages sent on second LLM call
         nudge_user_msg = [m for m in nudge_msgs if m.get("role") == "user"]
-        assert any(
-            "report_review" in m.get("content", "") for m in nudge_user_msg
-        ), "Nudge should reference report_review, not _reviewer_done_"
+        assert any("report_review" in m.get("content", "") for m in nudge_user_msg), (
+            "Nudge should reference report_review, not _reviewer_done_"
+        )
         assert not any(
             "_reviewer_done_" in m.get("content", "") for m in nudge_user_msg
         ), "Nudge should NOT reference the sentinel _reviewer_done_"

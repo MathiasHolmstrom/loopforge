@@ -22,35 +22,35 @@ from tests.support import build_spec
         (
             True,
             False,
-                {
-                    "planner": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "consultation": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "narrator": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                },
+            {
+                "planner": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "consultation": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "narrator": bootstrap_module.DEFAULT_OPENAI_MODEL,
+            },
         ),
         (
             False,
             True,
-                {
-                    "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "worker": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "review": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                },
+            {
+                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "worker": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "review": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+            },
         ),
         (
             True,
             True,
-                {
-                    "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                    "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                    "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                },
+            {
+                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+            },
         ),
     ],
 )
@@ -80,9 +80,7 @@ def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> N
     assert app.bootstrap_backend.model == bootstrap_module._normalise_model_id(
         app.role_models.planner
     )
-    expected_helper = bootstrap_module._normalise_model_id(
-        app.role_models.consultation
-    )
+    expected_helper = bootstrap_module._normalise_model_id(app.role_models.consultation)
     assert app.access_advisor_backend.model == expected_helper
     assert app.narrator_backend.model == bootstrap_module._normalise_model_id(
         app.role_models.narrator

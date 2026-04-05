@@ -600,7 +600,11 @@ def run_interactive_start(
     planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
     narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
-        response = "y" if pending_resume_start and turn is not None and turn.ready_to_start else ""
+        response = (
+            "y"
+            if pending_resume_start and turn is not None and turn.ready_to_start
+            else ""
+        )
         pending_resume_start = False
         deferred_start_response: str | None = None
         # Only call the LLM when we actually need a new plan

@@ -396,7 +396,9 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
     )
 
 
-def test_orchestrator_run_allows_runtime_max_autonomous_hours_override(tmp_path) -> None:
+def test_orchestrator_run_allows_runtime_max_autonomous_hours_override(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "memory")
     spec = build_spec(stop_conditions={"max_iterations": 3, "max_autonomous_hours": 6})
     orchestrator = ExperimentOrchestrator(
