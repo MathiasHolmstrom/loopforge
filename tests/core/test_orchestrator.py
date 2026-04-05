@@ -163,18 +163,18 @@ def test_orchestrator_classifies_first_metric_bearing_iteration_as_unchanged_and
     orchestrator = ExperimentOrchestrator(
         memory_store=store,
         worker_backend=FakeWorkerBackend(
-                [
-                    ExperimentCandidate(
-                        hypothesis="Run baseline.",
-                        action_type="baseline",
-                        change_type="baseline",
-                        instructions="Run the baseline once.",
-                        execution_steps=[
-                            ExecutionStep(kind="shell", command="python src/train.py")
-                        ],
-                    )
-                ]
-            ),
+            [
+                ExperimentCandidate(
+                    hypothesis="Run baseline.",
+                    action_type="baseline",
+                    change_type="baseline",
+                    instructions="Run the baseline once.",
+                    execution_steps=[
+                        ExecutionStep(kind="shell", command="python src/train.py")
+                    ],
+                )
+            ]
+        ),
         executor=RoutingExperimentExecutor(
             {},
             plan_executor=StaticExecutor([ExperimentOutcome(primary_metric_value=0.5)]),
@@ -260,7 +260,9 @@ def test_orchestrator_classifies_metric_ties_as_unchanged(tmp_path) -> None:
     assert second_cycle.accepted_summary.result == "unchanged"
 
 
-def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(tmp_path) -> None:
+def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
+    tmp_path,
+) -> None:
     store = FileMemoryStore(tmp_path / "memory")
     spec = build_spec(
         guardrail_metrics=[
@@ -304,10 +306,16 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(tmp_pat
             ),
         ),
         reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Baseline."), ReflectionSummary(assessment="Improved.")]
+            [
+                ReflectionSummary(assessment="Baseline."),
+                ReflectionSummary(assessment="Improved."),
+            ]
         ),
         review_backend=FakeReviewBackend(
-            [ReviewDecision(status="accepted", reason="ok"), ReviewDecision(status="accepted", reason="ok")]
+            [
+                ReviewDecision(status="accepted", reason="ok"),
+                ReviewDecision(status="accepted", reason="ok"),
+            ]
         ),
         capability_provider=lambda spec: CapabilityContext(),
     )
@@ -316,7 +324,7 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(tmp_pat
     first_cycle = orchestrator.run_iteration()
     assert first_cycle.accepted_summary is not None
 
-        # placeholder
+    # placeholder
 
 
 def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(

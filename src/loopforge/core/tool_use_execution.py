@@ -1865,12 +1865,18 @@ class ToolUseReviewer:
         evidence_parts: list[str] = []
         if searches:
             evidence_parts.append(
-                "searches=" + ", ".join(searches[:2]) + ("..." if len(searches) > 2 else "")
+                "searches="
+                + ", ".join(searches[:2])
+                + ("..." if len(searches) > 2 else "")
             )
         if commands:
             evidence_parts.append(
-                "commands=" + ", ".join(commands[:2]) + ("..." if len(commands) > 2 else "")
+                "commands="
+                + ", ".join(commands[:2])
+                + ("..." if len(commands) > 2 else "")
             )
         if evidence_parts:
-            handoff.append("Reviewer evidence trail: " + "; ".join(evidence_parts) + ".")
+            handoff.append(
+                "Reviewer evidence trail: " + "; ".join(evidence_parts) + "."
+            )
         return handoff[:2]
