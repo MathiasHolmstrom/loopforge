@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import loopforge.bootstrap as bootstrap_module
@@ -15,41 +17,64 @@ from tests.support import build_spec
 
 
 @pytest.mark.parametrize(
-    ("helpers_supported", "kwargs", "expected_helper_model", "expected_core_model"),
+    ("openai_available", "anthropic_available", "expected_models"),
     [
         (
+            True,
             False,
             {
-                "consultation_model": "anthropic/claude-sonnet-4-5",
-                "narrator_model": "anthropic/claude-sonnet-4-5",
+                "planner": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "reflection": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "consultation": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "narrator": bootstrap_module.DEFAULT_OPENAI_MODEL,
             },
-            bootstrap_module.DEFAULT_OPENAI_MODEL,
-            bootstrap_module.DEFAULT_OPENAI_MODEL,
         ),
-        (True, {}, bootstrap_module.DEFAULT_CLAUDE_MODEL, None),
+        (
+            False,
+            True,
+            {
+                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "worker": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "reflection": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "review": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+            },
+        ),
+        (
+            True,
+            True,
+            {
+                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "reflection": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+            },
+        ),
     ],
 )
-def test_default_role_models_helper_routing(
+def test_default_role_models_provider_routing(
     monkeypatch,
-    helpers_supported: bool,
-    kwargs: dict[str, str],
-    expected_helper_model: str,
-    expected_core_model: str | None,
+    openai_available: bool,
+    anthropic_available: bool,
+    expected_models: dict[str, str],
 ) -> None:
     monkeypatch.setattr(
-        "loopforge.bootstrap._can_use_anthropic_helpers", lambda: helpers_supported
+        "loopforge.bootstrap._can_use_openai_models", lambda: openai_available
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap._can_use_anthropic_helpers",
+        lambda: anthropic_available,
     )
     monkeypatch.delenv("ANTHROPIC_BEDROCK_BASE_URL", raising=False)
 
-    role_models = bootstrap_module.default_role_models(**kwargs)
+    role_models = bootstrap_module.default_role_models()
 
-    if expected_core_model is not None:
-        assert role_models.planner == expected_core_model
-        assert role_models.worker == expected_core_model
-        assert role_models.reflection == expected_core_model
-        assert role_models.review == expected_core_model
-    assert role_models.consultation == expected_helper_model
-    assert role_models.narrator == expected_helper_model
+    assert role_models.to_dict() == expected_models
 
 
 def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> None:
@@ -64,6 +89,75 @@ def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> N
     assert (
         app.bootstrap_backend.max_completion_tokens
         == bootstrap_module.DEFAULT_ROLE_MAX_COMPLETION_TOKENS["planner"]
+    )
+
+
+def test_loopforge_loads_repo_role_model_settings_and_preserves_explicit_overrides(
+    tmp_path, monkeypatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "loopforge.models.json").write_text(
+        json.dumps(
+            {
+                "model_profile": "all_codex",
+                "roles": {
+                    "planner": "anthropic/claude-sonnet-4-5",
+                    "worker": "anthropic/claude-opus-4-6-v1",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("loopforge.bootstrap._can_use_openai_models", lambda: True)
+    monkeypatch.setattr("loopforge.bootstrap._can_use_anthropic_helpers", lambda: True)
+
+    app = Loopforge(
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        worker_model="openai/gpt-5.4-mini",
+    )
+
+    assert app.role_models.planner == "anthropic/claude-sonnet-4-5"
+    assert app.role_models.worker == "openai/gpt-5.4-mini"
+
+
+def test_loopforge_warns_when_repo_role_model_provider_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "loopforge.models.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    "worker": "openai/gpt-5.4",
+                    "review": "openai/gpt-5.4",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("loopforge.bootstrap._can_use_openai_models", lambda: False)
+    monkeypatch.setattr("loopforge.bootstrap._can_use_anthropic_helpers", lambda: True)
+    progress: list[tuple[str, str]] = []
+
+    app = Loopforge(
+        repo_root=repo_root,
+        memory_root=tmp_path / "memory",
+        progress_fn=lambda stage, message: progress.append((stage, message)),
+    )
+
+    assert app.role_models.worker == bootstrap_module.DEFAULT_CLAUDE_MODEL
+    assert app.role_models.review == bootstrap_module.DEFAULT_CLAUDE_MODEL
+    assert any("Loaded role model settings from" in message for _, message in progress)
+    assert any(
+        "OpenAI credentials were not detected; routing all agent roles through Claude models."
+        in message
+        for _, message in progress
+    )
+    assert any(
+        "worker requested `openai/gpt-5.4`" in message for _, message in progress
     )
 
 

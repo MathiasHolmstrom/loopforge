@@ -7,6 +7,8 @@ from loopforge import (
     ExperimentOrchestrator,
     ExperimentOutcome,
     FileMemoryStore,
+    MetricResult,
+    MetricSpec,
     ReflectionSummary,
     ReviewDecision,
     RoutingExperimentExecutor,
@@ -265,12 +267,7 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
 ) -> None:
     store = FileMemoryStore(tmp_path / "memory")
     spec = build_spec(
-        guardrail_metrics=[
-            bootstrapless_guardrail := build_spec().primary_metric.__class__(
-                name="mean_absolute_error",
-                goal="minimize",
-            )
-        ]
+        guardrail_metrics=[MetricSpec(name="mean_absolute_error", goal="minimize")]
     )
 
     orchestrator = ExperimentOrchestrator(
@@ -282,12 +279,18 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
                     action_type="baseline",
                     change_type="baseline",
                     instructions="Run baseline once.",
+                    execution_steps=[
+                        ExecutionStep(kind="shell", command="python src/train.py")
+                    ],
                 ),
                 ExperimentCandidate(
                     hypothesis="Improve the model.",
                     action_type="train",
                     change_type="train",
                     instructions="Train an improved model.",
+                    execution_steps=[
+                        ExecutionStep(kind="shell", command="python src/train.py")
+                    ],
                 ),
             ]
         ),
@@ -297,11 +300,22 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
                 [
                     ExperimentOutcome(
                         metric_results={
-                            "log_loss": bootstrapless_guardrail.__class__(
-                                name="log_loss", goal="minimize"
-                            )  # placeholder to keep syntax invalid?
-                        }
-                    )
+                            "log_loss": MetricResult(name="log_loss", value=0.5),
+                            "mean_absolute_error": MetricResult(
+                                name="mean_absolute_error", value=1.0
+                            ),
+                        },
+                        primary_metric_value=0.5,
+                    ),
+                    ExperimentOutcome(
+                        metric_results={
+                            "log_loss": MetricResult(name="log_loss", value=0.4),
+                            "mean_absolute_error": MetricResult(
+                                name="mean_absolute_error", value=1.2
+                            ),
+                        },
+                        primary_metric_value=0.4,
+                    ),
                 ]
             ),
         ),
@@ -322,9 +336,11 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
     orchestrator.initialize(spec)
 
     first_cycle = orchestrator.run_iteration()
-    assert first_cycle.accepted_summary is not None
+    second_cycle = orchestrator.run_iteration()
 
-    # placeholder
+    assert first_cycle.accepted_summary is not None
+    assert second_cycle.accepted_summary is not None
+    assert second_cycle.accepted_summary.result == "improved"
 
 
 def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(

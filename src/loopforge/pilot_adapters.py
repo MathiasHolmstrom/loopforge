@@ -48,20 +48,28 @@ def detect_builtin_executor_factory(
         and (root / "examples" / "lol" / "pipeline_transformer_example.py").exists()
     ):
         return "loopforge.pilot_adapters:build_lol_kills_adapter"
-    loopforge_root = Path(__file__).resolve().parents[2]
     if (
         "nba" in objective_lower
         and "point" in objective_lower
-        and (loopforge_root / "experiments" / "nba_points_real_pilot.py").exists()
+        and (root / "experiments" / "nba_points_real_pilot.py").exists()
     ):
         return "loopforge.pilot_adapters:build_nba_points_adapter"
     return None
 
 
 def build_lol_kills_adapter(
-    spec: ExperimentSpec, memory_root: Path | str
+    spec: ExperimentSpec, memory_root: Path | str, repo_root: Path | str | None = None
 ) -> AdapterSetup:
-    handler = _LoLKillsHandler(spec=spec, memory_root=Path(memory_root))
+    bound_repo_root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else _resolve_player_performance_repo()
+    )
+    handler = _LoLKillsHandler(
+        spec=spec,
+        memory_root=Path(memory_root),
+        repo_root=bound_repo_root,
+    )
     return AdapterSetup(
         handlers={
             "baseline": handler,
@@ -70,21 +78,27 @@ def build_lol_kills_adapter(
             "targeted_tune": handler,
         },
         capability_provider=lambda effective_spec: _lol_capability_context(
-            _resolve_player_performance_repo()
+            bound_repo_root
         ),
-        discovery_provider=lambda objective: _lol_capability_context(
-            _resolve_player_performance_repo()
-        ),
+        discovery_provider=lambda objective: _lol_capability_context(bound_repo_root),
         preflight_provider=lambda effective_spec, capability_context: _lol_preflight(
-            _resolve_player_performance_repo()
+            bound_repo_root
         ),
     )
 
 
 def build_nba_points_adapter(
-    spec: ExperimentSpec, memory_root: Path | str
+    spec: ExperimentSpec, memory_root: Path | str, repo_root: Path | str | None = None
 ) -> AdapterSetup:
-    handler = _NBAPointsPilotHandler(memory_root=Path(memory_root))
+    bound_repo_root = (
+        Path(repo_root).resolve()
+        if repo_root is not None
+        else Path(__file__).resolve().parents[2]
+    )
+    handler = _NBAPointsPilotHandler(
+        memory_root=Path(memory_root),
+        repo_root=bound_repo_root,
+    )
     return AdapterSetup(
         handlers={
             "baseline": handler,
@@ -92,9 +106,13 @@ def build_nba_points_adapter(
             "slice_analysis": handler,
             "targeted_tune": handler,
         },
-        capability_provider=lambda effective_spec: _nba_capability_context(),
-        discovery_provider=lambda objective: _nba_capability_context(),
-        preflight_provider=lambda effective_spec, capability_context: _nba_preflight(),
+        capability_provider=lambda effective_spec: _nba_capability_context(
+            bound_repo_root
+        ),
+        discovery_provider=lambda objective: _nba_capability_context(bound_repo_root),
+        preflight_provider=lambda effective_spec, capability_context: _nba_preflight(
+            bound_repo_root
+        ),
     )
 
 
@@ -240,16 +258,18 @@ def _lol_capability_context(repo_root: Path) -> CapabilityContext:
 
 
 class _LoLKillsHandler:
-    def __init__(self, *, spec: ExperimentSpec, memory_root: Path) -> None:
+    def __init__(
+        self, *, spec: ExperimentSpec, memory_root: Path, repo_root: Path
+    ) -> None:
         self.spec = spec
         self.memory_root = memory_root
+        self.repo_root = repo_root
 
     def execute(self, candidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
-        repo_root = _resolve_player_performance_repo()
         action = candidate.action_type
         if action == "baseline":
             result = _evaluate_lol_kills_configuration(
-                repo_root=repo_root, params=_baseline_lol_params()
+                repo_root=self.repo_root, params=_baseline_lol_params()
             )
             notes = [
                 f"Baseline MAE on validation rows: {result['metrics']['kills_mae']:.4f}",
@@ -264,7 +284,7 @@ class _LoLKillsHandler:
             )
         if action in {"eda", "slice_analysis"}:
             result = _evaluate_lol_kills_configuration(
-                repo_root=repo_root,
+                repo_root=self.repo_root,
                 params=_baseline_lol_params(),
                 include_diagnostics=True,
             )
@@ -304,7 +324,9 @@ class _LoLKillsHandler:
                     {**_baseline_lol_params(), **candidate.config_patch}
                 )
             trials = [
-                _evaluate_lol_kills_configuration(repo_root=repo_root, params=params)
+                _evaluate_lol_kills_configuration(
+                    repo_root=self.repo_root, params=params
+                )
                 for params in search_space
             ]
             best = min(trials, key=lambda item: item["metrics"]["kills_mae"])
@@ -597,7 +619,7 @@ def _prob1(value: Any) -> float:
     return float(value)
 
 
-def _nba_capability_context() -> CapabilityContext:
+def _nba_capability_context(repo_root: Path) -> CapabilityContext:
     return CapabilityContext(
         available_actions={
             "baseline": "Run the current NBA points baseline.",
@@ -620,6 +642,7 @@ def _nba_capability_context() -> CapabilityContext:
         environment_facts={
             "autonomous_execution_supported": True,
             "runner_kind": "built_in_nba_points",
+            "repo_root": str(repo_root),
             "iteration_policy": "diagnostic_first",
             "baseline_action": "baseline",
             "diagnostic_actions": ["eda", "slice_analysis"],
@@ -628,10 +651,8 @@ def _nba_capability_context() -> CapabilityContext:
     )
 
 
-def _nba_preflight() -> list[PreflightCheck]:
-    pilot_path = (
-        Path(__file__).resolve().parents[2] / "experiments" / "nba_points_real_pilot.py"
-    )
+def _nba_preflight(repo_root: Path) -> list[PreflightCheck]:
+    pilot_path = repo_root / "experiments" / "nba_points_real_pilot.py"
     return [
         PreflightCheck(
             name="nba_pilot_available",
@@ -642,10 +663,12 @@ def _nba_preflight() -> list[PreflightCheck]:
 
 
 class _NBAPointsPilotHandler:
-    def __init__(self, *, memory_root: Path) -> None:
+    def __init__(self, *, memory_root: Path, repo_root: Path) -> None:
         self.memory_root = memory_root
+        self.repo_root = repo_root
 
     def execute(self, candidate, snapshot: MemorySnapshot) -> ExperimentOutcome:
+        _add_repo_to_path(self.repo_root)
         from experiments.nba_points_real_pilot import (
             baseline_params,
             evaluate_configuration,
@@ -654,9 +677,8 @@ class _NBAPointsPilotHandler:
             run_diagnostics,
         )
 
-        repo_root = _resolve_player_performance_repo()
         if candidate.action_type in {"eda", "slice_analysis"}:
-            diagnostics = run_diagnostics(repo_root=repo_root, n_splits=3)
+            diagnostics = run_diagnostics(repo_root=self.repo_root, n_splits=3)
             return ExperimentOutcome(
                 primary_metric_value=float(diagnostics["diagnostic_metrics"]["mae"]),
                 secondary_metrics={
@@ -669,8 +691,8 @@ class _NBAPointsPilotHandler:
                 ],
                 notes=[f"Primary issue: {diagnostics['primary_issue']}"],
             )
-        modules = load_modules(repo_root)
-        df, column_names = load_nba_dataframe(repo_root, modules)
+        modules = load_modules(self.repo_root)
+        df, column_names = load_nba_dataframe(self.repo_root, modules)
         params = baseline_params()
         if candidate.action_type == "targeted_tune" and candidate.config_patch:
             params.update(candidate.config_patch)

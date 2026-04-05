@@ -12,7 +12,9 @@ Three agents:
 from __future__ import annotations
 
 import json
+import os
 import re
+import signal
 import subprocess
 import time
 from math import isfinite
@@ -58,13 +60,20 @@ def _run_subprocess_with_progress(
     total_steps: int,
     step_description: str,
 ) -> subprocess.CompletedProcess[str]:
+    popen_kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "shell": shell,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
     process = subprocess.Popen(
         command,
-        cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        shell=shell,
+        **popen_kwargs,
     )
     started_at = time.monotonic()
 
@@ -72,7 +81,7 @@ def _run_subprocess_with_progress(
         elapsed = time.monotonic() - started_at
         remaining = timeout_seconds - elapsed
         if remaining <= 0:
-            process.kill()
+            _terminate_subprocess(process)
             stdout, stderr = process.communicate()
             raise subprocess.TimeoutExpired(
                 cmd=command,
@@ -92,6 +101,28 @@ def _run_subprocess_with_progress(
             elapsed = time.monotonic() - started_at
             if progress_fn is not None and elapsed >= 120 and int(elapsed) % 120 < 3:
                 progress_fn("waiting", f"Still running ({int(elapsed)}s)...")
+        except KeyboardInterrupt:
+            _terminate_subprocess(process, interrupted=True)
+            raise
+
+
+def _terminate_subprocess(
+    process: subprocess.Popen[str], *, interrupted: bool = False
+) -> None:
+    try:
+        if interrupted:
+            if os.name == "nt":
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                os.killpg(process.pid, signal.SIGINT)
+            process.communicate(timeout=1)
+            return
+    except Exception:
+        pass
+    try:
+        process.kill()
+    except Exception:
+        return
 
 
 def _coerce_float(value: Any) -> float | None:
@@ -941,16 +972,7 @@ class ToolUseExecutor:
                 )
             except KeyboardInterrupt:
                 self.progress_fn("interrupted", "Interrupted by user.")
-                return self._build_outcome(
-                    spec=spec,
-                    reported_metrics=reported_metrics,
-                    reported_primary_value=reported_primary_value,
-                    successful_command_outputs=successful_command_outputs,
-                    tool_call_log=tool_call_log,
-                    files_written=files_written,
-                    metrics_reported=metrics_reported,
-                    turns_used=turn,
-                )
+                raise
             except Exception as exc:
                 return ExperimentOutcome(
                     status="recoverable_failure",
@@ -1019,8 +1041,7 @@ class ToolUseExecutor:
                     self.progress_fn(
                         "interrupted", "Interrupted by user during tool execution."
                     )
-                    interrupted = True
-                    break
+                    raise
 
                 tool_call_log.append(
                     {
@@ -1267,7 +1288,7 @@ def _run_tool_loop(
             )
         except KeyboardInterrupt:
             progress_fn("interrupted", "Interrupted by user.")
-            return result
+            raise
         except Exception as exc:
             progress_fn("error", f"LLM call failed: {exc}")
             return result
@@ -1341,7 +1362,7 @@ def _run_tool_loop(
                 return result
             except KeyboardInterrupt:
                 progress_fn("interrupted", "Interrupted by user.")
-                return result
+                raise
 
             if (
                 tool_name == "run_command"
@@ -1607,7 +1628,7 @@ REVIEWER_TOOLS = [
         "type": "function",
         "function": {
             "name": "report_review",
-            "description": "Report your review of this experiment iteration.",
+            "description": "Report your review of this experiment iteration. You MUST run diagnostic analysis code on predictions.parquet BEFORE calling this.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1617,17 +1638,27 @@ REVIEWER_TOOLS = [
                         "description": "Accept into memory or reject",
                     },
                     "reason": {"type": "string", "description": "Why this decision"},
+                    "diagnostic_findings": {
+                        "type": "string",
+                        "description": "Results from your diagnostic analysis on saved predictions. Include: error breakdown by segment/category, which subgroups the model struggles on, any patterns in residuals. This must come from actual code you ran, not guessing.",
+                    },
                     "lessons": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "What was learned from this iteration",
+                        "description": "What was learned from this iteration — informed by your diagnostic analysis",
                     },
                     "next_experiment": {
                         "type": "string",
-                        "description": "What to try in the next iteration",
+                        "description": "What to try next — must be grounded in your diagnostic findings (e.g. 'errors are 2x higher for support players, try role-specific features')",
                     },
                 },
-                "required": ["status", "reason", "lessons", "next_experiment"],
+                "required": [
+                    "status",
+                    "reason",
+                    "diagnostic_findings",
+                    "lessons",
+                    "next_experiment",
+                ],
             },
         },
     },
@@ -1783,18 +1814,41 @@ class ToolUseReviewer:
             if name == "think":
                 return "OK"
             if name == "report_review":
-                # Reject thin reviews — must have lessons and next_experiment
+                # Reject thin reviews — require diagnostic analysis for successful iterations
                 lessons = args.get("lessons", [])
                 next_exp = args.get("next_experiment", "")
-                if (not lessons or not next_exp) and review_attempts < 2:
-                    review_attempts += 1
-                    return (
-                        "Review incomplete. You MUST include:\n"
-                        "- lessons: what was learned (at least 1 item)\n"
-                        "- next_experiment: specific recommendation for next iteration\n"
-                        "First, load the saved predictions and run analysis code. "
-                        "Then call report_review with substantive findings."
-                    )
+                diagnostics = args.get("diagnostic_findings", "")
+                ran_analysis = any(
+                    entry["tool"] == "run_command" for entry in tool_call_log
+                )
+                # Only enforce diagnostics when the iteration succeeded (predictions exist)
+                has_predictions = outcome.status == "success"
+                if review_attempts < 2:
+                    missing: list[str] = []
+                    if has_predictions and (not diagnostics or len(diagnostics) < 50):
+                        missing.append(
+                            "- diagnostic_findings: must contain actual analysis results "
+                            "(error breakdown by segment, which subgroups struggle, residual patterns)"
+                        )
+                    if not lessons:
+                        missing.append("- lessons: what was learned (at least 1 item)")
+                    if not next_exp:
+                        missing.append(
+                            "- next_experiment: specific recommendation grounded in your analysis"
+                        )
+                    if has_predictions and not ran_analysis:
+                        missing.append(
+                            "- You have not run any analysis code yet! Load predictions.parquet "
+                            "with run_command and compute error breakdowns before reporting."
+                        )
+                    if missing:
+                        review_attempts += 1
+                        return (
+                            "Review incomplete. Fix these:\n"
+                            + "\n".join(missing)
+                            + "\n\nRun diagnostic code on the saved predictions first, "
+                            "then call report_review with substantive data-backed findings."
+                        )
                 review_result.update(args)
                 raise _StopLoop()
             return f"Unknown tool: {name}"
@@ -1820,6 +1874,10 @@ class ToolUseReviewer:
         reason = result.get("reason", "Review completed.")
         lessons = result.get("lessons", [])
         next_experiment = result.get("next_experiment")
+        # Prepend diagnostic findings as a lesson so executor sees slicing in history
+        diagnostics = result.get("diagnostic_findings", "")
+        if diagnostics:
+            lessons = [f"[Diagnostics] {diagnostics}", *lessons]
         reviewer_handoff = self._review_handoff_lessons(tool_call_log)
         if reviewer_handoff:
             lessons = [*lessons, *reviewer_handoff]

@@ -82,6 +82,7 @@ def test_compact_recent_records_omits_full_attempt_payloads() -> None:
     assert "intra_iteration_attempts" not in execution_details
     assert execution_details["attempt_count"] == 1
     assert execution_details["latest_step_result"]["stderr_preview"].endswith("...")
+    assert compact[0]["reflection"]["lessons"] == []
 
 
 def test_worker_markdown_handoff_truncates_and_prefers_bootstrap_notes() -> None:

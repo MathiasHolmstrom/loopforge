@@ -9,13 +9,10 @@ from pathlib import Path
 from typing import Any
 
 from loopforge.bootstrap import (
-    DEFAULT_MODEL_PROFILE,
-    DEFAULT_OPENAI_MODEL,
     Loopforge,
     apply_answers_to_bootstrap_turn,
     cycle_results_to_payload,
     discover_capabilities_for_objective,
-    default_role_models,
     run_preflight_checks,
 )
 from loopforge.core import (
@@ -74,7 +71,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Import path package.module:function_name",
     )
-    run_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
+    run_parser.add_argument("--model-profile", default=None)
     run_parser.add_argument(
         "--worker-model",
         default=None,
@@ -120,7 +117,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     draft_parser.add_argument(
         "--planner-model",
-        default=DEFAULT_OPENAI_MODEL,
+        default=None,
         help="LiteLLM model id for the planning agent.",
     )
     draft_parser.add_argument("--preferences-json", default="{}")
@@ -141,7 +138,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--executor-factory", help="Import path package.module:function_name"
     )
-    start_parser.add_argument("--model-profile", default=DEFAULT_MODEL_PROFILE)
+    start_parser.add_argument("--model-profile", default=None)
     start_parser.add_argument("--planner-model", default=None)
     start_parser.add_argument("--worker-model", default=None)
     start_parser.add_argument("--reflection-model")
@@ -550,7 +547,7 @@ def run_interactive_start(
     repo_root: Path | str = ".",
     memory_root: Path | str = ".loopforge",
     executor_factory: str | None = None,
-    model_profile: str = DEFAULT_MODEL_PROFILE,
+    model_profile: str | None = None,
     planner_model: str | None = None,
     worker_model: str | None = None,
     reflection_model: str | None = None,
@@ -916,33 +913,23 @@ def run_from_spec(
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
-    model_profile: str = DEFAULT_MODEL_PROFILE,
+    model_profile: str | None = None,
     iterations: int | None = None,
     temperature: float = 0.2,
 ) -> list[dict[str, Any]]:
     spec = ExperimentSpec.from_dict(
         json.loads(Path(spec_path).read_text(encoding="utf-8"))
     )
-    role_models = default_role_models(
-        planner_model=worker_model,
-        worker_model=worker_model,
-        reflection_model=reflection_model,
-        review_model=review_model,
-        consultation_model=consultation_model,
-        narrator_model=narrator_model,
-        profile=model_profile,
-    )
     app = Loopforge(
         executor_factory_path=executor_factory_path,
         repo_root=repo_root,
         memory_root=memory_root,
         model_profile=model_profile,
-        planner_model=role_models.planner,
-        worker_model=role_models.worker,
-        reflection_model=role_models.reflection,
-        review_model=role_models.review,
-        consultation_model=role_models.consultation,
-        narrator_model=role_models.narrator,
+        worker_model=worker_model,
+        reflection_model=reflection_model,
+        review_model=review_model,
+        consultation_model=consultation_model,
+        narrator_model=narrator_model,
         temperature=temperature,
     )
     memory_store = FileMemoryStore(memory_root)
@@ -974,28 +961,31 @@ def draft_spec(
     objective: str,
     memory_root: Path | str,
     executor_factory_path: str | None,
-    planner_model: str,
+    planner_model: str | None,
     repo_root: Path | str = ".",
     preferences: dict[str, Any] | None = None,
     temperature: float = 0.2,
 ) -> ExperimentSpecProposal:
+    probe_app = Loopforge(
+        executor_factory_path=None,
+        repo_root=repo_root,
+        memory_root=memory_root,
+        planner_model=planner_model,
+        temperature=temperature,
+    )
     resolved_factory_path = executor_factory_path
     if resolved_factory_path is None:
-        resolved_factory_path = Loopforge(
-            executor_factory_path=None,
-            repo_root=repo_root,
-            memory_root=memory_root,
-            planner_model=planner_model,
-            worker_model=planner_model,
-            temperature=temperature,
-        ).resolve_executor_factory_path(objective)
+        resolved_factory_path = probe_app.resolve_executor_factory_path(objective)
     capability_context = discover_capabilities_for_objective(
         objective=objective,
         memory_root=memory_root,
         executor_factory_path=resolved_factory_path,
         repo_root=repo_root,
     )
-    backend = LiteLLMSpecBackend(model=planner_model, temperature=temperature)
+    backend = LiteLLMSpecBackend(
+        model=probe_app.role_models.planner,
+        temperature=temperature,
+    )
     return backend.propose_spec(
         objective=objective,
         capability_context=capability_context,

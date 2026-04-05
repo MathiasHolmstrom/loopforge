@@ -21,6 +21,7 @@ Thumbs.db
 
 # Claude Code
 CLAUDE.md
+AGENTS.md
 
 # Loopforge runtime / generated artifacts
 .loopforge/agent_markdown/

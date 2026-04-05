@@ -6,6 +6,8 @@ import subprocess
 
 import pytest
 
+from tests.support import patch_loopforge_backend_constructors
+
 
 class _FakeCompletedProcess:
     """Mimics a successful subprocess.run result for the execution probe."""
@@ -47,3 +49,9 @@ def _block_real_llm_calls(monkeypatch):
         monkeypatch.setattr(litellm, "completion", _blocked_completion)
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _stub_loopforge_backend_constructors(monkeypatch):
+    """Prevent Loopforge tests from constructing concrete LiteLLM backend classes."""
+    patch_loopforge_backend_constructors(monkeypatch)

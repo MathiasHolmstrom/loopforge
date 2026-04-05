@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import importlib
 import importlib.util
 import json
@@ -59,6 +60,18 @@ from loopforge.core import (
 DEFAULT_OPENAI_MODEL = "openai/gpt-5.4"
 DEFAULT_CLAUDE_MODEL = "anthropic/claude-opus-4-6-v1"
 DEFAULT_MODEL_PROFILE = "codex_with_claude_support"
+ROLE_MODEL_NAMES = (
+    "planner",
+    "worker",
+    "reflection",
+    "review",
+    "consultation",
+    "narrator",
+)
+REPO_MODEL_CONFIG_FILENAMES = (
+    "loopforge.models.json",
+    ".loopforge/models.json",
+)
 ExecutionBackendKind = Literal["supported", "planning_only"]
 GENERIC_AUTONOMOUS_ACTIONS = [
     "inspect_repo",
@@ -112,6 +125,21 @@ DEFAULT_ROLE_MAX_COMPLETION_TOKENS: dict[str, int] = {
 }
 
 
+@dataclass(frozen=True)
+class RepoRoleModelSettings:
+    model_profile: str | None = None
+    planner_model: str | None = None
+    worker_model: str | None = None
+    reflection_model: str | None = None
+    review_model: str | None = None
+    consultation_model: str | None = None
+    narrator_model: str | None = None
+
+
+def _can_use_openai_models() -> bool:
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
 def _can_use_anthropic_helpers() -> bool:
     if os.getenv("ANTHROPIC_API_KEY"):
         return True
@@ -124,16 +152,154 @@ def _can_use_anthropic_helpers() -> bool:
     return False
 
 
-def _resolve_helper_model(preferred_model: str, fallback_model: str) -> str:
-    if preferred_model.startswith("anthropic/") and not _can_use_anthropic_helpers():
-        return fallback_model
+def _model_provider(model: str) -> str | None:
+    if model.startswith("openai/"):
+        return "openai"
+    if model.startswith("anthropic/") or model.startswith("bedrock/us.anthropic."):
+        return "anthropic"
+    return None
+
+
+def _default_model_for_provider(provider: str) -> str:
+    if provider == "openai":
+        return DEFAULT_OPENAI_MODEL
+    if provider == "anthropic":
+        return DEFAULT_CLAUDE_MODEL
+    raise ValueError(f"Unknown model provider: {provider!r}")
+
+
+def _normalise_model_id(model: str) -> str:
     # Route through Bedrock proxy
-    if preferred_model.startswith("anthropic/") and os.getenv(
-        "ANTHROPIC_BEDROCK_BASE_URL"
-    ):
-        model_name = preferred_model.removeprefix("anthropic/")
+    if model.startswith("anthropic/") and os.getenv("ANTHROPIC_BEDROCK_BASE_URL"):
+        model_name = model.removeprefix("anthropic/")
         return f"bedrock/us.anthropic.{model_name}"
-    return preferred_model
+    return model
+
+
+def _coerce_optional_string(
+    payload: dict[str, Any], key: str, *, path: Path
+) -> str | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped or None
+    raise ValueError(f"{path}: `{key}` must be a string when provided.")
+
+
+def _parse_repo_role_model_settings(
+    payload: dict[str, Any], *, path: Path
+) -> RepoRoleModelSettings:
+    roles_payload = payload.get("roles")
+    if roles_payload is None:
+        roles_payload = {}
+    elif not isinstance(roles_payload, dict):
+        raise ValueError(f"{path}: `roles` must be a JSON object when provided.")
+
+    model_profile = _coerce_optional_string(payload, "model_profile", path=path)
+    if model_profile is None:
+        model_profile = _coerce_optional_string(payload, "profile", path=path)
+
+    values: dict[str, str | None] = {"model_profile": model_profile}
+    for role in ROLE_MODEL_NAMES:
+        arg_name = f"{role}_model"
+        role_value = payload.get(arg_name, payload.get(role, roles_payload.get(role)))
+        if role_value is None:
+            values[arg_name] = None
+            continue
+        if not isinstance(role_value, str):
+            raise ValueError(f"{path}: `{arg_name}` must be a string when provided.")
+        stripped = role_value.strip()
+        values[arg_name] = stripped or None
+    return RepoRoleModelSettings(**values)
+
+
+def load_repo_role_model_settings(
+    repo_root: Path | str,
+) -> tuple[RepoRoleModelSettings, Path | None]:
+    root = Path(repo_root)
+    for relative_path in REPO_MODEL_CONFIG_FILENAMES:
+        candidate = root / relative_path
+        if not candidate.is_file():
+            continue
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"{candidate}: top-level JSON value must be an object.")
+        return _parse_repo_role_model_settings(payload, path=candidate), candidate
+    return RepoRoleModelSettings(), None
+
+
+def _resolve_role_models(
+    *,
+    planner_model: str | None = None,
+    worker_model: str | None = None,
+    reflection_model: str | None = None,
+    review_model: str | None = None,
+    consultation_model: str | None = None,
+    narrator_model: str | None = None,
+    profile: str | None = None,
+) -> tuple[RoleModelConfig, list[str]]:
+    resolved_profile = profile or DEFAULT_MODEL_PROFILE
+    try:
+        defaults = MODEL_PROFILES[resolved_profile]
+    except KeyError as exc:
+        raise ValueError(f"Unknown model profile: {resolved_profile!r}") from exc
+
+    desired_models = {
+        "planner": planner_model or defaults["planner"],
+        "worker": worker_model or defaults["worker"],
+        "reflection": reflection_model or defaults["reflection"],
+        "review": review_model or defaults["review"],
+        "consultation": consultation_model or defaults["consultation"],
+        "narrator": narrator_model or defaults["narrator"],
+    }
+    openai_available = _can_use_openai_models()
+    anthropic_available = _can_use_anthropic_helpers()
+    warnings: list[str] = []
+
+    forced_provider: str | None = None
+    if openai_available and not anthropic_available:
+        forced_provider = "openai"
+        warnings.append(
+            "Anthropic credentials were not detected; routing all agent roles through OpenAI/Codex models."
+        )
+    elif anthropic_available and not openai_available:
+        forced_provider = "anthropic"
+        warnings.append(
+            "OpenAI credentials were not detected; routing all agent roles through Claude models."
+        )
+    elif not openai_available and not anthropic_available:
+        warnings.append(
+            "No OpenAI or Anthropic credentials were detected. Model calls will fail until one provider is configured."
+        )
+
+    resolved_models: dict[str, str] = {}
+    for role, desired_model in desired_models.items():
+        desired_provider = _model_provider(desired_model)
+        resolved_model = desired_model
+        if forced_provider is not None and desired_provider not in (
+            None,
+            forced_provider,
+        ):
+            resolved_model = _default_model_for_provider(forced_provider)
+            warnings.append(
+                f"{role} requested `{desired_model}` but provider `{desired_provider}` is unavailable; "
+                f"using `{resolved_model}` instead."
+            )
+        resolved_models[role] = _normalise_model_id(resolved_model)
+
+    return (
+        RoleModelConfig(
+            planner=resolved_models["planner"],
+            worker=resolved_models["worker"],
+            reflection=resolved_models["reflection"],
+            review=resolved_models["review"],
+            consultation=resolved_models["consultation"],
+            narrator=resolved_models["narrator"],
+        ),
+        warnings,
+    )
 
 
 def summarise_runtime_exception(exc: Exception) -> str:
@@ -183,6 +349,27 @@ def load_factory(factory_path: str) -> Any:
     else:
         module = importlib.import_module(module_name)
     return getattr(module, attribute_name)
+
+
+def _invoke_adapter_factory(
+    factory,
+    *,
+    spec: ExperimentSpec,
+    memory_root: Path,
+    repo_root: Path | None = None,
+):
+    kwargs: dict[str, Any] = {
+        "spec": spec,
+        "memory_root": memory_root,
+    }
+    if repo_root is not None:
+        try:
+            signature = inspect.signature(factory)
+        except (TypeError, ValueError):
+            signature = None
+        if signature is None or "repo_root" in signature.parameters:
+            kwargs["repo_root"] = repo_root
+    return factory(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -496,40 +683,18 @@ def default_role_models(
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
-    profile: str = DEFAULT_MODEL_PROFILE,
+    profile: str | None = None,
 ) -> RoleModelConfig:
-    try:
-        defaults = MODEL_PROFILES[profile]
-    except KeyError as exc:
-        raise ValueError(f"Unknown model profile: {profile!r}") from exc
-    fallback = defaults["worker"]
-    resolved_planner = _resolve_helper_model(
-        planner_model or defaults["planner"], fallback
+    role_models, _ = _resolve_role_models(
+        planner_model=planner_model,
+        worker_model=worker_model,
+        reflection_model=reflection_model,
+        review_model=review_model,
+        consultation_model=consultation_model,
+        narrator_model=narrator_model,
+        profile=profile,
     )
-    resolved_worker = _resolve_helper_model(
-        worker_model or defaults["worker"], fallback
-    )
-    resolved_reflection = _resolve_helper_model(
-        reflection_model or defaults["reflection"] or resolved_worker, resolved_worker
-    )
-    resolved_review = _resolve_helper_model(
-        review_model or defaults["review"] or resolved_reflection, resolved_reflection
-    )
-    resolved_consultation = _resolve_helper_model(
-        consultation_model or defaults["consultation"], resolved_worker
-    )
-    resolved_narrator = _resolve_helper_model(
-        narrator_model or defaults["narrator"] or resolved_reflection,
-        resolved_reflection,
-    )
-    return RoleModelConfig(
-        planner=resolved_planner,
-        worker=resolved_worker,
-        reflection=resolved_reflection,
-        review=resolved_review,
-        consultation=resolved_consultation,
-        narrator=resolved_narrator,
-    )
+    return role_models
 
 
 def load_adapter_setup(
@@ -537,8 +702,14 @@ def load_adapter_setup(
     factory_path: str,
     spec: ExperimentSpec,
     memory_root: Path,
+    repo_root: Path | None = None,
 ) -> AdapterSetup | None:
-    adapter_result = load_factory(factory_path)(spec=spec, memory_root=memory_root)
+    adapter_result = _invoke_adapter_factory(
+        load_factory(factory_path),
+        spec=spec,
+        memory_root=memory_root,
+        repo_root=repo_root,
+    )
     if isinstance(adapter_result, AdapterSetup):
         return adapter_result
     return None
@@ -855,6 +1026,7 @@ def discover_capabilities_for_objective(
         factory_path=executor_factory_path,
         spec=build_bootstrap_spec(objective),
         memory_root=memory_root_path,
+        repo_root=Path(repo_root),
     )
     if adapter_setup is None:
         return CapabilityContext()
@@ -1077,6 +1249,11 @@ def run_preflight_checks(
         factory_path=executor_factory_path,
         spec=spec,
         memory_root=memory_root_path,
+        repo_root=(
+            Path(capability_context.environment_facts["repo_root"])
+            if capability_context.environment_facts.get("repo_root")
+            else None
+        ),
     )
     if adapter_setup is not None and adapter_setup.preflight_provider is not None:
         checks.extend(
@@ -1720,7 +1897,7 @@ class Loopforge:
         review_model: str | None = None,
         consultation_model: str | None = None,
         narrator_model: str | None = None,
-        model_profile: str = DEFAULT_MODEL_PROFILE,
+        model_profile: str | None = None,
         temperature: float = 0.2,
         bootstrap_backend: Any | None = None,
         worker_backend: Any | None = None,
@@ -1743,6 +1920,9 @@ class Loopforge:
         self._cached_capability_key: tuple[str, str | None, str] | None = None
         self._cached_authoring_failure_reason: str | None = None
         self._attempted_dependency_installs: set[str] = set()
+        repo_model_settings, repo_model_settings_path = load_repo_role_model_settings(
+            self.repo_root
+        )
         bedrock_base = os.getenv("ANTHROPIC_BEDROCK_BASE_URL")
         if bedrock_base:
             self._bedrock_kwargs: dict[str, Any] = {
@@ -1752,15 +1932,29 @@ class Loopforge:
             }
         else:
             self._bedrock_kwargs: dict[str, Any] = {}
-        self.role_models = default_role_models(
-            planner_model=planner_model,
-            worker_model=worker_model,
-            reflection_model=reflection_model,
-            review_model=review_model,
-            consultation_model=consultation_model,
-            narrator_model=narrator_model,
-            profile=model_profile,
+        resolved_profile = (
+            model_profile or repo_model_settings.model_profile or DEFAULT_MODEL_PROFILE
         )
+        self.role_models, model_routing_warnings = _resolve_role_models(
+            planner_model=planner_model or repo_model_settings.planner_model,
+            worker_model=worker_model or repo_model_settings.worker_model,
+            reflection_model=reflection_model or repo_model_settings.reflection_model,
+            review_model=review_model or repo_model_settings.review_model,
+            consultation_model=consultation_model
+            or repo_model_settings.consultation_model,
+            narrator_model=narrator_model or repo_model_settings.narrator_model,
+            profile=resolved_profile,
+        )
+        if repo_model_settings_path is not None:
+            self.progress_fn(
+                "model_config_loaded",
+                f"Loaded role model settings from {repo_model_settings_path}.",
+            )
+        for warning_index, warning in enumerate(model_routing_warnings, start=1):
+            self.progress_fn(
+                f"model_routing_warning_{warning_index}",
+                f"Warning: {warning}",
+            )
 
         def _extra(model: str) -> dict[str, Any]:
             if model.startswith("bedrock/") and self._bedrock_kwargs:
@@ -1871,8 +2065,11 @@ class Loopforge:
                 capability_context=capability_context,
             )
 
-        adapter_result = load_factory(resolved_factory_path)(
-            spec=spec, memory_root=self.memory_root
+        adapter_result = _invoke_adapter_factory(
+            load_factory(resolved_factory_path),
+            spec=spec,
+            memory_root=self.memory_root,
+            repo_root=self.repo_root,
         )
         if isinstance(adapter_result, AdapterSetup):
             handlers = adapter_result.handlers

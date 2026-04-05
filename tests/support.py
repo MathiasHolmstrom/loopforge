@@ -15,6 +15,48 @@ from loopforge import (
 )
 
 
+class StubLoopforgeLiteLLMBackend:
+    def __init__(
+        self,
+        model: str,
+        temperature: float = 0.2,
+        max_completion_tokens: int | None = None,
+        stream_fn=None,
+        progress_fn=None,
+        extra_kwargs=None,
+        **kwargs,
+    ) -> None:
+        self.model = model
+        self.temperature = temperature
+        self.max_completion_tokens = max_completion_tokens
+        self.stream_fn = stream_fn
+        self.progress_fn = progress_fn
+        self.extra_kwargs = extra_kwargs or {}
+
+
+def patch_loopforge_backend_constructors(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMBootstrapBackend", StubLoopforgeLiteLLMBackend
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMRunnerAuthoringBackend",
+        StubLoopforgeLiteLLMBackend,
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMAccessAdvisorBackend",
+        StubLoopforgeLiteLLMBackend,
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMReflectionBackend", StubLoopforgeLiteLLMBackend
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMReviewBackend", StubLoopforgeLiteLLMBackend
+    )
+    monkeypatch.setattr(
+        "loopforge.bootstrap.LiteLLMNarrationBackend", StubLoopforgeLiteLLMBackend
+    )
+
+
 class FakeWorkerBackend:
     def __init__(self, candidates: list[ExperimentCandidate]) -> None:
         self._candidates = list(candidates)
@@ -173,89 +215,3 @@ def build_adapter_setup(
             else None
         ),
     )
-
-
-def patch_litellm_test_backends(
-    monkeypatch,
-    *,
-    candidate: ExperimentCandidate | None = None,
-    reflection: ReflectionSummary | None = None,
-    review: ReviewDecision | None = None,
-    bootstrap_message: str = "bootstrap update",
-    iteration_message: str = "iteration update",
-) -> None:
-    candidate = candidate or build_candidate()
-    reflection = reflection or ReflectionSummary(assessment="Baseline is fine.")
-    review = review or ReviewDecision(status="accepted", reason="Approved into memory.")
-
-    class StubWorker:
-        def __init__(
-            self,
-            model: str,
-            completion_fn=None,
-            temperature: float = 0.2,
-            extra_kwargs=None,
-            **kwargs,
-        ) -> None:
-            self.model = model
-
-        def propose_next_experiment(self, snapshot):
-            return candidate
-
-    class StubReflection:
-        def __init__(
-            self,
-            model: str,
-            completion_fn=None,
-            temperature: float = 0.2,
-            extra_kwargs=None,
-            **kwargs,
-        ) -> None:
-            self.model = model
-
-        def reflect(self, snapshot, proposed_candidate, outcome):
-            return reflection
-
-    class StubReview:
-        def __init__(
-            self,
-            model: str,
-            completion_fn=None,
-            temperature: float = 0.2,
-            extra_kwargs=None,
-            **kwargs,
-        ) -> None:
-            self.model = model
-
-        def review(self, snapshot, proposed_candidate, outcome, proposed_reflection):
-            return review
-
-    class StubNarration:
-        def __init__(
-            self,
-            model: str,
-            completion_fn=None,
-            temperature: float = 0.2,
-            extra_kwargs=None,
-            **kwargs,
-        ) -> None:
-            self.model = model
-
-        def summarize_bootstrap(self, turn, capability_context):
-            return bootstrap_message
-
-        def summarize_iteration(
-            self,
-            snapshot,
-            candidate,
-            outcome,
-            reflection,
-            review,
-            accepted_summary,
-        ):
-            return iteration_message
-
-    monkeypatch.setattr("loopforge.bootstrap.LiteLLMWorkerBackend", StubWorker)
-    monkeypatch.setattr("loopforge.bootstrap.LiteLLMReflectionBackend", StubReflection)
-    monkeypatch.setattr("loopforge.bootstrap.LiteLLMReviewBackend", StubReview)
-    monkeypatch.setattr("loopforge.bootstrap.LiteLLMNarrationBackend", StubNarration)

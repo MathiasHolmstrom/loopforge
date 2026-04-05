@@ -531,7 +531,7 @@ def synthesize_auto_adapter(
 
 from pathlib import Path
 
-from loopforge import AdapterSetup, CapabilityContext, ExperimentOutcome, PreflightCheck
+from loopforge import AdapterSetup, CapabilityContext, PreflightCheck
 
 DISCOVERED_METRICS = {json.dumps(summary["metrics"], indent=4, sort_keys=True)}
 DISCOVERED_ACTIONS = {json.dumps(summary["actions"], indent=4, sort_keys=True)}
@@ -557,7 +557,10 @@ def _build_context(objective: str) -> CapabilityContext:
         available_actions={{name: item["path"] for name, item in DISCOVERED_ACTIONS.items()}},
         available_data_assets=list(DISCOVERED_DATA_ASSETS),
         available_metrics={{
-            name: {{"scorer_ref": f\"auto_adapter:{{item['path']}}:{{item['symbol']}}\", "path": item["path"]}}
+            name: {{
+                "scorer_ref": f"auto_adapter:{{item['path']}}:{{item['symbol']}}",
+                "path": item["path"],
+            }}
             for name, item in DISCOVERED_METRICS.items()
         }},
         environment_facts={{
@@ -584,9 +587,9 @@ def _preflight_provider(spec, capability_context):
     for asset in capability_context.available_data_assets:
         asset_path = Path(REPO_ROOT) / asset
         if asset_path.exists():
-                checks.append(
-                    PreflightCheck(
-                        name=f"asset:{{asset}}",
+            checks.append(
+                PreflightCheck(
+                    name=f"asset:{{asset}}",
                     status="passed",
                     detail=f"Discovered repo path exists: {{asset_path}}",
                     required=False,
@@ -596,8 +599,7 @@ def _preflight_provider(spec, capability_context):
     return checks
 
 
-def build_adapter(spec, memory_root):
-    context = _build_context(spec.objective)
+def build_adapter(spec, memory_root, repo_root=None):
     action_names = spec.allowed_actions or list(DISCOVERED_ACTIONS.keys())
     handlers = {{name: _PlaceholderExecutor(name) for name in action_names}}
     return AdapterSetup(

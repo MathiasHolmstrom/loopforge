@@ -6,11 +6,13 @@ import json
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 
 from loopforge.core.tool_use_execution import (
     ToolUseExecutor,
     ToolUsePlanner,
     ToolUseReviewer,
+    _run_subprocess_with_progress,
     _execute_read_file,
     _execute_list_files,
     _execute_search_files,
@@ -465,6 +467,41 @@ class TestToolUseExecutor:
         assert outcome.status == "recoverable_failure"
         assert outcome.failure_type == "MetricsNotReported"
 
+    def test_keyboard_interrupt_during_tool_execution_propagates(
+        self, tmp_path, monkeypatch
+    ):
+        executor = ToolUseExecutor(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+
+        def mock_completion(**kwargs):
+            return _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1", "run_command", {"command": "python train.py"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+
+        def raise_interrupt(*args, **kwargs):
+            raise KeyboardInterrupt()
+
+        import unittest.mock
+
+        with (
+            unittest.mock.patch("litellm.completion", mock_completion),
+            unittest.mock.patch.object(
+                executor, "_dispatch_tool", side_effect=raise_interrupt
+            ),
+            pytest.raises(KeyboardInterrupt),
+        ):
+            executor.execute(candidate, snapshot)
+
 
 # ---------------------------------------------------------------------------
 # Utility tests
@@ -486,6 +523,40 @@ class TestBriefArgs:
         long_cmd = "x" * 200
         result = _brief_args({"command": long_cmd}, limit=80)
         assert len(result) <= 83  # 80 + "..."
+
+
+class TestRunSubprocessWithProgress:
+    def test_keyboard_interrupt_terminates_process(self, tmp_path, monkeypatch):
+        process = MagicMock()
+        process.communicate.side_effect = [KeyboardInterrupt(), ("", "")]
+
+        terminated: list[bool] = []
+
+        def record_terminate(proc, *, interrupted=False):
+            terminated.append(interrupted)
+
+        monkeypatch.setattr(
+            "loopforge.core.tool_use_execution.subprocess.Popen",
+            lambda *args, **kwargs: process,
+        )
+        monkeypatch.setattr(
+            "loopforge.core.tool_use_execution._terminate_subprocess",
+            record_terminate,
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            _run_subprocess_with_progress(
+                command="python train.py",
+                cwd=tmp_path,
+                shell=True,
+                timeout_seconds=30,
+                progress_fn=None,
+                step_index=1,
+                total_steps=1,
+                step_description="python train.py",
+            )
+
+        assert terminated == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +702,7 @@ class TestToolUsePlanner:
 class TestToolUseReviewer:
     def test_reviewer_accepts_successful_iteration(self, tmp_path):
         """Reviewer accepts an iteration with good metrics."""
+        (tmp_path / "experiment.py").write_text("print('baseline')\n", encoding="utf-8")
         reviewer = ToolUseReviewer(
             model="test/mock",
             repo_root=tmp_path,
@@ -647,8 +719,18 @@ class TestToolUseReviewer:
         responses = [
             _mock_response(
                 tool_calls=[
+                    _mock_tool_call("tc0", "read_file", {"path": "experiment.py"}),
+                ],
+                finish_reason="tool_calls",
+            ),
+            _mock_response(
+                tool_calls=[
                     _mock_tool_call(
-                        "tc1", "think", {"reasoning": "RMSE 0.42 is a good baseline"}
+                        "tc1",
+                        "run_command",
+                        {
+                            "command": "python -c \"import pandas; print('MAE by group')\""
+                        },
                     )
                 ],
                 finish_reason="tool_calls",
@@ -657,10 +739,23 @@ class TestToolUseReviewer:
                 tool_calls=[
                     _mock_tool_call(
                         "tc2",
+                        "think",
+                        {
+                            "reasoning": "RMSE 0.42 is a good baseline, MAE by group shows uniform error"
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc3",
                         "report_review",
                         {
                             "status": "accepted",
                             "reason": "Good baseline established",
+                            "diagnostic_findings": "Error is uniform across groups. MAE by category: A=0.41, B=0.43, C=0.42. No obvious segment to target first.",
                             "lessons": ["Baseline RMSE is 0.42"],
                             "next_experiment": "Try adding rolling averages as features",
                         },
@@ -685,6 +780,12 @@ class TestToolUseReviewer:
         assert review.status == "accepted"
         assert "baseline" in review.reason.lower()
         assert len(reflection.lessons) > 0
+        # Diagnostic findings are prepended as a lesson
+        assert any("[Diagnostics]" in lesson for lesson in reflection.lessons)
+        assert any(
+            lesson == "Reviewer inspected files: experiment.py."
+            for lesson in reflection.lessons
+        )
         assert reflection.recommended_next_action is not None
 
     def test_reviewer_rejects_failed_iteration(self, tmp_path):
