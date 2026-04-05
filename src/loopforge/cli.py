@@ -509,6 +509,26 @@ def _is_start_intent(text: str) -> bool:
     return any(phrase in normalized for phrase in start_phrases)
 
 
+def _extract_start_with_context(text: str) -> str | None:
+    """Detect 'Y but also X' or 'yes, also X' patterns. Returns the extra context or None."""
+    normalized = " ".join(text.strip().split())
+    lower = normalized.lower()
+    prefixes = (
+        "y but ", "y, but ", "y but also ", "y, but also ",
+        "yes but ", "yes, but ", "yes but also ", "yes, but also ",
+        "yes, also ", "y, also ", "yes also ",
+        "go but ", "go, but ", "go but also ",
+        "start but ", "start, but ", "y, ",
+        "yes, ", "go, ",
+    )
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            extra = normalized[len(prefix):].strip()
+            if extra:
+                return extra
+    return None
+
+
 def run_interactive_start(
     *,
     repo_root: Path | str = ".",
@@ -745,6 +765,32 @@ def run_interactive_start(
         if response.lower() in ("quit", "exit"):
             print_fn("Aborted.")
             return 0
+        # Check for "Y but also..." — start with extra context
+        if turn.ready_to_start:
+            extra_context = _extract_start_with_context(response)
+            if extra_context:
+                print_fn(f"\n  Extra context noted: {extra_context}")
+                # Store in spec metadata so it flows to the executor
+                current_guidance = list(
+                    turn.proposal.recommended_spec.metadata.get(
+                        "operator_guidance", []
+                    )
+                )
+                current_guidance.append(extra_context)
+                turn = replace(
+                    turn,
+                    proposal=replace(
+                        turn.proposal,
+                        recommended_spec=replace(
+                            turn.proposal.recommended_spec,
+                            metadata={
+                                **turn.proposal.recommended_spec.metadata,
+                                "operator_guidance": current_guidance,
+                            },
+                        ),
+                    ),
+                )
+                response = "y"  # Treat as start intent
         if turn.ready_to_start and _is_start_intent(response):
             print_fn("\nStarting experiment loop...\n")
             try:
