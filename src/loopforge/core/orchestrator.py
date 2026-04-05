@@ -883,7 +883,7 @@ class ExperimentOrchestrator:
         failures = []
         for metric in spec.guardrail_metrics:
             result = metric_results.get(metric.name)
-            if metric.resolve_passed(result) is not True:
+            if metric.resolve_passed(result) is False:
                 failures.append(metric.name)
         return failures
 

@@ -1756,9 +1756,13 @@ class ToolUseReviewer:
 
         review_result: dict[str, Any] = {}
         review_attempts = 0
+        tool_call_log: list[dict[str, str]] = []
 
         def dispatch(name: str, args: dict[str, Any], turn: int) -> str:
-            nonlocal review_result, review_attempts
+            nonlocal review_result, review_attempts, tool_call_log
+            if name in {"read_file", "search_files", "run_command", "list_files"}:
+                summary = _brief_args(args, limit=120)
+                tool_call_log.append({"tool": name, "summary": summary})
             if name == "read_file":
                 return _execute_read_file(args, self.repo_root, 100_000)
             if name == "list_files":
@@ -1816,6 +1820,9 @@ class ToolUseReviewer:
         reason = result.get("reason", "Review completed.")
         lessons = result.get("lessons", [])
         next_experiment = result.get("next_experiment")
+        reviewer_handoff = self._review_handoff_lessons(tool_call_log)
+        if reviewer_handoff:
+            lessons = [*lessons, *reviewer_handoff]
 
         reflection = ReflectionSummary(
             assessment=reason,
@@ -1828,3 +1835,42 @@ class ToolUseReviewer:
             should_update_memory=True,
         )
         return reflection, review
+
+    @staticmethod
+    def _review_handoff_lessons(tool_call_log: list[dict[str, str]]) -> list[str]:
+        files_read: list[str] = []
+        searches: list[str] = []
+        commands: list[str] = []
+        for item in tool_call_log:
+            tool = item.get("tool", "")
+            summary = " ".join(item.get("summary", "").split())
+            if not summary:
+                continue
+            if tool == "read_file":
+                if summary not in files_read:
+                    files_read.append(summary)
+            elif tool == "search_files":
+                if summary not in searches:
+                    searches.append(summary)
+            elif tool == "run_command":
+                if summary not in commands:
+                    commands.append(summary)
+
+        handoff: list[str] = []
+        if files_read:
+            preview = ", ".join(files_read[:3])
+            if len(files_read) > 3:
+                preview += f", and {len(files_read) - 3} more"
+            handoff.append(f"Reviewer inspected files: {preview}.")
+        evidence_parts: list[str] = []
+        if searches:
+            evidence_parts.append(
+                "searches=" + ", ".join(searches[:2]) + ("..." if len(searches) > 2 else "")
+            )
+        if commands:
+            evidence_parts.append(
+                "commands=" + ", ".join(commands[:2]) + ("..." if len(commands) > 2 else "")
+            )
+        if evidence_parts:
+            handoff.append("Reviewer evidence trail: " + "; ".join(evidence_parts) + ".")
+        return handoff[:2]

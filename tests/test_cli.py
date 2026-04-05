@@ -135,4 +135,6 @@ def test_question_failure_does_not_silently_replan(
     assert len(created_apps) == 1
     assert created_apps[0].bootstrap_calls == 1
     assert created_apps[0].apply_feedback_calls == []
-    assert any("narrator failed: narrator unavailable" in str(output) for output in outputs)
+    assert any(
+        "narrator failed: narrator unavailable" in str(output) for output in outputs
+    )

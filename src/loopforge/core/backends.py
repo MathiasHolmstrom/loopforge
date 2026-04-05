@@ -616,6 +616,11 @@ def _compact_iteration_record(record) -> dict[str, Any]:
         "outcome": _compact_outcome(record.outcome),
         "reflection": {
             "assessment": _truncate_text(record.reflection.assessment, limit=280),
+            "lessons": [
+                _truncate_text(item, limit=180)
+                for item in record.reflection.lessons[:2]
+                if item
+            ],
             "recommended_next_action": record.reflection.recommended_next_action,
         },
         "review": {

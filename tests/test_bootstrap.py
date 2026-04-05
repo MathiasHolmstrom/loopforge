@@ -399,6 +399,6 @@ def test_start_from_bootstrap_turn_blocks_on_unreadable_persisted_state(
 
     assert result["status"] == "blocked"
     assert result["error"]["type"] == "PersistedStateLoadFailed"
-    assert "Refusing to reset persisted memory automatically" in result["error"][
-        "message"
-    ]
+    assert (
+        "Refusing to reset persisted memory automatically" in result["error"]["message"]
+    )
