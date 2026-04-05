@@ -54,7 +54,6 @@ from loopforge.core import (
     ToolUseReviewer,
     _noop_progress,
 )
-from loopforge.core.runtime import is_generic_autonomous
 
 
 DEFAULT_OPENAI_MODEL = "openai/gpt-5.4"
