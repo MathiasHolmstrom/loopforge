@@ -47,12 +47,6 @@ def patch_loopforge_backend_constructors(monkeypatch) -> None:
         StubLoopforgeLiteLLMBackend,
     )
     monkeypatch.setattr(
-        "loopforge.bootstrap.LiteLLMReflectionBackend", StubLoopforgeLiteLLMBackend
-    )
-    monkeypatch.setattr(
-        "loopforge.bootstrap.LiteLLMReviewBackend", StubLoopforgeLiteLLMBackend
-    )
-    monkeypatch.setattr(
         "loopforge.bootstrap.LiteLLMNarrationBackend", StubLoopforgeLiteLLMBackend
     )
 
@@ -75,20 +69,17 @@ class StaticActionExecutor:
         return self._outcomes.pop(0)
 
 
-class FakeReflectionBackend:
-    def __init__(self, reflections: list[ReflectionSummary]) -> None:
+class FakeReviewer:
+    def __init__(
+        self,
+        reflections: list[ReflectionSummary],
+        decisions: list[ReviewDecision],
+    ) -> None:
         self._reflections = list(reflections)
-
-    def reflect(self, snapshot, candidate, outcome):
-        return self._reflections.pop(0)
-
-
-class FakeReviewBackend:
-    def __init__(self, decisions: list[ReviewDecision]) -> None:
         self._decisions = list(decisions)
 
-    def review(self, snapshot, candidate, outcome, reflection):
-        return self._decisions.pop(0)
+    def review(self, snapshot, candidate, outcome):
+        return self._reflections.pop(0), self._decisions.pop(0)
 
 
 class FakeNarrationBackend:

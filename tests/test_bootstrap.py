@@ -22,38 +22,35 @@ from tests.support import build_spec
         (
             True,
             False,
-            {
-                "planner": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "reflection": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "consultation": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "narrator": bootstrap_module.DEFAULT_OPENAI_MODEL,
-            },
+                {
+                    "planner": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "consultation": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "narrator": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                },
         ),
         (
             False,
             True,
-            {
-                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "worker": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "reflection": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "review": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-            },
+                {
+                    "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "worker": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "review": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                },
         ),
         (
             True,
             True,
-            {
-                "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "reflection": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
-                "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-                "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
-            },
+                {
+                    "planner": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "worker": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "review": bootstrap_module.DEFAULT_OPENAI_MODEL,
+                    "consultation": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                    "narrator": bootstrap_module.DEFAULT_CLAUDE_MODEL,
+                },
         ),
     ],
 )
@@ -80,12 +77,16 @@ def test_default_role_models_provider_routing(
 def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> None:
     app = Loopforge(memory_root=tmp_path / "memory")
 
-    assert app.bootstrap_backend.model == app.role_models.planner
-    assert app.reflection_backend.model == app.role_models.reflection
-    assert app.review_backend.model == app.role_models.review
-    expected_helper = app.role_models.consultation
+    assert app.bootstrap_backend.model == bootstrap_module._normalise_model_id(
+        app.role_models.planner
+    )
+    expected_helper = bootstrap_module._normalise_model_id(
+        app.role_models.consultation
+    )
     assert app.access_advisor_backend.model == expected_helper
-    assert app.narrator_backend.model == app.role_models.narrator
+    assert app.narrator_backend.model == bootstrap_module._normalise_model_id(
+        app.role_models.narrator
+    )
     assert (
         app.bootstrap_backend.max_completion_tokens
         == bootstrap_module.DEFAULT_ROLE_MAX_COMPLETION_TOKENS["planner"]
@@ -95,6 +96,7 @@ def test_loopforge_init_wires_default_models_to_expected_backends(tmp_path) -> N
 def test_loopforge_loads_repo_role_model_settings_and_preserves_explicit_overrides(
     tmp_path, monkeypatch
 ) -> None:
+    monkeypatch.delenv("ANTHROPIC_BEDROCK_BASE_URL", raising=False)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "loopforge.models.json").write_text(
@@ -125,6 +127,7 @@ def test_loopforge_loads_repo_role_model_settings_and_preserves_explicit_overrid
 def test_loopforge_warns_when_repo_role_model_provider_is_unavailable(
     tmp_path, monkeypatch
 ) -> None:
+    monkeypatch.delenv("ANTHROPIC_BEDROCK_BASE_URL", raising=False)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "loopforge.models.json").write_text(
@@ -159,6 +162,33 @@ def test_loopforge_warns_when_repo_role_model_provider_is_unavailable(
     assert any(
         "worker requested `openai/gpt-5.4`" in message for _, message in progress
     )
+
+
+def test_loopforge_applies_repo_stop_condition_settings_without_overwriting_spec(
+    tmp_path,
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "loopforge.settings.json").write_text(
+        json.dumps(
+            {
+                "stop_conditions": {
+                    "max_iterations": 12,
+                    "max_autonomous_hours": 2.5,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = Loopforge(repo_root=repo_root, memory_root=tmp_path / "memory")
+    spec = build_spec(stop_conditions={"max_iterations": 7, "patience": 2})
+
+    patched = app._apply_repo_stop_condition_defaults(spec)
+
+    assert patched.stop_conditions["max_iterations"] == 7
+    assert patched.stop_conditions["max_autonomous_hours"] == 2.5
+    assert patched.stop_conditions["patience"] == 2
 
 
 def test_repo_scan_metric_catalog_does_not_auto_enrich_planning_metrics() -> None:
@@ -197,6 +227,35 @@ def test_extract_primary_metric_from_feedback_fuzzy_matches_repo_metric_names() 
     )
 
     assert metric == "OrdinalLossScorer"
+
+
+def test_trace_data_source_skips_auto_sync_when_uv_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    (repo_root / "train_model.py").write_text(
+        "def train_model():\n    return 1\n",
+        encoding="utf-8",
+    )
+    progress: list[tuple[str, str]] = []
+
+    monkeypatch.setattr("loopforge.bootstrap.shutil.which", lambda _: None)
+
+    result = bootstrap_module._trace_data_source(
+        user_goal="Improve the model in train_model.py",
+        repo_root=repo_root,
+        python_executable="python",
+        progress_fn=lambda stage, message: progress.append((stage, message)),
+    )
+
+    assert result["data_source"] == "train_model.py"
+    assert result["dependency_sync"] == {
+        "attempted": False,
+        "succeeded": False,
+        "tool": None,
+    }
+    assert any("uv not found" in message for _, message in progress)
 
 
 def test_repo_scan_context_surfaces_likely_baseline_files_and_metric_symbols(

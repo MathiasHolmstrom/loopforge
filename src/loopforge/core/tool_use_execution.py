@@ -877,6 +877,7 @@ class ToolUseExecutor:
         self,
         *,
         model: str,
+        request_model: str | None = None,
         repo_root: Path | str,
         max_errors: int = 15,
         max_tool_calls: int = 200,
@@ -887,6 +888,7 @@ class ToolUseExecutor:
         extra_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
+        self.request_model = request_model or model
         self.repo_root = Path(repo_root)
         self.max_errors = max_errors
         self.max_tool_calls = max_tool_calls
@@ -964,7 +966,7 @@ class ToolUseExecutor:
             turn += 1
             try:
                 response = litellm_completion(
-                    model=self.model,
+                    model=self.request_model,
                     messages=messages,
                     tools=TOOLS,
                     temperature=self.temperature,
@@ -1161,7 +1163,10 @@ class ToolUseExecutor:
         if not metric_results:
             for output in reversed(successful_command_outputs):
                 parsed = _extract_metric_payload_from_text(output, spec)
-                if parsed["metric_results"]:
+                if (
+                    parsed["metric_results"]
+                    or parsed["primary_metric_value"] is not None
+                ):
                     metric_results.update(parsed["metric_results"])
                     if parsed["primary_metric_value"] is not None:
                         primary_value = parsed["primary_metric_value"]
@@ -1251,14 +1256,28 @@ class _StopLoop(Exception):
     """Raised by a tool dispatcher to signal the loop should stop."""
 
 
+def _find_tool_definition(
+    tools: list[dict[str, Any]], tool_name: str
+) -> dict[str, Any] | None:
+    for tool in tools:
+        function = tool.get("function", {})
+        if function.get("name") == tool_name:
+            return tool
+    return None
+
+
 def _run_tool_loop(
     *,
     model: str,
+    request_model: str | None = None,
     system_prompt: str,
     user_message: str,
     tools: list[dict[str, Any]],
     tool_dispatcher,
     stop_tool: str,
+    nudge_tool: str | None = None,
+    budget_reminder_tool: str | None = None,
+    budget_reminder_turns: int = 5,
     max_errors: int = 10,
     max_tool_calls: int = 100,
     temperature: float = 0.2,
@@ -1268,6 +1287,12 @@ def _run_tool_loop(
     """Generic tool-use agentic loop. Returns the stop_tool's arguments when called."""
     from litellm import completion as litellm_completion
 
+    # nudge_tool overrides what the nudge message tells the model to call.
+    # Useful when stop_tool is a sentinel and the real finishing tool is handled in dispatch.
+    effective_nudge = nudge_tool or stop_tool
+    reserved_final_turn = 1 if budget_reminder_tool and max_tool_calls > 0 else 0
+    normal_turn_limit = max(max_tool_calls - reserved_final_turn, 0)
+
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_message},
@@ -1276,11 +1301,11 @@ def _run_tool_loop(
     turn = 0
     result: dict[str, Any] = {}
 
-    while turn < max_tool_calls:
+    while turn < normal_turn_limit:
         turn += 1
         try:
             response = litellm_completion(
-                model=model,
+                model=request_model or model,
                 messages=messages,
                 tools=tools,
                 temperature=temperature,
@@ -1323,11 +1348,11 @@ def _run_tool_loop(
         if not message.tool_calls:
             # Model responded with text instead of calling a tool.
             # If we haven't got the stop_tool result yet, nudge it to call it.
-            if not result and turn < max_tool_calls - 1:
+            if not result and turn < normal_turn_limit:
                 messages.append(
                     {
                         "role": "user",
-                        "content": f"Please call {stop_tool} now with the information you have.",
+                        "content": f"Please call {effective_nudge} now with the information you have.",
                     }
                 )
                 continue
@@ -1373,6 +1398,117 @@ def _run_tool_loop(
                 if error_count >= max_errors:
                     progress_fn("error_limit", f"Hit {max_errors} failed commands.")
                     return result
+
+            if (
+                budget_reminder_tool
+                and tool_name != budget_reminder_tool
+                and turn >= max(1, max_tool_calls - budget_reminder_turns)
+            ):
+                turns_remaining = max_tool_calls - turn
+                if turns_remaining > 0:
+                    reminder = (
+                        f"[SYSTEM: You have {turns_remaining} response turns remaining. "
+                        f"Call {budget_reminder_tool} now with your current findings.]"
+                    )
+                    tool_result = (
+                        f"{tool_result}\n\n{reminder}" if tool_result else reminder
+                    )
+
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+            )
+
+    if not result and budget_reminder_tool:
+        final_tool = _find_tool_definition(tools, budget_reminder_tool)
+        if final_tool is None:
+            return result
+
+        final_turn = turn + 1
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"This is your final turn. Do not call any more analysis tools. "
+                    f"Call {budget_reminder_tool} now with the information you have."
+                ),
+            }
+        )
+        try:
+            response = litellm_completion(
+                model=request_model or model,
+                messages=messages,
+                tools=[final_tool],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": budget_reminder_tool},
+                },
+                temperature=temperature,
+                **(extra_kwargs or {}),
+            )
+        except KeyboardInterrupt:
+            progress_fn("interrupted", "Interrupted by user.")
+            raise
+        except Exception as exc:
+            progress_fn("error", f"LLM call failed: {exc}")
+            return result
+
+        message = response.choices[0].message
+
+        if message.content and message.content.strip():
+            reasoning = message.content.strip()
+            if len(reasoning) > 500:
+                reasoning = reasoning[:500] + "..."
+            progress_fn(f"agent_thought_{final_turn}", f"[{model}] {reasoning}")
+
+        assistant_msg: dict[str, Any] = {"role": "assistant"}
+        if message.content:
+            assistant_msg["content"] = message.content
+        if message.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in message.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        if not message.tool_calls:
+            return result
+
+        for tc in message.tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                tool_args = {}
+
+            progress_fn(
+                f"tool_{final_turn}",
+                f"[{model}] {tool_name}({_brief_args(tool_args)})",
+            )
+
+            if tool_name == stop_tool:
+                result = tool_args
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                )
+                return result
+
+            try:
+                tool_result = tool_dispatcher(tool_name, tool_args, final_turn)
+            except _StopLoop:
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                )
+                return result
+            except KeyboardInterrupt:
+                progress_fn("interrupted", "Interrupted by user.")
+                raise
 
             messages.append(
                 {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
@@ -1504,12 +1640,14 @@ class ToolUsePlanner:
         self,
         *,
         model: str,
+        request_model: str | None = None,
         repo_root: Path | str,
         temperature: float = 0.2,
         progress_fn: ProgressFn | None = None,
         extra_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
+        self.request_model = request_model or model
         self.repo_root = Path(repo_root)
         self.temperature = temperature
         self.progress_fn: ProgressFn = progress_fn or _noop_progress
@@ -1594,6 +1732,7 @@ class ToolUsePlanner:
 
         result = _run_tool_loop(
             model=self.model,
+            request_model=self.request_model,
             system_prompt=system_prompt,
             user_message="\n".join(user_msg_parts),
             tools=PLANNER_TOOLS,
@@ -1672,12 +1811,14 @@ class ToolUseReviewer:
         self,
         *,
         model: str,
+        request_model: str | None = None,
         repo_root: Path | str,
         temperature: float = 0.2,
         progress_fn: ProgressFn | None = None,
         extra_kwargs: dict[str, Any] | None = None,
     ) -> None:
         self.model = model
+        self.request_model = request_model or model
         self.repo_root = Path(repo_root)
         self.temperature = temperature
         self.progress_fn: ProgressFn = progress_fn or _noop_progress
@@ -1855,11 +1996,14 @@ class ToolUseReviewer:
 
         _run_tool_loop(
             model=self.model,
+            request_model=self.request_model,
             system_prompt=system_prompt,
             user_message=user_message,
             tools=REVIEWER_TOOLS,
             tool_dispatcher=dispatch,
             stop_tool="_reviewer_done_",  # Never auto-stops — we handle report_review in dispatch
+            nudge_tool="report_review",  # Nudge must reference the real tool, not the sentinel
+            budget_reminder_tool="report_review",
             max_tool_calls=20,
             temperature=self.temperature,
             progress_fn=self.progress_fn,

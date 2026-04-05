@@ -127,8 +127,6 @@ class ExperimentOrchestrator:
         worker_backend: WorkerBackend,
         executor: RoutingExperimentExecutor,
         reviewer=None,
-        reflection_backend=None,
-        review_backend=None,
         narrator_backend: NarrationBackend | None = None,
         capability_provider=None,
         summary_window: int = 5,
@@ -141,8 +139,6 @@ class ExperimentOrchestrator:
         self.worker_backend = worker_backend
         self.executor = executor
         self.reviewer = reviewer
-        self.reflection_backend = reflection_backend
-        self.review_backend = review_backend
         self.narrator_backend = narrator_backend
         self.capability_provider = capability_provider
         self.summary_window = summary_window
@@ -324,15 +320,6 @@ class ExperimentOrchestrator:
         try:
             if self.reviewer is not None:
                 reflection, review = self.reviewer.review(snapshot, candidate, outcome)
-            elif (
-                self.reflection_backend is not None and self.review_backend is not None
-            ):
-                reflection = self.reflection_backend.reflect(
-                    snapshot, candidate, outcome
-                )
-                review = self.review_backend.review(
-                    snapshot, candidate, outcome, reflection
-                )
             else:
                 reflection = self._fallback_reflection(
                     outcome, RuntimeError("No reviewer configured")
@@ -398,6 +385,7 @@ class ExperimentOrchestrator:
     def run(
         self,
         iterations: int | None = None,
+        max_autonomous_hours: float | None = None,
         iteration_callback: IterationCallback | None = None,
     ) -> list[IterationCycleResult]:
         snapshot = self._load_snapshot()
@@ -406,9 +394,10 @@ class ExperimentOrchestrator:
             max_iterations = int(
                 snapshot.effective_spec.stop_conditions.get("max_iterations", 30)
             )
-        max_autonomous_hours = snapshot.effective_spec.stop_conditions.get(
-            "max_autonomous_hours", 6
-        )
+        if max_autonomous_hours is None:
+            max_autonomous_hours = snapshot.effective_spec.stop_conditions.get(
+                "max_autonomous_hours", 6
+            )
         max_runtime_seconds = None
         if max_autonomous_hours is not None:
             max_runtime_seconds = float(max_autonomous_hours) * 60 * 60

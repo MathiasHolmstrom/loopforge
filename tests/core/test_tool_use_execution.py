@@ -418,6 +418,55 @@ class TestToolUseExecutor:
         assert "rmse" in outcome.metric_results
         assert outcome.metric_results["rmse"].value == 0.5
 
+    def test_stdout_fallback_primary_metric_value_only_counts_as_success(
+        self, tmp_path, monkeypatch
+    ):
+        executor = ToolUseExecutor(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+
+        responses = [
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1", "run_command", {"command": "python train.py"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+            _mock_response(content="Done.", tool_calls=None, finish_reason="stop"),
+        ]
+        call_idx = 0
+
+        def mock_completion(**kwargs):
+            nonlocal call_idx
+            resp = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return resp
+
+        import unittest.mock
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = '{"primary_metric_value": 0.5}'
+        mock_proc.stderr = ""
+
+        with (
+            unittest.mock.patch("litellm.completion", mock_completion),
+            unittest.mock.patch(
+                "loopforge.core.tool_use_execution._run_subprocess_with_progress",
+                return_value=mock_proc,
+            ),
+        ):
+            outcome = executor.execute(candidate, snapshot)
+
+        assert outcome.status == "success"
+        assert outcome.primary_metric_value == 0.5
+
     def test_stdout_metrics_from_failed_command_do_not_count_as_success(
         self, tmp_path, monkeypatch
     ):
@@ -827,3 +876,216 @@ class TestToolUseReviewer:
 
         assert review.status == "rejected"
         assert reflection.recommended_next_action is not None
+
+    def test_reviewer_nudge_says_report_review_not_sentinel(self, tmp_path):
+        """When model responds with text, nudge asks for report_review, not _reviewer_done_."""
+        reviewer = ToolUseReviewer(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+        outcome = ExperimentOutcome(
+            status="recoverable_failure",
+            failure_type="ScriptFailed",
+            failure_summary="Something broke",
+        )
+
+        captured_messages: list[list[dict]] = []
+
+        responses = [
+            # First: model responds with text only (no tool calls) — triggers nudge
+            _mock_response(
+                content="I've analyzed the results and the script failed.",
+                tool_calls=None,
+                finish_reason="stop",
+            ),
+            # Second: after nudge, model calls report_review
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1",
+                        "report_review",
+                        {
+                            "status": "rejected",
+                            "reason": "Script failed",
+                            "lessons": ["Missing dependency caused failure"],
+                            "next_experiment": "Install deps and rerun",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ]
+        call_idx = 0
+
+        def mock_completion(**kwargs):
+            nonlocal call_idx
+            # Capture messages to verify nudge content
+            captured_messages.append(kwargs.get("messages", []))
+            resp = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return resp
+
+        import unittest.mock
+
+        with unittest.mock.patch("litellm.completion", mock_completion):
+            reflection, review = reviewer.review(snapshot, candidate, outcome)
+
+        assert review.status == "rejected"
+        assert reflection.recommended_next_action == "Install deps and rerun"
+        # Verify the nudge message references report_review, not _reviewer_done_
+        assert len(captured_messages) >= 2
+        nudge_msgs = captured_messages[1]  # messages sent on second LLM call
+        nudge_user_msg = [m for m in nudge_msgs if m.get("role") == "user"]
+        assert any(
+            "report_review" in m.get("content", "") for m in nudge_user_msg
+        ), "Nudge should reference report_review, not _reviewer_done_"
+        assert not any(
+            "_reviewer_done_" in m.get("content", "") for m in nudge_user_msg
+        ), "Nudge should NOT reference the sentinel _reviewer_done_"
+
+    def test_reviewer_budget_reminder_is_appended_to_tool_results(self, tmp_path):
+        reviewer = ToolUseReviewer(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+        outcome = ExperimentOutcome(
+            status="recoverable_failure",
+            failure_type="ScriptFailed",
+            failure_summary="Something broke",
+        )
+
+        captured_messages: list[list[dict[str, Any]]] = []
+        responses = [
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        f"tc{i}", "think", {"reasoning": f"analysis step {i}"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+            for i in range(15)
+        ]
+        responses.append(
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc-final",
+                        "report_review",
+                        {
+                            "status": "rejected",
+                            "reason": "Script failed",
+                            "lessons": ["Failure mode identified"],
+                            "next_experiment": "Fix the script failure first",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+        call_idx = 0
+
+        def mock_completion(**kwargs):
+            nonlocal call_idx
+            captured_messages.append(kwargs.get("messages", []))
+            resp = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return resp
+
+        import unittest.mock
+
+        with unittest.mock.patch("litellm.completion", mock_completion):
+            reflection, review = reviewer.review(snapshot, candidate, outcome)
+
+        assert review.status == "rejected"
+        assert reflection.recommended_next_action == "Fix the script failure first"
+        reminder_messages = [
+            m.get("content", "")
+            for m in captured_messages[15]
+            if m.get("role") == "tool"
+        ]
+        assert any(
+            "You have 5 response turns remaining" in message
+            and "Call report_review now" in message
+            for message in reminder_messages
+        )
+
+    def test_reviewer_uses_final_reserved_turn_to_force_report(self, tmp_path):
+        reviewer = ToolUseReviewer(
+            model="test/mock",
+            repo_root=tmp_path,
+        )
+        spec = _make_spec()
+        snapshot = _make_snapshot(spec, str(tmp_path))
+        candidate = _make_candidate()
+        outcome = ExperimentOutcome(
+            status="recoverable_failure",
+            failure_type="ScriptFailed",
+            failure_summary="Something broke",
+        )
+
+        captured_tools: list[list[dict[str, Any]]] = []
+        captured_tool_choice: list[dict[str, Any] | None] = []
+        responses = [
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        f"tc{i}", "think", {"reasoning": f"analysis step {i}"}
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+            for i in range(19)
+        ]
+        responses.append(
+            _mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc-final",
+                        "report_review",
+                        {
+                            "status": "rejected",
+                            "reason": "Final forced review",
+                            "lessons": ["Used the final reserved turn"],
+                            "next_experiment": "Fix the failing script before retrying",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            )
+        )
+        call_idx = 0
+
+        def mock_completion(**kwargs):
+            nonlocal call_idx
+            captured_tools.append(kwargs.get("tools", []))
+            captured_tool_choice.append(kwargs.get("tool_choice"))
+            resp = responses[min(call_idx, len(responses) - 1)]
+            call_idx += 1
+            return resp
+
+        import unittest.mock
+
+        with unittest.mock.patch("litellm.completion", mock_completion):
+            reflection, review = reviewer.review(snapshot, candidate, outcome)
+
+        assert review.status == "rejected"
+        assert review.reason == "Final forced review"
+        assert (
+            reflection.recommended_next_action
+            == "Fix the failing script before retrying"
+        )
+        assert len(captured_tools) == 20
+        final_tools = captured_tools[-1]
+        assert len(final_tools) == 1
+        assert final_tools[0]["function"]["name"] == "report_review"
+        assert captured_tool_choice[-1] == {
+            "type": "function",
+            "function": {"name": "report_review"},
+        }

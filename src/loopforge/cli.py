@@ -78,9 +78,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="LiteLLM model id for the worker agent.",
     )
     run_parser.add_argument(
-        "--reflection-model", help="LiteLLM model id for the reflection agent."
-    )
-    run_parser.add_argument(
         "--review-model", help="LiteLLM model id for the review agent."
     )
     run_parser.add_argument(
@@ -92,9 +89,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--iterations",
+        "--max-iterations",
+        dest="iterations",
         type=int,
         default=None,
         help="Override max iterations for this run.",
+    )
+    run_parser.add_argument(
+        "--max-autonomous-hours",
+        type=float,
+        default=None,
+        help="Override max autonomous runtime hours for this run.",
     )
     run_parser.add_argument("--temperature", type=float, default=0.2)
 
@@ -141,12 +146,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
     start_parser.add_argument("--model-profile", default=None)
     start_parser.add_argument("--planner-model", default=None)
     start_parser.add_argument("--worker-model", default=None)
-    start_parser.add_argument("--reflection-model")
     start_parser.add_argument("--review-model")
     start_parser.add_argument("--consultation-model")
     start_parser.add_argument("--narrator-model")
     start_parser.add_argument("--answers-json", default="{}")
-    start_parser.add_argument("--iterations", type=int, default=None)
+    start_parser.add_argument(
+        "--iterations",
+        "--max-iterations",
+        dest="iterations",
+        type=int,
+        default=None,
+    )
+    start_parser.add_argument("--max-autonomous-hours", type=float, default=None)
     start_parser.add_argument("--temperature", type=float, default=0.2)
     start_parser.add_argument(
         "--stream-llm-output",
@@ -550,11 +561,11 @@ def run_interactive_start(
     model_profile: str | None = None,
     planner_model: str | None = None,
     worker_model: str | None = None,
-    reflection_model: str | None = None,
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
     iterations: int | None = None,
+    max_autonomous_hours: float | None = None,
     temperature: float = 0.2,
     stream_llm_output: bool = False,
     input_fn=input,
@@ -569,7 +580,6 @@ def run_interactive_start(
         model_profile=model_profile,
         planner_model=planner_model,
         worker_model=worker_model,
-        reflection_model=reflection_model,
         review_model=review_model,
         consultation_model=consultation_model,
         narrator_model=narrator_model,
@@ -584,12 +594,14 @@ def run_interactive_start(
     replan_reason = "initial"
     first_run = True
     resume_existing_run = False
+    pending_resume_start = False
     turn = None
     last_ready_plan_signature: str | None = None
     planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
     narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
-        response = ""
+        response = "y" if pending_resume_start and turn is not None and turn.ready_to_start else ""
+        pending_resume_start = False
         deferred_start_response: str | None = None
         # Only call the LLM when we actually need a new plan
         if replan_reason:
@@ -752,8 +764,6 @@ def run_interactive_start(
                 continue
             else:
                 response = ""
-        else:
-            response = ""
 
         # Show the plan summary if ready
         if turn.ready_to_start:
@@ -810,6 +820,7 @@ def run_interactive_start(
                     bootstrap_turn=turn,
                     user_goal=user_goal,
                     iterations=iterations,
+                    max_autonomous_hours=max_autonomous_hours,
                     iteration_callback=iteration_cb,
                     reset_state=not resume_existing_run,
                 )
@@ -837,9 +848,15 @@ def run_interactive_start(
                     author="human",
                     type_="override",
                 )
-                answers["user_feedback"] = redirect
+                reopened = FileMemoryStore(app.memory_root).reopen_last_iteration()
+                if reopened is not None:
+                    print_fn(
+                        f"  Reopened iteration {reopened.iteration_id} with the new reviewer feedback."
+                    )
+                answers.pop("user_feedback", None)
                 resume_existing_run = True
-                replan_reason = "feedback"
+                replan_reason = ""
+                pending_resume_start = True
                 continue
             except KeyboardInterrupt:
                 print_fn("\n\n--- Interrupted during experiment ---")
@@ -853,9 +870,17 @@ def run_interactive_start(
                 if not redirect or redirect.lower() in ("quit", "exit"):
                     print_fn("Stopped.")
                     return 0
-                answers["user_feedback"] = redirect
+                append_human_intervention(
+                    memory_root=app.memory_root,
+                    message=redirect,
+                    effects={"user_redirect": True},
+                    author="human",
+                    type_="override",
+                )
+                answers.pop("user_feedback", None)
                 resume_existing_run = True
-                replan_reason = "feedback"
+                replan_reason = ""
+                pending_resume_start = True
                 continue
             _print_result_summary(result, print_fn=print_fn)
             return 0
@@ -909,12 +934,12 @@ def run_from_spec(
     memory_root: Path | str,
     executor_factory_path: str,
     worker_model: str | None,
-    reflection_model: str | None = None,
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
     model_profile: str | None = None,
     iterations: int | None = None,
+    max_autonomous_hours: float | None = None,
     temperature: float = 0.2,
 ) -> list[dict[str, Any]]:
     spec = ExperimentSpec.from_dict(
@@ -926,12 +951,12 @@ def run_from_spec(
         memory_root=memory_root,
         model_profile=model_profile,
         worker_model=worker_model,
-        reflection_model=reflection_model,
         review_model=review_model,
         consultation_model=consultation_model,
         narrator_model=narrator_model,
         temperature=temperature,
     )
+    spec = app._apply_repo_stop_condition_defaults(spec)
     memory_store = FileMemoryStore(memory_root)
     orchestrator, runtime = app.build_orchestrator(
         spec=spec,
@@ -953,7 +978,11 @@ def run_from_spec(
     if blocking_checks:
         raise ValueError("; ".join(blocking_checks))
     orchestrator.initialize(spec=spec, reset_state=True)
-    return cycle_results_to_payload(orchestrator.run(iterations=iterations))
+    return cycle_results_to_payload(
+        orchestrator.run(
+            iterations=iterations, max_autonomous_hours=max_autonomous_hours
+        )
+    )
 
 
 def draft_spec(
@@ -986,10 +1015,16 @@ def draft_spec(
         model=probe_app.role_models.planner,
         temperature=temperature,
     )
-    return backend.propose_spec(
+    proposal = backend.propose_spec(
         objective=objective,
         capability_context=capability_context,
         user_preferences=preferences,
+    )
+    return replace(
+        proposal,
+        recommended_spec=probe_app._apply_repo_stop_condition_defaults(
+            proposal.recommended_spec
+        ),
     )
 
 
@@ -1025,12 +1060,12 @@ def main(argv: list[str] | None = None) -> int:
                 memory_root=args.memory_root,
                 executor_factory_path=args.executor_factory,
                 worker_model=args.worker_model,
-                reflection_model=args.reflection_model,
                 review_model=args.review_model,
                 consultation_model=args.consultation_model,
                 narrator_model=args.narrator_model,
                 model_profile=args.model_profile,
                 iterations=args.iterations,
+                max_autonomous_hours=args.max_autonomous_hours,
                 temperature=args.temperature,
             )
         except ValueError as exc:
@@ -1065,11 +1100,11 @@ def main(argv: list[str] | None = None) -> int:
                 model_profile=args.model_profile,
                 planner_model=args.planner_model,
                 worker_model=args.worker_model,
-                reflection_model=args.reflection_model,
                 review_model=args.review_model,
                 consultation_model=args.consultation_model,
                 narrator_model=args.narrator_model,
                 iterations=args.iterations,
+                max_autonomous_hours=args.max_autonomous_hours,
                 temperature=args.temperature,
                 stream_llm_output=args.stream_llm_output,
             )
@@ -1080,7 +1115,6 @@ def main(argv: list[str] | None = None) -> int:
             model_profile=args.model_profile,
             planner_model=args.planner_model,
             worker_model=args.worker_model,
-            reflection_model=args.reflection_model,
             review_model=args.review_model,
             consultation_model=args.consultation_model,
             narrator_model=args.narrator_model,
@@ -1090,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
             user_goal=args.message,
             answers=json.loads(args.answers_json),
             iterations=args.iterations,
+            max_autonomous_hours=args.max_autonomous_hours,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0

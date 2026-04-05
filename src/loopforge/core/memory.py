@@ -179,6 +179,41 @@ class FileMemoryStore:
         with self._updates_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(update.to_dict(), sort_keys=True) + "\n")
 
+    def reopen_last_iteration(self) -> IterationRecord | None:
+        records = self._read_records()
+        if not records:
+            return None
+        reopened = records[-1]
+        self._write_jsonl(
+            self._records_path, [record.to_dict() for record in records[:-1]]
+        )
+
+        summaries = self._read_summaries()
+        remaining_summaries = [
+            summary
+            for summary in summaries
+            if summary.iteration_id != reopened.iteration_id
+        ]
+        self._write_jsonl(
+            self._summaries_path,
+            [summary.to_dict() for summary in remaining_summaries],
+        )
+        self._rewrite_accepted_memory(remaining_summaries)
+
+        remaining_updates = [
+            update
+            for update in self.read_agent_updates()
+            if not (
+                update.stage == "iteration"
+                and update.iteration_id == reopened.iteration_id
+            )
+        ]
+        self._write_jsonl(
+            self._updates_path,
+            [update.to_dict() for update in remaining_updates],
+        )
+        return reopened
+
     def _read_records(self) -> list[IterationRecord]:
         if not self._records_path.exists():
             return []
@@ -326,3 +361,59 @@ class FileMemoryStore:
             lines.append("- Next ideas: " + "; ".join(summary.next_ideas))
         with self._experiment_journal_path.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(lines) + "\n\n")
+
+    @staticmethod
+    def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+        payload = "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+        path.write_text(payload, encoding="utf-8")
+
+    def _rewrite_accepted_memory(self, summaries: list[IterationSummary]) -> None:
+        self._rewrite_lessons(summaries)
+        self._rewrite_experiment_journal(summaries)
+        self._rewrite_artifact_index(summaries)
+        self._rewrite_best_summary(summaries)
+
+    def _rewrite_lessons(self, summaries: list[IterationSummary]) -> None:
+        merged_lessons: list[str] = []
+        for summary in summaries:
+            for lesson in summary.lessons:
+                if lesson not in merged_lessons:
+                    merged_lessons.append(lesson)
+        self._lessons_path.write_text(
+            "".join(f"- {lesson}\n" for lesson in merged_lessons), encoding="utf-8"
+        )
+
+    def _rewrite_experiment_journal(self, summaries: list[IterationSummary]) -> None:
+        self._experiment_journal_path.write_text("", encoding="utf-8")
+        for summary in summaries:
+            self._append_experiment_journal(summary)
+
+    def _rewrite_artifact_index(self, summaries: list[IterationSummary]) -> None:
+        payload = [
+            {
+                "iteration_id": summary.iteration_id,
+                "action_type": summary.action_type,
+                "artifacts": summary.artifacts,
+            }
+            for summary in summaries
+        ]
+        self._artifact_index_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _rewrite_best_summary(self, summaries: list[IterationSummary]) -> None:
+        best: IterationSummary | None = None
+        for summary in summaries:
+            if summary.result == "improved":
+                best = summary
+            elif (
+                best is None
+                and summary.result == "unchanged"
+                and summary.primary_metric_value is not None
+            ):
+                best = summary
+        if best is None:
+            self._best_result_path.unlink(missing_ok=True)
+            return
+        self.write_best_summary(best)

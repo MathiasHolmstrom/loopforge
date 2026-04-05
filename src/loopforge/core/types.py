@@ -655,7 +655,6 @@ class ExperimentSpecProposal:
 class RoleModelConfig:
     planner: str
     worker: str
-    reflection: str
     review: str
     consultation: str
     narrator: str
@@ -668,11 +667,11 @@ class RoleModelConfig:
         return cls(
             planner=payload["planner"],
             worker=payload["worker"],
-            reflection=payload["reflection"],
             review=payload["review"],
             consultation=payload.get("consultation", payload["worker"]),
             narrator=payload.get(
-                "narrator", payload.get("reflection", payload["worker"])
+                "narrator",
+                payload.get("review", payload.get("reflection", payload["worker"])),
             ),
         )
 

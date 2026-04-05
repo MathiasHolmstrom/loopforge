@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from difflib import get_close_matches
@@ -36,8 +37,6 @@ from loopforge.core import (
     LiteLLMBootstrapBackend,
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
-    LiteLLMReflectionBackend,
-    LiteLLMReviewBackend,
     PreflightCheck,
     ProgressFn,
     StreamFn,
@@ -63,7 +62,6 @@ DEFAULT_MODEL_PROFILE = "codex_with_claude_support"
 ROLE_MODEL_NAMES = (
     "planner",
     "worker",
-    "reflection",
     "review",
     "consultation",
     "narrator",
@@ -71,6 +69,10 @@ ROLE_MODEL_NAMES = (
 REPO_MODEL_CONFIG_FILENAMES = (
     "loopforge.models.json",
     ".loopforge/models.json",
+)
+REPO_SETTINGS_FILENAMES = (
+    "loopforge.settings.json",
+    ".loopforge/settings.json",
 )
 ExecutionBackendKind = Literal["supported", "planning_only"]
 GENERIC_AUTONOMOUS_ACTIONS = [
@@ -98,7 +100,6 @@ MODEL_PROFILES: dict[str, dict[str, str]] = {
     "all_codex": {
         "planner": DEFAULT_OPENAI_MODEL,
         "worker": DEFAULT_OPENAI_MODEL,
-        "reflection": DEFAULT_OPENAI_MODEL,
         "review": DEFAULT_OPENAI_MODEL,
         "consultation": DEFAULT_OPENAI_MODEL,
         "narrator": DEFAULT_OPENAI_MODEL,
@@ -106,7 +107,6 @@ MODEL_PROFILES: dict[str, dict[str, str]] = {
     "codex_with_claude_support": {
         "planner": DEFAULT_CLAUDE_MODEL,
         "worker": DEFAULT_OPENAI_MODEL,
-        "reflection": DEFAULT_OPENAI_MODEL,
         "review": DEFAULT_OPENAI_MODEL,
         "consultation": DEFAULT_CLAUDE_MODEL,
         "narrator": DEFAULT_CLAUDE_MODEL,
@@ -119,7 +119,6 @@ DEFAULT_ROLE_MAX_COMPLETION_TOKENS: dict[str, int] = {
     "runner_authoring": 5000,
     "consultation": 1200,
     "access_advisor": 1200,
-    "reflection": 900,
     "review": 700,
     "narrator": 700,
 }
@@ -130,10 +129,15 @@ class RepoRoleModelSettings:
     model_profile: str | None = None
     planner_model: str | None = None
     worker_model: str | None = None
-    reflection_model: str | None = None
     review_model: str | None = None
     consultation_model: str | None = None
     narrator_model: str | None = None
+
+
+@dataclass(frozen=True)
+class RepoLoopSettings:
+    max_iterations: int | None = None
+    max_autonomous_hours: float | None = None
 
 
 def _can_use_openai_models() -> bool:
@@ -230,11 +234,85 @@ def load_repo_role_model_settings(
     return RepoRoleModelSettings(), None
 
 
+def _coerce_optional_positive_int(
+    payload: dict[str, Any], key: str, *, path: Path
+) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{path}: `{key}` must be an integer when provided.")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{path}: `{key}` must be >= 0.")
+        return value
+    raise ValueError(f"{path}: `{key}` must be an integer when provided.")
+
+
+def _coerce_optional_positive_float(
+    payload: dict[str, Any], key: str, *, path: Path
+) -> float | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{path}: `{key}` must be a number when provided.")
+    if isinstance(value, int | float):
+        numeric = float(value)
+        if numeric < 0:
+            raise ValueError(f"{path}: `{key}` must be >= 0.")
+        return numeric
+    raise ValueError(f"{path}: `{key}` must be a number when provided.")
+
+
+def _parse_repo_loop_settings(payload: dict[str, Any], *, path: Path) -> RepoLoopSettings:
+    stop_payload = payload.get("stop_conditions")
+    if stop_payload is None:
+        stop_payload = {}
+    elif not isinstance(stop_payload, dict):
+        raise ValueError(
+            f"{path}: `stop_conditions` must be a JSON object when provided."
+        )
+
+    max_iterations = _coerce_optional_positive_int(
+        stop_payload, "max_iterations", path=path
+    )
+    if max_iterations is None:
+        max_iterations = _coerce_optional_positive_int(
+            payload, "max_iterations", path=path
+        )
+
+    max_autonomous_hours = _coerce_optional_positive_float(
+        stop_payload, "max_autonomous_hours", path=path
+    )
+    if max_autonomous_hours is None:
+        max_autonomous_hours = _coerce_optional_positive_float(
+            payload, "max_autonomous_hours", path=path
+        )
+
+    return RepoLoopSettings(
+        max_iterations=max_iterations,
+        max_autonomous_hours=max_autonomous_hours,
+    )
+
+
+def load_repo_loop_settings(repo_root: Path | str) -> tuple[RepoLoopSettings, Path | None]:
+    root = Path(repo_root)
+    for relative_path in REPO_SETTINGS_FILENAMES:
+        candidate = root / relative_path
+        if not candidate.is_file():
+            continue
+        payload = json.loads(candidate.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError(f"{candidate}: top-level JSON value must be an object.")
+        return _parse_repo_loop_settings(payload, path=candidate), candidate
+    return RepoLoopSettings(), None
+
+
 def _resolve_role_models(
     *,
     planner_model: str | None = None,
     worker_model: str | None = None,
-    reflection_model: str | None = None,
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
@@ -249,7 +327,6 @@ def _resolve_role_models(
     desired_models = {
         "planner": planner_model or defaults["planner"],
         "worker": worker_model or defaults["worker"],
-        "reflection": reflection_model or defaults["reflection"],
         "review": review_model or defaults["review"],
         "consultation": consultation_model or defaults["consultation"],
         "narrator": narrator_model or defaults["narrator"],
@@ -287,13 +364,12 @@ def _resolve_role_models(
                 f"{role} requested `{desired_model}` but provider `{desired_provider}` is unavailable; "
                 f"using `{resolved_model}` instead."
             )
-        resolved_models[role] = _normalise_model_id(resolved_model)
+        resolved_models[role] = resolved_model
 
     return (
         RoleModelConfig(
             planner=resolved_models["planner"],
             worker=resolved_models["worker"],
-            reflection=resolved_models["reflection"],
             review=resolved_models["review"],
             consultation=resolved_models["consultation"],
             narrator=resolved_models["narrator"],
@@ -679,7 +755,6 @@ def cycle_results_to_payload(results: list[Any]) -> list[dict[str, Any]]:
 def default_role_models(
     planner_model: str | None = None,
     worker_model: str | None = None,
-    reflection_model: str | None = None,
     review_model: str | None = None,
     consultation_model: str | None = None,
     narrator_model: str | None = None,
@@ -688,7 +763,6 @@ def default_role_models(
     role_models, _ = _resolve_role_models(
         planner_model=planner_model,
         worker_model=worker_model,
-        reflection_model=reflection_model,
         review_model=review_model,
         consultation_model=consultation_model,
         narrator_model=narrator_model,
@@ -1306,6 +1380,11 @@ def _trace_data_source(
         "columns": [],
         "load_error": None,
         "generated_questions": [],
+        "dependency_sync": {
+            "attempted": False,
+            "succeeded": False,
+            "tool": None,
+        },
     }
 
     # 1. Extract file/module references from user's goal
@@ -1378,19 +1457,45 @@ def _trace_data_source(
         results["load_error"] = f"Could not read {matched_file}: {exc}"
         return results
 
-    # 4. Sync dependencies
-    progress_fn("data_trace", "Syncing dependencies...")
+    # 4. Sync dependencies when uv is available. Otherwise keep using the
+    # current environment instead of making uv a hard prerequisite.
+    if shutil.which("uv") is None:
+        progress_fn(
+            "data_trace",
+            "uv not found; using the current Python environment without auto-sync.",
+        )
+        return results
+
+    progress_fn("data_trace", "Syncing dependencies with uv...")
+    results["dependency_sync"] = {
+        "attempted": True,
+        "succeeded": False,
+        "tool": "uv",
+    }
     try:
-        subprocess.run(
+        completed = subprocess.run(
             ["uv", "sync"],
             cwd=repo_root,
             capture_output=True,
             text=True,
             timeout=120,
+            check=False,
         )
-        progress_fn("data_trace", "Dependencies synced.")
-    except Exception:
-        pass
+    except Exception as exc:
+        progress_fn(
+            "data_trace",
+            f"Dependency sync unavailable ({exc}); continuing with the current environment.",
+        )
+        return results
+
+    if completed.returncode == 0:
+        results["dependency_sync"]["succeeded"] = True
+        progress_fn("data_trace", "Dependencies synced with uv.")
+    else:
+        progress_fn(
+            "data_trace",
+            "uv sync failed; continuing with the current environment.",
+        )
 
     return results
 
@@ -1400,13 +1505,14 @@ def _verify_execution_environment(
     repo_root: Path,
     capability_context: CapabilityContext,
     progress_fn: ProgressFn,
+    dependency_sync: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run real checks to verify the experiment can actually execute.
 
     Returns a dict with verification results to include in the bootstrap handoff.
     """
     results: dict[str, Any] = {
-        "deps_synced": True,  # Already synced in data trace step
+        "dependency_sync": dependency_sync or {},
         "baseline_metric": None,
         "baseline_script": None,
         "baseline_output": None,
@@ -1893,7 +1999,6 @@ class Loopforge:
         memory_root: Path | str = ".loopforge",
         planner_model: str | None = None,
         worker_model: str | None = None,
-        reflection_model: str | None = None,
         review_model: str | None = None,
         consultation_model: str | None = None,
         narrator_model: str | None = None,
@@ -1903,8 +2008,6 @@ class Loopforge:
         worker_backend: Any | None = None,
         runner_authoring_backend: RunnerAuthoringBackend | None = None,
         access_advisor_backend: Any | None = None,
-        reflection_backend: Any | None = None,
-        review_backend: Any | None = None,
         narrator_backend: Any | None = None,
         progress_fn: ProgressFn | None = None,
         stream_fn: StreamFn | None = None,
@@ -1923,6 +2026,9 @@ class Loopforge:
         repo_model_settings, repo_model_settings_path = load_repo_role_model_settings(
             self.repo_root
         )
+        self.repo_loop_settings, repo_loop_settings_path = load_repo_loop_settings(
+            self.repo_root
+        )
         bedrock_base = os.getenv("ANTHROPIC_BEDROCK_BASE_URL")
         if bedrock_base:
             self._bedrock_kwargs: dict[str, Any] = {
@@ -1938,7 +2044,6 @@ class Loopforge:
         self.role_models, model_routing_warnings = _resolve_role_models(
             planner_model=planner_model or repo_model_settings.planner_model,
             worker_model=worker_model or repo_model_settings.worker_model,
-            reflection_model=reflection_model or repo_model_settings.reflection_model,
             review_model=review_model or repo_model_settings.review_model,
             consultation_model=consultation_model
             or repo_model_settings.consultation_model,
@@ -1950,19 +2055,30 @@ class Loopforge:
                 "model_config_loaded",
                 f"Loaded role model settings from {repo_model_settings_path}.",
             )
+        if repo_loop_settings_path is not None:
+            self.progress_fn(
+                "repo_settings_loaded",
+                f"Loaded repo loop settings from {repo_loop_settings_path}.",
+            )
         for warning_index, warning in enumerate(model_routing_warnings, start=1):
             self.progress_fn(
                 f"model_routing_warning_{warning_index}",
                 f"Warning: {warning}",
             )
 
+        self._log_startup_summary()
+
+        def _runtime_model(model: str) -> str:
+            return _normalise_model_id(model)
+
         def _extra(model: str) -> dict[str, Any]:
-            if model.startswith("bedrock/") and self._bedrock_kwargs:
+            if _runtime_model(model).startswith("bedrock/") and self._bedrock_kwargs:
                 return {"extra_kwargs": self._bedrock_kwargs}
             return {}
 
         self.bootstrap_backend = bootstrap_backend or LiteLLMBootstrapBackend(
-            model=self.role_models.planner,
+            model=_runtime_model(self.role_models.planner),
+            request_model=_runtime_model(self.role_models.planner),
             temperature=temperature,
             max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["planner"],
             stream_fn=stream_fn,
@@ -1972,7 +2088,8 @@ class Loopforge:
         self.runner_authoring_backend = (
             runner_authoring_backend
             or LiteLLMRunnerAuthoringBackend(
-                model=self.role_models.worker,
+                model=_runtime_model(self.role_models.worker),
+                request_model=_runtime_model(self.role_models.worker),
                 temperature=temperature,
                 max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS[
                     "runner_authoring"
@@ -1985,7 +2102,8 @@ class Loopforge:
         self.access_advisor_backend = (
             access_advisor_backend
             or LiteLLMAccessAdvisorBackend(
-                model=self.role_models.consultation,
+                model=_runtime_model(self.role_models.consultation),
+                request_model=_runtime_model(self.role_models.consultation),
                 temperature=temperature,
                 max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS[
                     "access_advisor"
@@ -1995,24 +2113,9 @@ class Loopforge:
                 **_extra(self.role_models.consultation),
             )
         )
-        self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
-            model=self.role_models.reflection,
-            temperature=temperature,
-            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["reflection"],
-            stream_fn=stream_fn,
-            progress_fn=self.progress_fn,
-            **_extra(self.role_models.reflection),
-        )
-        self.review_backend = review_backend or LiteLLMReviewBackend(
-            model=self.role_models.review,
-            temperature=temperature,
-            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["review"],
-            stream_fn=stream_fn,
-            progress_fn=self.progress_fn,
-            **_extra(self.role_models.review),
-        )
         self.narrator_backend = narrator_backend or LiteLLMNarrationBackend(
-            model=self.role_models.narrator,
+            model=_runtime_model(self.role_models.narrator),
+            request_model=_runtime_model(self.role_models.narrator),
             temperature=temperature,
             max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["narrator"],
             stream_fn=stream_fn,
@@ -2020,6 +2123,40 @@ class Loopforge:
             **_extra(self.role_models.narrator),
         )
         self._extra = _extra
+        self._runtime_model = _runtime_model
+
+    def _log_startup_summary(self) -> None:
+        """Log a human-readable summary of the effective configuration."""
+        models = self.role_models
+        loop = self.repo_loop_settings
+        # Deduplicate models: group roles that share the same model
+        model_to_roles: dict[str, list[str]] = {}
+        for role, model in [
+            ("planner", models.planner),
+            ("worker", models.worker),
+            ("reflection", models.worker),
+            ("review", models.review),
+            ("consultation", models.consultation),
+            ("narrator", models.narrator),
+        ]:
+            model_to_roles.setdefault(model, []).append(role)
+        if len(model_to_roles) == 1:
+            only_model = next(iter(model_to_roles))
+            model_summary = f"all roles -> {only_model}"
+        else:
+            parts = []
+            for model, roles in model_to_roles.items():
+                parts.append(f"{', '.join(roles)} -> {model}")
+            model_summary = " | ".join(parts)
+        max_iter = loop.max_iterations if loop.max_iterations is not None else 30
+        max_hours = loop.max_autonomous_hours if loop.max_autonomous_hours is not None else 6
+        lines = [
+            "Configuration:",
+            f"  Models     : {model_summary}",
+            f"  Iterations : up to {max_iter}",
+            f"  Time limit : {max_hours}h",
+        ]
+        self.progress_fn("startup_summary_detail", "\n".join(lines))
 
     def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
         if self.explicit_executor_factory_path:
@@ -2106,6 +2243,7 @@ class Loopforge:
         extra_kwargs_review = self._extra(self.role_models.review).get("extra_kwargs")
         tool_use_agent = ToolUseExecutor(
             model=self.role_models.worker,
+            request_model=self._runtime_model(self.role_models.worker),
             repo_root=self.repo_root,
             temperature=self.temperature,
             progress_fn=self.progress_fn,
@@ -2113,6 +2251,7 @@ class Loopforge:
         )
         reviewer = ToolUseReviewer(
             model=self.role_models.review,
+            request_model=self._runtime_model(self.role_models.review),
             repo_root=self.repo_root,
             temperature=self.temperature,
             progress_fn=self.progress_fn,
@@ -2310,7 +2449,28 @@ class Loopforge:
                 "fix_metrics_warning_llm",
                 f"Metric repair inference failed; keeping the current spec unchanged: {exc}",
             )
-            return patched_spec
+        return patched_spec
+
+    def _apply_repo_stop_condition_defaults(self, spec: ExperimentSpec) -> ExperimentSpec:
+        stop_conditions = dict(spec.stop_conditions)
+        changed = False
+        if (
+            "max_iterations" not in stop_conditions
+            and self.repo_loop_settings.max_iterations is not None
+        ):
+            stop_conditions["max_iterations"] = self.repo_loop_settings.max_iterations
+            changed = True
+        if (
+            "max_autonomous_hours" not in stop_conditions
+            and self.repo_loop_settings.max_autonomous_hours is not None
+        ):
+            stop_conditions["max_autonomous_hours"] = (
+                self.repo_loop_settings.max_autonomous_hours
+            )
+            changed = True
+        if not changed:
+            return spec
+        return replace(spec, stop_conditions=stop_conditions)
 
         if not fixes:
             return patched_spec
@@ -2542,6 +2702,7 @@ class Loopforge:
         planner_extra = self._extra(self.role_models.planner).get("extra_kwargs")
         planner = ToolUsePlanner(
             model=self.role_models.planner,
+            request_model=self._runtime_model(self.role_models.planner),
             repo_root=self.repo_root,
             temperature=self.temperature,
             progress_fn=self.progress_fn,
@@ -2598,6 +2759,7 @@ class Loopforge:
                 "baseline_metric_value": contract.get("baseline_value"),
             },
         )
+        spec = self._apply_repo_stop_condition_defaults(spec)
 
         # Convert planner questions to SpecQuestion objects
         spec_questions = [
@@ -2716,6 +2878,7 @@ class Loopforge:
                 repo_root=self.repo_root,
                 capability_context=capability_context,
                 progress_fn=self.progress_fn,
+                dependency_sync=data_trace.get("dependency_sync"),
             )
 
         bootstrap_warnings: list[str] = []
@@ -3040,12 +3203,14 @@ class Loopforge:
         user_goal: str,
         answers: dict[str, Any] | None = None,
         iterations: int | None = None,
+        max_autonomous_hours: float | None = None,
     ) -> dict[str, Any]:
         bootstrap_turn = self.bootstrap(user_goal=user_goal, answers=answers)
         return self.start_from_bootstrap_turn(
             bootstrap_turn=bootstrap_turn,
             user_goal=user_goal,
             iterations=iterations,
+            max_autonomous_hours=max_autonomous_hours,
             reset_state=True,
         )
 
@@ -3146,13 +3311,21 @@ class Loopforge:
         bootstrap_turn: BootstrapTurn,
         user_goal: str,
         iterations: int | None = None,
+        max_autonomous_hours: float | None = None,
         iteration_callback=None,
         reset_state: bool = False,
     ) -> dict[str, Any]:
         if not bootstrap_turn.ready_to_start:
             return {"status": "needs_input", "bootstrap": bootstrap_turn.to_dict()}
 
-        spec = bootstrap_turn.proposal.recommended_spec
+        spec = self._apply_repo_stop_condition_defaults(
+            bootstrap_turn.proposal.recommended_spec
+        )
+        if spec != bootstrap_turn.proposal.recommended_spec:
+            bootstrap_turn = replace(
+                bootstrap_turn,
+                proposal=replace(bootstrap_turn.proposal, recommended_spec=spec),
+            )
         memory_store = FileMemoryStore(self.memory_root)
         if not reset_state and memory_store.has_persisted_state():
             try:
@@ -3186,7 +3359,9 @@ class Loopforge:
         orchestrator.initialize(spec=spec, reset_state=reset_state)
         try:
             results = orchestrator.run(
-                iterations=iterations, iteration_callback=iteration_callback
+                iterations=iterations,
+                max_autonomous_hours=max_autonomous_hours,
+                iteration_callback=iteration_callback,
             )
         except (ExperimentInterrupted, KeyboardInterrupt):
             raise

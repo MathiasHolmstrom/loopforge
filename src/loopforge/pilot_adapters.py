@@ -34,7 +34,7 @@ def _installable_python_dependency(exc: Exception) -> tuple[str, str] | None:
     install_name = {
         "sklearn": "scikit-learn",
     }.get(package_name, package_name)
-    return package_name, f"uv pip install {install_name}"
+    return package_name, f"{sys.executable} -m pip install {install_name}"
 
 
 def detect_builtin_executor_factory(

@@ -209,10 +209,18 @@ def build_bootstrap_handoff(
         lines.extend(
             ["", "## Environment Verification (bootstrapper ran these checks)"]
         )
-        if env_verification.get("deps_synced"):
-            lines.append("- Dependencies: synced (uv sync succeeded)")
+        dependency_sync = env_verification.get("dependency_sync", {})
+        if dependency_sync.get("attempted") and dependency_sync.get("succeeded"):
+            tool_name = dependency_sync.get("tool") or "dependency manager"
+            lines.append(f"- Dependencies: synced automatically with `{tool_name}`")
+        elif dependency_sync.get("attempted"):
+            lines.append(
+                "- Dependencies: automatic sync was attempted but did not complete; the current Python environment is still being used"
+            )
         else:
-            lines.append("- Dependencies: NOT synced — use `uv sync` before running")
+            lines.append(
+                "- Dependencies: using the current Python environment (no automatic sync step ran)"
+            )
         if env_verification.get("baseline_script"):
             lines.append(f"- Baseline script: {env_verification['baseline_script']}")
         if env_verification.get("baseline_output"):

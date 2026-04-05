@@ -3,9 +3,11 @@ from __future__ import annotations
 from loopforge import CapabilityContext, PreflightCheck
 from loopforge.core.bootstrap_contracts import (
     apply_bootstrap_execution_contract,
+    build_bootstrap_handoff,
     resolve_repo_root_from_objective,
     should_prepare_access_guide,
 )
+from loopforge.core.types import BootstrapTurn, ExperimentSpecProposal, RoleModelConfig
 from tests.support import build_spec
 
 
@@ -61,3 +63,33 @@ def test_resolve_repo_root_from_objective_prefers_named_child_repo(tmp_path) -> 
     )
 
     assert resolved == target
+
+
+def test_build_bootstrap_handoff_does_not_require_uv_for_dependencies() -> None:
+    spec = build_spec()
+    turn = BootstrapTurn(
+        assistant_message="Plan ready.",
+        proposal=ExperimentSpecProposal(
+            objective=spec.objective,
+            recommended_spec=spec,
+            questions=[],
+            notes=[],
+        ),
+        role_models=RoleModelConfig(
+            planner="planner",
+            worker="worker",
+            review="review",
+            consultation="consultation",
+            narrator="narrator",
+        ),
+    )
+
+    handoff = build_bootstrap_handoff(
+        capability_context=CapabilityContext(),
+        turn=turn,
+        answers={},
+        env_verification={"dependency_sync": {"attempted": False, "succeeded": False}},
+    )
+
+    assert "using the current Python environment" in handoff
+    assert "use `uv sync` before running" not in handoff

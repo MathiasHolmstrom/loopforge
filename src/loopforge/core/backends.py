@@ -126,15 +126,6 @@ class BootstrapBackend(Protocol):
     ) -> BootstrapTurn: ...
 
 
-class ReflectionBackend(Protocol):
-    def reflect(
-        self,
-        snapshot: MemorySnapshot,
-        candidate: ExperimentCandidate,
-        outcome: ExperimentOutcome,
-    ) -> ReflectionSummary: ...
-
-
 class AccessAdvisorBackend(Protocol):
     def build_access_guide(
         self,
@@ -182,6 +173,7 @@ class _LiteLLMJsonBackend:
     def __init__(
         self,
         model: str,
+        request_model: str | None = None,
         completion_fn: Any | None = None,
         temperature: float = 0.2,
         max_completion_tokens: int | None = None,
@@ -192,6 +184,7 @@ class _LiteLLMJsonBackend:
         heartbeat_schedule_seconds: tuple[float, ...] = (15.0, 30.0, 60.0, 120.0),
     ) -> None:
         self.model = model
+        self.request_model = request_model or model
         self.temperature = temperature
         self.extra_kwargs = extra_kwargs or {}
         self.max_completion_tokens = max_completion_tokens
@@ -217,7 +210,7 @@ class _LiteLLMJsonBackend:
         from litellm import completion as litellm_completion
 
         response = litellm_completion(
-            model=self.model,
+            model=self.request_model,
             messages=messages,
             temperature=self.temperature,
             stream=True,
@@ -316,7 +309,7 @@ class _LiteLLMJsonBackend:
 
                 completion_fn = litellm_completion
             response = completion_fn(
-                model=self.model,
+                model=self.request_model,
                 messages=messages,
                 temperature=self.temperature,
                 **self._completion_kwargs(),
@@ -369,7 +362,7 @@ class _LiteLLMJsonBackend:
 
                 completion_fn = litellm_completion
             response = completion_fn(
-                model=self.model,
+                model=self.request_model,
                 messages=messages,
                 temperature=self.temperature,
                 response_format={"type": "json_object"},
@@ -1183,7 +1176,6 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
         resolved_role_models = role_models or RoleModelConfig(
             planner=self.model,
             worker=self.model,
-            reflection=self.model,
             review=self.model,
             consultation=self.model,
             narrator=self.model,
@@ -1470,150 +1462,6 @@ class LiteLLMAccessAdvisorBackend(_LiteLLMJsonBackend):
             progress_label="building the access guide",
         )
         return AccessGuide.from_dict(payload)
-
-
-class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
-    @staticmethod
-    def _coerce_string_list(value: Any) -> list[str]:
-        if isinstance(value, str):
-            stripped = value.strip()
-            return [stripped] if stripped else []
-        if isinstance(value, list):
-            return [str(item).strip() for item in value if str(item).strip()]
-        return []
-
-    @staticmethod
-    def _coerce_recommended_next_action(value: Any) -> str | None:
-        if isinstance(value, str):
-            stripped = value.strip()
-            return stripped or None
-        if isinstance(value, Mapping):
-            for key in (
-                "action_type",
-                "recommended_next_action",
-                "next_action",
-                "action",
-                "name",
-            ):
-                nested = value.get(key)
-                if isinstance(nested, str) and nested.strip():
-                    return nested.strip()
-            candidate = value.get("candidate")
-            if isinstance(candidate, Mapping):
-                action_type = candidate.get("action_type")
-                if isinstance(action_type, str) and action_type.strip():
-                    return action_type.strip()
-            reason = value.get("reason")
-            if isinstance(reason, str) and reason.strip():
-                return reason.strip()
-        return None
-
-    @classmethod
-    def _normalise_reflection_payload(
-        cls,
-        payload: Any,
-        *,
-        outcome: ExperimentOutcome,
-    ) -> dict[str, Any]:
-        raw_payload = payload if isinstance(payload, Mapping) else {}
-        nested = raw_payload.get("reflection")
-        if isinstance(nested, Mapping):
-            reflection_payload: dict[str, Any] = {**dict(raw_payload), **dict(nested)}
-        else:
-            reflection_payload = dict(raw_payload)
-
-        assessment = None
-        for key in (
-            "assessment",
-            "summary",
-            "analysis",
-            "reflection",
-            "message",
-            "text",
-        ):
-            value = reflection_payload.get(key)
-            if isinstance(value, str) and value.strip():
-                assessment = value.strip()
-                break
-
-        lessons = cls._coerce_string_list(reflection_payload.get("lessons"))
-        risks = cls._coerce_string_list(reflection_payload.get("risks"))
-        recommended_next_action = cls._coerce_recommended_next_action(
-            reflection_payload.get("recommended_next_action")
-            or reflection_payload.get("next_action")
-        )
-
-        if assessment is None:
-            if lessons:
-                assessment = lessons[0]
-            elif risks:
-                assessment = risks[0]
-            elif recommended_next_action is not None:
-                assessment = (
-                    f"The iteration {outcome.status.replace('_', ' ')}. "
-                    f"Suggested next action: {recommended_next_action}."
-                )
-            else:
-                assessment = (
-                    "[fallback] Reflection agent did not provide an assessment."
-                )
-
-        return {
-            "assessment": assessment,
-            "lessons": lessons,
-            "risks": risks,
-            "recommended_next_action": recommended_next_action,
-        }
-
-    def reflect(
-        self,
-        snapshot: MemorySnapshot,
-        candidate: ExperimentCandidate,
-        outcome: ExperimentOutcome,
-    ) -> ReflectionSummary:
-        payload = self._complete_json(
-            system_prompt=(
-                "You are a fresh reflection agent. Assess whether the experiment result is meaningful, "
-                "what was learned, whether primary or guardrail metrics moved in the intended direction, "
-                "and what action type should be considered next. "
-                "If the iteration failed but the failure is recoverable, reflect on the failure as useful evidence and recommend the next repair or retry step. "
-                "Treat the loop as autonomous after bootstrap: recommend the next experiment step directly unless execution is truly blocked.\n\n"
-                + DATA_SCIENCE_METRICS_REASONING
-            ),
-            payload={
-                "effective_spec": snapshot.effective_spec.to_dict(),
-                "capability_context": snapshot.capability_context.to_dict(),
-                "candidate": _compact_candidate(candidate),
-                "outcome": _compact_outcome(outcome),
-                "recent_records": _compact_recent_records(snapshot),
-                "best_summary": _compact_iteration_summary(snapshot.best_summary)
-                if snapshot.best_summary is not None
-                else None,
-                "recent_human_interventions": _compact_human_interventions(snapshot),
-                "markdown_memory": _compact_markdown_memory(snapshot, limit=3),
-                "instructions": {
-                    "return_fields": [
-                        "assessment",
-                        "lessons",
-                        "risks",
-                        "recommended_next_action",
-                    ],
-                    "assessment_requirements": [
-                        "assessment is required and must be a non-empty string",
-                        "recommended_next_action must be a short action label string, not an object",
-                    ],
-                },
-            },
-            progress_stage="reflect_llm",
-            progress_label="reflecting on the latest outcome",
-        )
-        payload = self._normalise_reflection_payload(payload, outcome=outcome)
-        return ReflectionSummary(
-            assessment=payload["assessment"],
-            lessons=payload.get("lessons", []),
-            risks=payload.get("risks", []),
-            recommended_next_action=payload.get("recommended_next_action"),
-        )
 
 
 class LiteLLMReviewBackend(_LiteLLMJsonBackend):

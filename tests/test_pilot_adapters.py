@@ -14,6 +14,15 @@ from loopforge import (
 from loopforge.auto_adapter import synthesize_auto_adapter
 
 
+def test_installable_python_dependency_suggests_pip_command() -> None:
+    package_name, install_command = pilot_adapters_module._installable_python_dependency(
+        ModuleNotFoundError("No module named 'sklearn'")
+    )
+
+    assert package_name == "sklearn"
+    assert install_command.endswith(" -m pip install scikit-learn")
+
+
 def test_detect_builtin_executor_factory_for_lol_kills_repo(tmp_path) -> None:
     repo_root = tmp_path / "player-performance-ratings"
     (repo_root / "examples" / "lol").mkdir(parents=True)

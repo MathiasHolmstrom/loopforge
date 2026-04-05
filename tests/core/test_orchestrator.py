@@ -14,8 +14,7 @@ from loopforge import (
     RoutingExperimentExecutor,
 )
 from tests.support import (
-    FakeReflectionBackend,
-    FakeReviewBackend,
+    FakeReviewer,
     FakeWorkerBackend,
     build_spec,
 )
@@ -64,11 +63,9 @@ def test_orchestrator_does_not_continue_metricless_baseline_first_iteration(
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor({}, plan_executor=Executor()),
-        reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="No metrics.")]
-        ),
-        review_backend=FakeReviewBackend(
-            [ReviewDecision(status="accepted", reason="ok")]
+        reviewer=FakeReviewer(
+            [ReflectionSummary(assessment="No metrics.")],
+            [ReviewDecision(status="accepted", reason="ok")],
         ),
         capability_provider=lambda spec: CapabilityContext(
             environment_facts={"execution_backend_kind": "generic_agentic"}
@@ -138,11 +135,9 @@ def test_orchestrator_attempts_same_iteration_repair_in_baseline_first_phase(
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor({}, plan_executor=executor),
-        reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Failed.")]
-        ),
-        review_backend=FakeReviewBackend(
-            [ReviewDecision(status="accepted", reason="ok")]
+        reviewer=FakeReviewer(
+            [ReflectionSummary(assessment="Failed.")],
+            [ReviewDecision(status="accepted", reason="ok")],
         ),
         capability_provider=lambda spec: CapabilityContext(
             environment_facts={"execution_backend_kind": "generic_agentic"}
@@ -181,11 +176,9 @@ def test_orchestrator_classifies_first_metric_bearing_iteration_as_unchanged_and
             {},
             plan_executor=StaticExecutor([ExperimentOutcome(primary_metric_value=0.5)]),
         ),
-        reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Baseline established.")]
-        ),
-        review_backend=FakeReviewBackend(
-            [ReviewDecision(status="accepted", reason="ok")]
+        reviewer=FakeReviewer(
+            [ReflectionSummary(assessment="Baseline established.")],
+            [ReviewDecision(status="accepted", reason="ok")],
         ),
         capability_provider=lambda spec: CapabilityContext(),
     )
@@ -237,17 +230,15 @@ def test_orchestrator_classifies_metric_ties_as_unchanged(tmp_path) -> None:
                 ]
             ),
         ),
-        reflection_backend=FakeReflectionBackend(
+        reviewer=FakeReviewer(
             [
                 ReflectionSummary(assessment="Baseline established."),
                 ReflectionSummary(assessment="No change."),
-            ]
-        ),
-        review_backend=FakeReviewBackend(
+            ],
             [
                 ReviewDecision(status="accepted", reason="ok"),
                 ReviewDecision(status="accepted", reason="ok"),
-            ]
+            ],
         ),
         capability_provider=lambda spec: CapabilityContext(),
     )
@@ -319,17 +310,15 @@ def test_orchestrator_does_not_mark_unconstrained_guardrails_as_failures(
                 ]
             ),
         ),
-        reflection_backend=FakeReflectionBackend(
+        reviewer=FakeReviewer(
             [
                 ReflectionSummary(assessment="Baseline."),
                 ReflectionSummary(assessment="Improved."),
-            ]
-        ),
-        review_backend=FakeReviewBackend(
+            ],
             [
                 ReviewDecision(status="accepted", reason="ok"),
                 ReviewDecision(status="accepted", reason="ok"),
-            ]
+            ],
         ),
         capability_provider=lambda spec: CapabilityContext(),
     )
@@ -389,11 +378,9 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
         memory_store=store,
         worker_backend=worker,
         executor=RoutingExperimentExecutor({}, plan_executor=Executor()),
-        reflection_backend=FakeReflectionBackend(
-            [ReflectionSummary(assessment="Failed.")] * 3
-        ),
-        review_backend=FakeReviewBackend(
-            [ReviewDecision(status="accepted", reason="ok")] * 3
+        reviewer=FakeReviewer(
+            [ReflectionSummary(assessment="Failed.")] * 3,
+            [ReviewDecision(status="accepted", reason="ok")] * 3,
         ),
         capability_provider=lambda spec: CapabilityContext(
             environment_facts={"execution_backend_kind": "generic_agentic"}
@@ -407,6 +394,23 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
     assert all(
         result.record.outcome.status == "recoverable_failure" for result in results
     )
+
+
+def test_orchestrator_run_allows_runtime_max_autonomous_hours_override(tmp_path) -> None:
+    store = FileMemoryStore(tmp_path / "memory")
+    spec = build_spec(stop_conditions={"max_iterations": 3, "max_autonomous_hours": 6})
+    orchestrator = ExperimentOrchestrator(
+        memory_store=store,
+        worker_backend=FakeWorkerBackend([]),
+        executor=RoutingExperimentExecutor({}, plan_executor=StaticExecutor([])),
+        reviewer=FakeReviewer([], []),
+        capability_provider=lambda spec: CapabilityContext(),
+    )
+    orchestrator.initialize(spec)
+
+    results = orchestrator.run(max_autonomous_hours=0)
+
+    assert results == []
 
 
 class StaticExecutor:
