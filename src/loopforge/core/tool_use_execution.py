@@ -801,87 +801,37 @@ def _build_system_prompt(
     parts = [
         "You are an ML experiment worker with interactive access to a code repository.",
         "",
-        "=== USER'S INSTRUCTION (this is what they asked for — follow it precisely) ===",
-        spec.objective,
-        "=============================================================================",
-        "",
+        f"Objective: {spec.objective}",
         f"Primary metric: {spec.primary_metric.name} (goal: {spec.primary_metric.goal})",
         f"Secondary metrics: {secondary}",
         f"Guardrail metrics: {guardrails}",
-        "",
         f"Repo root: {env.get('repo_root', '.')}",
         f"Python: {env.get('python_executable', 'python')}",
         "",
-        "IMPORTANT: The bootstrap handoff below may contain environment verification results.",
-        "If the handoff shows a baseline script ERROR, do NOT run that same script — read the error and adapt.",
-        "If the handoff shows successful baseline output with metrics, call report_metrics immediately.",
+        "You have tools to read files, write files, run commands, search code, and think.",
+        "Use think() to explain your reasoning before major actions.",
+        "Write experiment scripts to `.loopforge/experiments/`.",
         "",
-        "Rules:",
-        "- Call think() before major actions to explain your reasoning and plan.",
-        "- ONE experiment idea per iteration. Fix small errors but do not redesign the whole script.",
-        "- If after a few fixes the core approach is wrong, call report_metrics with what you learned and stop.",
-        "- The outer loop gives you more iterations with lessons from this one.",
-        "- NEVER use bare `pip install`. Use `uv pip install` or `uv sync` for dependencies.",
-        "- Do not install new packages unless absolutely necessary — the bootstrapper already verified deps.",
-        "- Write experiment scripts to a `.loopforge/experiments/` directory, not alongside existing scripts.",
+        "Workflow: run ONE experiment per iteration, then analyze results.",
+        "1. Read the code and the bootstrap handoff below",
+        "2. Write and run ONE experiment",
+        "3. Call report_metrics with numeric results",
+        "4. Analyze your results (feature importance, errors by segment, patterns)",
+        "5. Call finish_iteration with your analysis and what you'd recommend next",
     ]
 
-    # Phase-specific guidance: baseline first, then improve
+    # Phase context
     if snapshot.best_summary is None and not snapshot.recent_records:
         parts.append("")
-        parts.append("PHASE: BASELINE (no metrics exist yet)")
         parts.append(
-            "Your ONLY job this iteration is to get the EXISTING model's baseline metric."
-        )
-        parts.append(
-            "Do NOT add features, change the model, or try to improve anything yet."
-        )
-        parts.append("")
-        parts.append(
-            "The bootstrap handoff below already contains the baseline script path and possibly its output."
-        )
-        parts.append(
-            "READ IT FIRST. If it contains metric values, call report_metrics immediately."
-        )
-        parts.append(
-            "If it contains a baseline script path, run that script AS-IS — do not rewrite it."
-        )
-        parts.append("Only search the repo if the handoff doesn't answer the question.")
-        parts.append("")
-        parts.append(
-            "The next iteration will focus on improvements — this one just establishes the number to beat."
+            "No metrics exist yet. Establish the baseline first — run the existing code as-is."
         )
     elif snapshot.best_summary is not None:
         parts.append("")
-        parts.append("PHASE: IMPROVE (baseline exists)")
         parts.append(
-            f"Best result so far: {spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value} (iteration {snapshot.best_summary.iteration_id})"
+            f"Best so far: {spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value}. "
+            "Make ONE focused change to improve it."
         )
-        parts.append(
-            "Your job: make ONE focused change to beat that number, then report the new metric."
-        )
-    else:
-        parts.append("")
-        parts.append("PHASE: RETRY (prior attempts failed to produce metrics)")
-        parts.append(
-            "Focus on getting a metric out — even the baseline. Read prior errors and fix them."
-        )
-
-    parts.append("")
-    parts.append("Your workflow:")
-    parts.append("1. Read the repo to find the existing model/experiment code")
-    parts.append("2. Write or adapt ONE script")
-    parts.append("3. Run it (use timeout=300 for training)")
-    parts.append("4. Fix obvious errors if needed and retry")
-    parts.append("5. Call report_metrics with the numeric results")
-    parts.append("6. AFTER reporting metrics, analyze your results:")
-    parts.append("   - Run feature importance code (e.g. print top features)")
-    parts.append("   - Check model errors by segment/category")
-    parts.append("   - Note where the model struggles and why")
-    parts.append(
-        "7. Call finish_iteration with your analysis summary and recommendations"
-    )
-    parts.append("   The reviewer uses your analysis to decide what to try next.")
 
     # Add context from bootstrap handoff / experiment guide if present
     for note in snapshot.markdown_memory:
