@@ -105,7 +105,7 @@ def _run_subprocess_with_progress(
                 tick += 1
                 progress_fn(
                     f"step_{step_index}_wait_{tick}",
-                    f"Still running step {step_index}/{total_steps}: {step_description} ({int(elapsed)}s elapsed)...",
+                    f"Still running ({int(elapsed)}s)...",
                 )
                 checkpoint_index += 1
                 if checkpoint_index < len(checkpoints):
