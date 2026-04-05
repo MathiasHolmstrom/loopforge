@@ -1050,7 +1050,11 @@ class ToolUseExecutor:
                     metrics_reported = True
                     # report_metrics stops the loop
                     messages.append(
-                        {"role": "tool", "tool_call_id": tc.id, "content": "Metrics recorded."}
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "content": "Metrics recorded.",
+                        }
                     )
                     interrupted = True
                     break
@@ -1715,13 +1719,15 @@ class ToolUseReviewer:
 
         # Point to saved artifacts
         artifacts_dir = f".loopforge/experiments/iter_{snapshot.next_iteration_id}"
-        user_parts.extend([
-            "",
-            f"EXPERIMENT ARTIFACTS: {artifacts_dir}/",
-            "  The experimenter may have saved predictions.parquet and the experiment script there.",
-            "  Load predictions.parquet to run your own diagnostic analysis.",
-            "  Use run_command with Python to compute error breakdowns, feature importance, etc.",
-        ])
+        user_parts.extend(
+            [
+                "",
+                f"EXPERIMENT ARTIFACTS: {artifacts_dir}/",
+                "  The experimenter may have saved predictions.parquet and the experiment script there.",
+                "  Load predictions.parquet to run your own diagnostic analysis.",
+                "  Use run_command with Python to compute error breakdowns, feature importance, etc.",
+            ]
+        )
 
         # Add full experiment history
         history = _format_iteration_history(snapshot)
@@ -1742,7 +1748,12 @@ class ToolUseReviewer:
                 return _execute_write_file(args, self.repo_root)
             if name == "run_command":
                 return _execute_run_command(
-                    args, self.repo_root, 120, 100_000, self.progress_fn, turn,
+                    args,
+                    self.repo_root,
+                    120,
+                    100_000,
+                    self.progress_fn,
+                    turn,
                 )
             if name == "think":
                 return "OK"
