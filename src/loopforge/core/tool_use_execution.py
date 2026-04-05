@@ -502,31 +502,6 @@ TOOLS = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "finish_iteration",
-            "description": (
-                "Finish this iteration. Call AFTER report_metrics and AFTER analyzing your results. "
-                "Include your analysis findings: feature importance, segmented performance, error patterns, "
-                "and what you'd recommend trying next."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": (
-                            "Your analysis of the experiment results. Include: "
-                            "top features by importance, segments where model struggles, "
-                            "error patterns, and what you'd recommend for the next iteration."
-                        ),
-                    },
-                },
-                "required": ["summary"],
-            },
-        },
-    },
 ]
 
 
@@ -700,14 +675,7 @@ def _execute_report_metrics(
         if name == spec.primary_metric.name:
             primary_value = value
 
-    response = (
-        f"Metrics recorded: {json.dumps(raw_metrics)}\n\n"
-        "Good. Now BEFORE calling finish_iteration, analyze your results:\n"
-        "- Run feature importance (e.g. model.feature_importances_)\n"
-        "- Check error by segment/category (e.g. by position, time period)\n"
-        "- Note patterns in where the model fails\n"
-        "Then call finish_iteration with your analysis summary."
-    )
+    response = f"Metrics recorded: {json.dumps(raw_metrics)}"
     return response, metric_results, primary_value
 
 
@@ -810,14 +778,15 @@ def _build_system_prompt(
         "",
         "You have tools to read files, write files, run commands, search code, and think.",
         "Use think() to explain your reasoning before major actions.",
-        "Write experiment scripts to `.loopforge/experiments/`.",
         "",
-        "Workflow: run ONE experiment per iteration, then analyze results.",
+        "Workflow:",
         "1. Read the code and the bootstrap handoff below",
-        "2. Write and run ONE experiment",
-        "3. Call report_metrics with numeric results",
-        "4. Analyze your results (feature importance, errors by segment, patterns)",
-        "5. Call finish_iteration with your analysis and what you'd recommend next",
+        f"2. Write experiment script to `.loopforge/experiments/iter_{snapshot.next_iteration_id}/`",
+        "3. Your script MUST save its CV predictions to `predictions.parquet` in that directory",
+        "4. Run the experiment",
+        "5. Call report_metrics with numeric results",
+        "",
+        "The reviewer will analyze your saved predictions separately — you don't need to.",
     ]
 
     # Phase context
@@ -948,7 +917,6 @@ class ToolUseExecutor:
         tool_call_log: list[dict[str, Any]] = []
         files_written: list[str] = []
         metrics_reported = False
-        reported_summary = ""
         error_count = 0
         turn = 0
 
@@ -972,7 +940,6 @@ class ToolUseExecutor:
                     spec=spec,
                     reported_metrics=reported_metrics,
                     reported_primary_value=reported_primary_value,
-                    reported_summary=reported_summary,
                     command_outputs=command_outputs,
                     tool_call_log=tool_call_log,
                     files_written=files_written,
@@ -1081,10 +1048,9 @@ class ToolUseExecutor:
                     if primary is not None:
                         reported_primary_value = primary
                     metrics_reported = True
-                elif tool_name == "finish_iteration":
-                    reported_summary = tool_args.get("summary", "")
+                    # report_metrics stops the loop
                     messages.append(
-                        {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                        {"role": "tool", "tool_call_id": tc.id, "content": "Metrics recorded."}
                     )
                     interrupted = True
                     break
@@ -1106,7 +1072,6 @@ class ToolUseExecutor:
             spec=spec,
             reported_metrics=reported_metrics,
             reported_primary_value=reported_primary_value,
-            reported_summary=reported_summary,
             command_outputs=command_outputs,
             tool_call_log=tool_call_log,
             files_written=files_written,
@@ -1143,8 +1108,6 @@ class ToolUseExecutor:
         if name == "report_metrics":
             response, _, _ = _execute_report_metrics(args, spec)
             return response
-        if name == "finish_iteration":
-            return "OK"
         return f"Error: unknown tool '{name}'"
 
     def _build_outcome(
@@ -1153,7 +1116,6 @@ class ToolUseExecutor:
         spec: ExperimentSpec,
         reported_metrics: dict[str, MetricResult],
         reported_primary_value: float | None,
-        reported_summary: str = "",
         command_outputs: list[str],
         tool_call_log: list[dict[str, Any]],
         files_written: list[str],
@@ -1200,12 +1162,7 @@ class ToolUseExecutor:
                 notes=[
                     f"Interactive execution completed in {turns_used} turns.",
                     f"Metrics reported via {'report_metrics tool' if metrics_reported else 'stdout parsing'}.",
-                ]
-                + (
-                    [f"Executor analysis: {reported_summary}"]
-                    if reported_summary
-                    else []
-                ),
+                ],
                 code_or_config_changes=files_written,
                 execution_details={
                     "tool_call_log": tool_call_log,
@@ -1622,7 +1579,10 @@ class ToolUsePlanner:
 # ---------------------------------------------------------------------------
 
 REVIEWER_TOOLS = [
-    t for t in TOOLS if t["function"]["name"] in ("read_file", "search_files", "think")
+    t
+    for t in TOOLS
+    if t["function"]["name"]
+    in ("read_file", "list_files", "search_files", "write_file", "run_command", "think")
 ] + [
     {
         "type": "function",
@@ -1701,40 +1661,23 @@ class ToolUseReviewer:
             best_str = f"{spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value:.4g}"
 
         system_prompt = (
-            "You are an expert data scientist reviewing ML experiments. Your job:\n"
-            "1. Evaluate whether the experiment produced valid, trustworthy metrics\n"
-            "2. Check for data science red flags (leakage, bad splits, unrealistic results)\n"
-            "3. Compare metrics against experiment history\n"
-            "4. Propose a SPECIFIC, ACTIONABLE next experiment\n\n"
-            "ACCEPT if: experiment produced valid metrics with sound methodology.\n"
-            "REJECT only for: data leakage, broken evaluation, unrealistic metrics, guardrail violations.\n\n"
-            "CRITICAL — your next_experiment recommendation drives the next iteration.\n"
-            "Be SPECIFIC. Not 'add features' but 'try adding position as a categorical feature "
-            "because the current model treats all positions equally but kills distribution varies "
-            "significantly by role (ADC vs Support).'\n"
-            "Read the experiment script to understand what features exist, what the model does, "
-            "and reason about what specific change would most likely improve the metric.\n\n"
-            "DEEP ANALYSIS OF EXPERIMENT HISTORY:\n"
-            "Before proposing next steps, think deeply about ALL past iterations:\n"
-            "- What moved the metric and by how much? What patterns emerge across iterations?\n"
-            "- Which feature changes helped vs didn't? What does that tell you about the signal?\n"
-            "- Where might the model struggle? (certain segments, categories, time periods)\n"
-            "- What biases could exist? What hasn't been tried yet?\n"
+            "You are an expert data scientist reviewing ML experiments.\n\n"
+            "You have access to the experimenter's saved outputs (predictions, metrics, scripts).\n"
+            "You can RUN CODE on the saved predictions to do your own analysis.\n\n"
+            "Your job:\n"
+            "1. Read the experiment script and metrics\n"
+            "2. Load the saved predictions and run diagnostic analysis:\n"
+            "   - Error by segment/category\n"
+            "   - Feature importance\n"
+            "   - Where the model struggles and why\n"
+            "3. Think deeply about patterns across ALL past iterations\n"
+            "4. Propose a SPECIFIC next experiment based on your data analysis\n\n"
+            "ACCEPT if metrics are valid and methodology is sound.\n"
+            "REJECT only for data leakage, broken evaluation, or unrealistic results.\n\n"
             "Make your reasoning TRANSPARENT in think() — the user reads your thoughts.\n"
-            "Show the chain: 'iter2 added X which improved metric by Y, iter3 tried Z which didn't help, "
-            "this suggests the model needs more signal about W rather than V.'\n\n"
-            "Your next_experiment should ask the executor to add DIAGNOSTIC METRICS when you need "
-            "more visibility (e.g. primary metric broken down by category). Once you see segmented "
-            "results, propose specific feature engineering based on actual weaknesses.\n\n"
-            "LONG-TERM EFFICIENCY: You're managing a multi-iteration experiment campaign.\n"
-            "Think about what the executor should BUILD ONCE to make future iterations fast:\n"
-            "- Save cross-validation predictions to a file so future analysis doesn't retrain\n"
-            "- Create reusable analysis scripts that load saved predictions and compute any metric\n"
-            "- Separate 'train + predict' from 'analyze predictions' so analysis is instant\n"
-            "Early iterations should set up this infrastructure. Later iterations reuse it.\n"
-            "If the executor is retraining just to compute a new diagnostic metric, that's wrong — "
-            "the predictions should already be saved from the training step.\n\n"
-            "Call think() to reason deeply, then call report_review.\n"
+            "Show the chain: 'iter2 added X → +0.001, iter3 tried Z → no gain, my analysis shows "
+            "errors are highest in category A, so next we should focus on A.'\n\n"
+            "Call think() to reason, run analysis code, then call report_review.\n"
         )
 
         # Build comprehensive context
@@ -1764,14 +1707,21 @@ class ToolUseReviewer:
             user_parts.append(f"  Failure: {outcome.failure_summary[:500]}")
         if outcome.notes:
             for note in outcome.notes[:5]:
-                if note.startswith("Executor analysis:"):
-                    user_parts.append(f"  {note}")
-                else:
-                    user_parts.append(f"  Note: {note}")
+                user_parts.append(f"  Note: {note}")
         if outcome.code_or_config_changes:
             user_parts.append(
                 f"  Files changed: {', '.join(outcome.code_or_config_changes[:5])}"
             )
+
+        # Point to saved artifacts
+        artifacts_dir = f".loopforge/experiments/iter_{snapshot.next_iteration_id}"
+        user_parts.extend([
+            "",
+            f"EXPERIMENT ARTIFACTS: {artifacts_dir}/",
+            "  The experimenter may have saved predictions.parquet and the experiment script there.",
+            "  Load predictions.parquet to run your own diagnostic analysis.",
+            "  Use run_command with Python to compute error breakdowns, feature importance, etc.",
+        ])
 
         # Add full experiment history
         history = _format_iteration_history(snapshot)
@@ -1784,8 +1734,16 @@ class ToolUseReviewer:
         def dispatch(name: str, args: dict[str, Any], turn: int) -> str:
             if name == "read_file":
                 return _execute_read_file(args, self.repo_root, 100_000)
+            if name == "list_files":
+                return _execute_list_files(args, self.repo_root)
             if name == "search_files":
                 return _execute_search_files(args, self.repo_root, 100_000)
+            if name == "write_file":
+                return _execute_write_file(args, self.repo_root)
+            if name == "run_command":
+                return _execute_run_command(
+                    args, self.repo_root, 120, 100_000, self.progress_fn, turn,
+                )
             if name == "think":
                 return "OK"
             return f"Unknown tool: {name}"
