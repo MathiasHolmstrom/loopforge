@@ -794,6 +794,7 @@ def _build_system_prompt(
         "- The outer loop gives you more iterations with lessons from this one.",
         "- NEVER use bare `pip install`. Use `uv pip install` or `uv sync` for dependencies.",
         "- Do not install new packages unless absolutely necessary — the bootstrapper already verified deps.",
+        "- Write experiment scripts to a `.loopforge/experiments/` directory, not alongside existing scripts.",
     ]
 
     # Phase-specific guidance: baseline first, then improve
