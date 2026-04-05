@@ -1719,12 +1719,18 @@ class ToolUseReviewer:
             "1. Evaluate whether the experiment produced valid, trustworthy metrics\n"
             "2. Check for data science red flags (leakage, bad splits, unrealistic results)\n"
             "3. Compare metrics against experiment history\n"
-            "4. Propose the BEST next experiment based on everything you've learned\n\n"
+            "4. Propose a SPECIFIC, ACTIONABLE next experiment\n\n"
             "ACCEPT if: experiment produced valid metrics with sound methodology.\n"
-            "REJECT only for: data leakage, broken evaluation, unrealistic metrics, guardrail violations.\n"
-            "Do NOT reject based on code style, architecture, or refactoring completeness.\n\n"
-            "You can read files to check for leakage or methodology issues.\n"
-            "Call think() to reason, then call report_review with your decision.\n"
+            "REJECT only for: data leakage, broken evaluation, unrealistic metrics, guardrail violations.\n\n"
+            "CRITICAL — your next_experiment recommendation drives the next iteration.\n"
+            "Be SPECIFIC. Not 'add features' but 'try adding position as a categorical feature "
+            "because the current model treats all positions equally but kills distribution varies "
+            "significantly by role (ADC vs Support).'\n"
+            "Read the experiment script to understand what features exist, what the model does, "
+            "and reason about what specific change would most likely improve the metric.\n"
+            "Think about: feature importance, missing signals, model architecture, hyperparameters, "
+            "data preprocessing, training strategy.\n\n"
+            "Call think() to reason deeply, then call report_review.\n"
         )
 
         # Build comprehensive context
