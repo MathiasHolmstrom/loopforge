@@ -969,6 +969,7 @@ class ToolUseExecutor:
         tool_call_log: list[dict[str, Any]] = []
         files_written: list[str] = []
         metrics_reported = False
+        reported_summary = ""
         error_count = 0
         turn = 0
 
@@ -992,6 +993,7 @@ class ToolUseExecutor:
                     spec=spec,
                     reported_metrics=reported_metrics,
                     reported_primary_value=reported_primary_value,
+                    reported_summary=reported_summary,
                     command_outputs=command_outputs,
                     tool_call_log=tool_call_log,
                     files_written=files_written,
@@ -1099,6 +1101,7 @@ class ToolUseExecutor:
                     reported_metrics.update(metrics)
                     if primary is not None:
                         reported_primary_value = primary
+                    reported_summary = tool_args.get("summary", "")
                     metrics_reported = True
 
                 messages.append(
@@ -1118,6 +1121,7 @@ class ToolUseExecutor:
             spec=spec,
             reported_metrics=reported_metrics,
             reported_primary_value=reported_primary_value,
+            reported_summary=reported_summary,
             command_outputs=command_outputs,
             tool_call_log=tool_call_log,
             files_written=files_written,
@@ -1162,6 +1166,7 @@ class ToolUseExecutor:
         spec: ExperimentSpec,
         reported_metrics: dict[str, MetricResult],
         reported_primary_value: float | None,
+        reported_summary: str = "",
         command_outputs: list[str],
         tool_call_log: list[dict[str, Any]],
         files_written: list[str],
@@ -1208,7 +1213,8 @@ class ToolUseExecutor:
                 notes=[
                     f"Interactive execution completed in {turns_used} turns.",
                     f"Metrics reported via {'report_metrics tool' if metrics_reported else 'stdout parsing'}.",
-                ],
+                ]
+                + ([f"Executor analysis: {reported_summary}"] if reported_summary else []),
                 code_or_config_changes=files_written,
                 execution_details={
                     "tool_call_log": tool_call_log,
@@ -1753,7 +1759,11 @@ class ToolUseReviewer:
         if outcome.failure_summary:
             user_parts.append(f"  Failure: {outcome.failure_summary[:500]}")
         if outcome.notes:
-            user_parts.append(f"  Notes: {'; '.join(outcome.notes[:3])}")
+            for note in outcome.notes[:5]:
+                if note.startswith("Executor analysis:"):
+                    user_parts.append(f"  {note}")
+                else:
+                    user_parts.append(f"  Note: {note}")
         if outcome.code_or_config_changes:
             user_parts.append(
                 f"  Files changed: {', '.join(outcome.code_or_config_changes[:5])}"
