@@ -67,11 +67,6 @@ def _run_subprocess_with_progress(
         shell=shell,
     )
     started_at = time.monotonic()
-    checkpoints = STEP_PROGRESS_CHECKPOINTS
-    checkpoint_index = 0
-    next_target = checkpoints[0]
-    repeat_interval = checkpoints[-1]
-    tick = 0
 
     while True:
         elapsed = time.monotonic() - started_at
