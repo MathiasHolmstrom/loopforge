@@ -1,11 +1,9 @@
-from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
+from loopforge.core.tool_use_execution import ToolUseExecutor, ToolUsePlanner, ToolUseReviewer
 from loopforge.core.backends import (
     AccessAdvisorBackend,
-    BaselineFirstWorkerBackend,
     BootstrapBackend,
     LiteLLMAccessAdvisorBackend,
     LiteLLMBootstrapBackend,
-    LiteLLMExecutionFixBackend,  # noqa: F401
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
@@ -68,7 +66,6 @@ __all__ = [
     "AdapterSetup",
     "AccessGuide",
     "AgentUpdate",
-    "BaselineFirstWorkerBackend",
     "BootstrapBackend",
     "BootstrapTurn",
     "CapabilityContext",
@@ -81,7 +78,6 @@ __all__ = [
     "ExperimentSpec",
     "ExperimentSpecProposal",
     "FileMemoryStore",
-    "GenericExecutionPlanExecutor",
     "HumanIntervention",
     "is_generic_autonomous",
     "IterationCycleResult",
@@ -117,5 +113,6 @@ __all__ = [
     "RoutingExperimentExecutor",
     "SpecBackend",
     "SpecQuestion",
+    "ToolUseExecutor",
     "WorkerBackend",
 ]

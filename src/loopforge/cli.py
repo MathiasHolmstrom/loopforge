@@ -4,6 +4,23 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
+
+
+def _flush_stdin() -> None:
+    """Drain any buffered stdin so the next input() waits for fresh keystrokes.
+
+    This prevents multi-line pastes from leaking into later prompts.
+    """
+    try:
+        import msvcrt
+
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except ImportError:
+        import select
+
+        while select.select([sys.stdin], [], [], 0.0)[0]:
+            sys.stdin.readline()
 from pathlib import Path
 from typing import Any
 
@@ -203,17 +220,6 @@ def _looks_like_accidental_ready_prompt_feedback(
     return False
 
 
-def _should_confirm_first_ready_prompt_feedback(
-    response: str, *, just_bootstrapped_ready_turn: bool
-) -> bool:
-    if not just_bootstrapped_ready_turn:
-        return False
-    cleaned = response.strip()
-    if len(cleaned) < 20:
-        return False
-    return not _is_start_intent(cleaned)
-
-
 def _ready_plan_signature(turn: BootstrapTurn) -> str:
     payload = {
         "objective": turn.proposal.recommended_spec.objective,
@@ -301,6 +307,24 @@ def _print_plan_summary(turn, *, print_fn=print) -> None:
         print_fn(
             f"  Also track : {', '.join(_friendly_metric_label(metric) for metric in spec.secondary_metrics[:3])}"
         )
+    # Show execution contract
+    source_script = spec.metadata.get("source_script", "not specified")
+    print_fn(f"  Script     : {source_script}")
+    baseline_fn = spec.metadata.get("baseline_function")
+    if baseline_fn:
+        print_fn(f"  Model func : {baseline_fn}")
+    data_loading = spec.metadata.get("data_loading")
+    if data_loading:
+        print_fn(f"  Data       : {data_loading}")
+    target = spec.metadata.get("target_column")
+    if target:
+        print_fn(f"  Target     : {target}")
+    # Show baseline if the planner found one
+    baseline_value = spec.metadata.get("baseline_metric_value")
+    if baseline_value is not None:
+        print_fn(f"  Baseline   : {spec.primary_metric.name} = {baseline_value}")
+    else:
+        print_fn("  Baseline   : not found - first iteration will establish one")
     print_fn(
         f"  Next       : {_summarize_actions(spec.allowed_actions, generic_autonomous=generic_autonomous)}"
     )
@@ -532,10 +556,10 @@ def run_interactive_start(
     resume_existing_run = False
     turn = None
     last_ready_plan_signature: str | None = None
-    first_ready_prompt_after_bootstrap = False
     planner_tag = f"[{getattr(app, 'role_models', None) and app.role_models.planner or 'planner'}]"
     narrator_tag = f"[{getattr(app, 'role_models', None) and app.role_models.narrator or 'narrator'}]"
     while True:
+        response = ""
         deferred_start_response: str | None = None
         # Only call the LLM when we actually need a new plan
         if replan_reason:
@@ -550,7 +574,6 @@ def run_interactive_start(
             try:
                 turn = app.bootstrap(user_goal=user_goal, answers=answers)
                 last_ready_plan_signature = None
-                first_ready_prompt_after_bootstrap = bool(turn.ready_to_start)
             except KeyboardInterrupt:
                 print_fn("\n\n--- Interrupted during planning ---")
                 try:
@@ -638,7 +661,7 @@ def run_interactive_start(
                 replan_reason = "answers"
                 continue
 
-        # Ask any remaining required questions — NO re-plan between questions
+        # Ask any remaining required questions — re-plan after answers
         required_questions = [q for q in turn.proposal.questions if q.required]
         pending_questions = [q for q in required_questions if q.key not in answers]
         if pending_questions:
@@ -658,13 +681,8 @@ def run_interactive_start(
                         print_fn(f"  (default: {question.suggested_answer})")
                     raw = input_fn("> ").strip()
                     answers[question.key] = _resolve_question_answer(question, raw)
-            turn = apply_answers_to_bootstrap_turn(turn, answers=answers)
-            # Re-show blockers if still blocked after answering
-            failed_checks = [
-                c for c in (turn.preflight_checks or []) if c.status == "failed"
-            ]
-            if failed_checks and not turn.ready_to_start:
-                _print_blocked_summary(turn, print_fn=print_fn)
+            # Re-run the full pipeline with answers so data trace re-checks
+            replan_reason = "answers"
             continue
 
         optional_questions = [
@@ -717,33 +735,17 @@ def run_interactive_start(
         # Always prompt the user — whether ready, blocked, or anything else
         if not response:
             if turn.ready_to_start:
-                prompt_text = "Ready to start? [Y to go / or type feedback] "
+                print_fn("Start experiment? [Y = run / type feedback to revise / quit = exit]")
+                prompt_text = "> "
             else:
                 prompt_text = "> "
+            _flush_stdin()
             response = input_fn(prompt_text).strip()
         if not response:
             continue
         if response.lower() in ("quit", "exit"):
             print_fn("Aborted.")
             return 0
-        if turn.ready_to_start and _should_confirm_first_ready_prompt_feedback(
-            response,
-            just_bootstrapped_ready_turn=first_ready_prompt_after_bootstrap,
-        ):
-            confirm = input_fn(
-                "Treat that text as feedback for the current plan? [y/N] "
-            ).strip()
-            first_ready_prompt_after_bootstrap = False
-            if confirm.lower() not in ("y", "yes"):
-                continue
-            user_goal = f"{user_goal.rstrip()} {response.lstrip()}".strip()
-            answers = {
-                key: value
-                for key, value in answers.items()
-                if key not in {"user_feedback", "discussion"}
-            }
-            replan_reason = "feedback"
-            continue
         if turn.ready_to_start and _is_start_intent(response):
             print_fn("\nStarting experiment loop...\n")
             try:
@@ -801,15 +803,6 @@ def run_interactive_start(
                 continue
             _print_result_summary(result, print_fn=print_fn)
             return 0
-        if turn.ready_to_start and _looks_like_accidental_ready_prompt_feedback(
-            response, user_goal=user_goal, turn=turn
-        ):
-            confirm = input_fn(
-                "That looks like pasted objective text. Update the plan with it? [y/N] "
-            ).strip()
-            if confirm.lower() not in ("y", "yes"):
-                continue
-        first_ready_prompt_after_bootstrap = False
         # If it looks like a question, answer it directly — no full re-plan
         if response.rstrip().endswith("?") or response.lower().startswith(
             ("what ", "why ", "how ", "can ", "do ", "is ", "are ")
@@ -832,6 +825,8 @@ def run_interactive_start(
         updated_turn = app.apply_feedback(turn, response)
         if updated_turn is not None:
             turn = updated_turn
+            answers.pop("user_feedback", None)
+            answers.pop("discussion", None)
             if turn.human_update:
                 print_fn(f"\n{narrator_tag} {turn.human_update}")
             # Re-show blockers or plan

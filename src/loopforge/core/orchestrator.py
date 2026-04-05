@@ -128,8 +128,9 @@ class ExperimentOrchestrator:
         memory_store: FileMemoryStore,
         worker_backend: WorkerBackend,
         executor: RoutingExperimentExecutor,
-        reflection_backend: ReflectionBackend,
-        review_backend: ReviewBackend,
+        reviewer=None,
+        reflection_backend=None,
+        review_backend=None,
         narrator_backend: NarrationBackend | None = None,
         capability_provider=None,
         summary_window: int = 5,
@@ -141,6 +142,7 @@ class ExperimentOrchestrator:
         self.memory_store = memory_store
         self.worker_backend = worker_backend
         self.executor = executor
+        self.reviewer = reviewer
         self.reflection_backend = reflection_backend
         self.review_backend = review_backend
         self.narrator_backend = narrator_backend
@@ -167,12 +169,11 @@ class ExperimentOrchestrator:
         max_same_iteration_repairs = int(
             snapshot.effective_spec.stop_conditions.get(
                 "max_same_iteration_repairs",
-                2 if generic_autonomous else 0,
+                4 if generic_autonomous else 0,
             )
         )
         if baseline_first_phase:
             max_continuations = 0
-            max_same_iteration_repairs = 0
         intra_iteration_attempts: list[dict[str, object]] = []
         pending_success_outcome: ExperimentOutcome | None = None
 
@@ -188,7 +189,11 @@ class ExperimentOrchestrator:
         metricless_continuations = 0
         repair_round = 0
         while True:
-            if candidate.execution_steps:
+            if candidate.metadata.get("interactive_agent"):
+                self.progress_fn(
+                    "executor_run", "Launching interactive agent..."
+                )
+            elif candidate.execution_steps:
                 step_preview = self._candidate_step_preview(candidate)
                 detail = f" Executing: {step_preview}" if step_preview else ""
                 self.progress_fn(
@@ -228,7 +233,7 @@ class ExperimentOrchestrator:
             if outcome.status == "success":
                 if metricless_continuations >= max_continuations:
                     if generic_autonomous:
-                        outcome = self._block_metricless_iteration(
+                        outcome = self._carry_metricless_iteration_forward(
                             outcome,
                             intra_iteration_attempts,
                             max_continuations,
@@ -301,7 +306,7 @@ class ExperimentOrchestrator:
                 continue
 
             if generic_autonomous and outcome.status == "recoverable_failure":
-                outcome = self._block_repair_exhaustion(
+                outcome = self._carry_repair_exhaustion_forward(
                     outcome,
                     intra_iteration_attempts,
                     repair_round,
@@ -317,23 +322,20 @@ class ExperimentOrchestrator:
                 failure_summary="The orchestrator finished the iteration without an execution outcome.",
             )
 
-        # ── Reflect ──
-        reflect_tag = f"[{self.role_models.reflection}] " if self.role_models else ""
-        self.progress_fn("reflect", f"{reflect_tag}Reflecting on results...")
-        try:
-            reflection = self.reflection_backend.reflect(snapshot, candidate, outcome)
-        except Exception as exc:
-            reflection = self._fallback_reflection(outcome, exc)
-        self.progress_fn("reflect_detail", self._format_reflection(reflection))
-
-        # ── Review ──
+        # ── Review (includes reflection) ──
         review_tag = f"[{self.role_models.review}] " if self.role_models else ""
         self.progress_fn("review", f"{review_tag}Reviewing iteration...")
         try:
-            review = self.review_backend.review(
-                snapshot, candidate, outcome, reflection
-            )
+            if self.reviewer is not None:
+                reflection, review = self.reviewer.review(snapshot, candidate, outcome)
+            elif self.reflection_backend is not None and self.review_backend is not None:
+                reflection = self.reflection_backend.reflect(snapshot, candidate, outcome)
+                review = self.review_backend.review(snapshot, candidate, outcome, reflection)
+            else:
+                reflection = self._fallback_reflection(outcome, RuntimeError("No reviewer configured"))
+                review = self._fallback_review(outcome, RuntimeError("No reviewer configured"))
         except Exception as exc:
+            reflection = self._fallback_reflection(outcome, exc)
             review = self._fallback_review(outcome, exc)
         self.progress_fn("review_detail", self._format_review(review))
         record = IterationRecord(
@@ -657,6 +659,33 @@ class ExperimentOrchestrator:
         )
         return self._attach_intra_iteration_attempts(blocked, attempts)
 
+    def _carry_metricless_iteration_forward(
+        self,
+        outcome: ExperimentOutcome,
+        attempts: list[dict[str, object]],
+        continuation_count: int,
+    ) -> ExperimentOutcome:
+        carried = replace(
+            outcome,
+            status="recoverable_failure",
+            recoverable=True,
+            failure_type="MetriclessIterationExhausted",
+            failure_summary=(
+                "Generic autonomous mode exhausted same-iteration continuations without producing the configured "
+                "primary metric."
+            ),
+            recovery_actions=[
+                "Carry the failure into the next iteration and repair the metric reporting or evaluation path.",
+                "If repeated attempts still do not emit metrics, ask a helper model or the user for guidance on the execution environment.",
+            ],
+            notes=[
+                *outcome.notes,
+                "Loopforge is carrying this recoverable failure into the next iteration instead of stopping immediately.",
+                f"Same-iteration continuations attempted: {continuation_count}.",
+            ],
+        )
+        return self._attach_intra_iteration_attempts(carried, attempts)
+
     def _block_repair_exhaustion(
         self,
         outcome: ExperimentOutcome,
@@ -683,6 +712,34 @@ class ExperimentOrchestrator:
             ],
         )
         return self._attach_intra_iteration_attempts(blocked, attempts)
+
+    def _carry_repair_exhaustion_forward(
+        self,
+        outcome: ExperimentOutcome,
+        attempts: list[dict[str, object]],
+        repair_round: int,
+        max_same_iteration_repairs: int,
+    ) -> ExperimentOutcome:
+        carried = replace(
+            outcome,
+            status="recoverable_failure",
+            recoverable=True,
+            failure_type="IterationRepairBudgetExceeded",
+            failure_summary=(
+                "Generic autonomous mode exhausted same-iteration repair attempts before producing a successful "
+                "experiment."
+            ),
+            recovery_actions=[
+                "Carry the latest failure into the next iteration and keep repairing from that concrete blocker.",
+                "If repeated iterations keep failing on environment setup, escalate to a helper model or the user with the exact blocker.",
+            ],
+            notes=[
+                *outcome.notes,
+                "Loopforge is carrying this recoverable failure into the next iteration instead of stopping immediately.",
+                f"Same-iteration worker repairs attempted: {repair_round}/{max_same_iteration_repairs}.",
+            ],
+        )
+        return self._attach_intra_iteration_attempts(carried, attempts)
 
     def _load_snapshot(self) -> MemorySnapshot:
         preview_snapshot = self.memory_store.load_snapshot(

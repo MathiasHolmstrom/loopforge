@@ -21,6 +21,57 @@ METRIC_TOKENS = (
     "rmse",
     "mae",
 )
+IMPLEMENTATION_HINT_TOKENS = (
+    "baseline",
+    "experiment",
+    "train",
+    "model",
+    "pipeline",
+    "predict",
+    "prediction",
+    "validate",
+    "validation",
+    "cross",
+    "feature",
+    "rating",
+)
+OBJECTIVE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "build",
+    "copy",
+    "create",
+    "current",
+    "existing",
+    "for",
+    "from",
+    "get",
+    "here",
+    "improve",
+    "improving",
+    "in",
+    "into",
+    "it",
+    "just",
+    "load",
+    "make",
+    "model",
+    "new",
+    "of",
+    "on",
+    "or",
+    "script",
+    "that",
+    "the",
+    "this",
+    "to",
+    "upon",
+    "use",
+    "with",
+    "work",
+}
 DATA_TOKENS = (
     "data",
     "dataset",
@@ -193,6 +244,107 @@ def _extract_metric_symbol_usages(tree: ast.AST) -> set[str]:
     return symbols
 
 
+def _objective_tokens(objective: str | None) -> set[str]:
+    tokens = {
+        token
+        for token in re.findall(r"[a-zA-Z0-9_]+", str(objective or "").lower())
+        if len(token) >= 3 and token not in OBJECTIVE_STOPWORDS
+    }
+    return tokens
+
+
+def _score_implementation_candidate(
+    *,
+    path: str,
+    top_level_defs: list[str],
+    metric_symbols: list[str],
+    column_refs: list[str],
+    objective_tokens: set[str],
+) -> int:
+    score = 0
+    lower_path = path.lower()
+    searchable_tokens = set(re.findall(r"[a-zA-Z0-9_]+", " ".join([path, *top_level_defs, *metric_symbols]).lower()))
+    overlap = len(objective_tokens & searchable_tokens)
+    if "baseline" in lower_path:
+        score += 20
+    if "test" not in lower_path and "example" not in lower_path:
+        score += 4
+    for token in IMPLEMENTATION_HINT_TOKENS:
+        if token in lower_path:
+            score += 8
+    score += min(len(metric_symbols), 5) * 10
+    score += min(len(column_refs), 12)
+    score += overlap * 40
+    if objective_tokens and overlap == 0:
+        score -= 30
+    return score
+
+
+def _build_implementation_grounding(
+    summary: dict[str, Any],
+    *,
+    objective: str | None = None,
+    limit: int = 6,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    objective_tokens = _objective_tokens(objective)
+    ranked: list[tuple[int, str, dict[str, Any]]] = []
+    for path, file_info in summary.get("file_summaries", {}).items():
+        metric_symbols = list(file_info.get("metric_symbols", []))
+        top_level_defs = list(file_info.get("top_level_defs", []))
+        column_refs = list(file_info.get("column_refs", []))
+        score = _score_implementation_candidate(
+            path=path,
+            top_level_defs=top_level_defs,
+            metric_symbols=metric_symbols,
+            column_refs=column_refs,
+            objective_tokens=objective_tokens,
+        )
+        if score <= 0:
+            continue
+        ranked.append((score, path, file_info))
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    candidates: list[dict[str, Any]] = []
+    baseline_paths: list[str] = []
+    for _, path, file_info in ranked[:limit]:
+        candidate = {
+            "path": path,
+            "metric_symbols": list(file_info.get("metric_symbols", []))[:8],
+            "top_level_defs": list(file_info.get("top_level_defs", []))[:8],
+            "column_refs": list(file_info.get("column_refs", []))[:12],
+        }
+        candidates.append(candidate)
+        if "baseline" in path.lower():
+            baseline_paths.append(path)
+    if candidates:
+        primary_path = str(candidates[0]["path"])
+        baseline_paths = [primary_path, *[path for path in baseline_paths if path != primary_path]]
+    return candidates, baseline_paths
+
+
+def _selected_metric_catalog(
+    summary: dict[str, Any], implementation_candidates: list[dict[str, Any]]
+) -> dict[str, dict[str, Any]]:
+    if not implementation_candidates:
+        return {}
+    file_summaries = summary.get("file_summaries", {})
+    metric_catalog: dict[str, dict[str, Any]] = {}
+    for candidate in implementation_candidates:
+        path = str(candidate.get("path", "")).strip()
+        if not path:
+            continue
+        file_info = file_summaries.get(path, {})
+        for name in file_info.get("metric_symbols", []):
+            metric_catalog.setdefault(
+                name,
+                {
+                    "scorer_ref": f"repo_scan:{path}:{name}",
+                    "path": path,
+                },
+            )
+    return metric_catalog
+
+
 def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     root = Path(repo_root).resolve()
     metrics: dict[str, dict[str, Any]] = {}
@@ -200,6 +352,7 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
     data_assets: list[str] = []
     notes: list[str] = []
     column_refs: dict[str, list[str]] = {}  # file -> columns found
+    file_summaries: dict[str, dict[str, Any]] = {}
 
     for path in _iter_python_files(root):
         relative_path = str(path.relative_to(root)).replace("\\", "/")
@@ -214,10 +367,13 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
             tree = ast.parse(source)
         except (OSError, SyntaxError, UnicodeDecodeError):
             continue
+        top_level_defs: list[str] = []
         for node in ast.iter_child_nodes(tree):
             name = getattr(node, "name", None)
             if not isinstance(name, str):
                 continue
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                top_level_defs.append(name)
             lowered = name.lower()
             if isinstance(
                 node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
@@ -227,12 +383,19 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
                 node, (ast.FunctionDef, ast.AsyncFunctionDef)
             ) and _is_candidate_action_name(name):
                 _record_symbol(name, path, root, actions)
-        for metric_name in _extract_metric_symbol_usages(tree):
+        metric_symbols = sorted(_extract_metric_symbol_usages(tree))
+        for metric_name in metric_symbols:
             _record_symbol(metric_name, path, root, metrics)
         # Extract column references from data manipulation code
         cols = _extract_column_refs(tree)
         if cols:
             column_refs[relative_path] = sorted(cols)
+        if metric_symbols or top_level_defs or cols:
+            file_summaries[relative_path] = {
+                "metric_symbols": metric_symbols,
+                "top_level_defs": sorted(top_level_defs)[:16],
+                "column_refs": sorted(cols)[:24],
+            }
 
     for path in _iter_data_files(root):
         relative_path = str(path.relative_to(root)).replace("\\", "/")
@@ -274,13 +437,22 @@ def scan_repo(repo_root: Path | str) -> dict[str, Any]:
         "data_assets": data_assets,
         "notes": notes,
         "column_refs": column_refs,
+        "file_summaries": file_summaries,
     }
 
 
-def build_repo_scan_context(repo_root: Path | str) -> CapabilityContext:
-    summary = scan_repo(repo_root)
+def build_repo_scan_context(
+    repo_root: Path | str,
+    *,
+    objective: str | None = None,
+    summary: dict[str, Any] | None = None,
+) -> CapabilityContext:
+    summary = summary or scan_repo(repo_root)
     discovered_actions = summary["actions"]
-    discovered_metrics = summary["metrics"]
+    implementation_candidates, baseline_paths = _build_implementation_grounding(
+        summary, objective=objective
+    )
+    selected_metrics = _selected_metric_catalog(summary, implementation_candidates)
     notes = [
         "Loopforge can inspect this repo and plan experiments from observed repo structure, but it does not yet have a real runnable runner for this objective.",
         "Discovered symbols are observations only. They are not executable experiment steps until the repo has a supported runner.",
@@ -292,25 +464,34 @@ def build_repo_scan_context(repo_root: Path | str) -> CapabilityContext:
             for name, item in list(discovered_actions.items())[:10]
         ]
         notes.append("Public callables discovered in code: " + ", ".join(previews))
+    if implementation_candidates:
+        notes.append(
+            "Likely implementation files to inspect first for the current baseline:"
+        )
+        for item in implementation_candidates:
+            parts = [str(item["path"])]
+            metric_symbols = item.get("metric_symbols") or []
+            if metric_symbols:
+                parts.append("metrics: " + ", ".join(metric_symbols[:6]))
+            top_level_defs = item.get("top_level_defs") or []
+            if top_level_defs:
+                parts.append("symbols: " + ", ".join(top_level_defs[:6]))
+            notes.append("  " + " | ".join(parts))
     return CapabilityContext(
         available_actions={
             name: item["path"] for name, item in discovered_actions.items()
         },
         available_data_assets=list(summary["data_assets"]),
-        available_metrics={
-            name: {
-                "scorer_ref": f"repo_scan:{item['path']}:{item['symbol']}",
-                "path": item["path"],
-            }
-            for name, item in discovered_metrics.items()
-        },
+        available_metrics=selected_metrics,
         environment_facts={
             "execution_backend_kind": "planning_only_repo_scan",
             "autonomous_execution_supported": False,
             "observation_mode": "repo_scan_only",
             "repo_root": summary["repo_root"],
             "discovered_action_count": len(discovered_actions),
-            "discovered_metric_count": len(discovered_metrics),
+            "discovered_metric_count": len(selected_metrics),
+            "baseline_code_paths": baseline_paths,
+            "implementation_candidates": implementation_candidates,
         },
         notes=notes,
     )

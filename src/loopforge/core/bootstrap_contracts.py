@@ -13,6 +13,8 @@ from loopforge.core.types import (
     PreflightCheck,
 )
 
+TRANSIENT_BOOTSTRAP_ANSWER_KEYS = {"user_feedback", "discussion"}
+
 
 EXISTING_FRAMEWORK_HINT_TOKENS = (
     "existing script",
@@ -79,7 +81,27 @@ def _should_enforce_baseline_reuse(*parts: str) -> bool:
     combined = " ".join(part.strip().lower() for part in parts if part and part.strip())
     if not combined:
         return False
-    return any(token in combined for token in EXISTING_FRAMEWORK_HINT_TOKENS)
+    if any(token in combined for token in EXISTING_FRAMEWORK_HINT_TOKENS):
+        return True
+    words = {
+        token
+        for token in re.findall(r"[a-z0-9_]+", combined)
+        if token
+    }
+    mentions_existing_artifact = "existing" in words and bool(
+        words & {"script", "framework", "pipeline", "model", "baseline"}
+    )
+    mentions_copying_existing = "copy" in words and bool(
+        words & {"script", "model", "framework", "pipeline", "baseline", "paste"}
+    )
+    mentions_repo_baseline = "baseline" in words or (
+        "exists" in words and "here" in words
+    )
+    return (
+        mentions_existing_artifact
+        or mentions_copying_existing
+        or mentions_repo_baseline
+    )
 
 
 def apply_bootstrap_execution_contract(
@@ -115,11 +137,14 @@ def build_bootstrap_handoff(
     capability_context: CapabilityContext,
     turn: BootstrapTurn,
     answers: dict[str, Any] | None,
+    env_verification: dict[str, Any] | None = None,
 ) -> str:
     spec = turn.proposal.recommended_spec
     metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
     bootstrap_answers = dict(metadata.get("bootstrap_answers", {}))
     for key, value in (answers or {}).items():
+        if str(key) in TRANSIENT_BOOTSTRAP_ANSWER_KEYS:
+            continue
         if value not in (None, ""):
             bootstrap_answers[str(key)] = value
     operator_guidance = normalise_text_list(metadata.get("operator_guidance", []))
@@ -132,6 +157,10 @@ def build_bootstrap_handoff(
     baseline_paths = normalise_text_list(
         capability_context.environment_facts.get("baseline_code_paths", [])
     )
+    # Prefer source_script from contract over auto-discovered baseline paths
+    source_script = metadata.get("source_script")
+    if source_script and source_script not in ("not specified",):
+        baseline_paths = [source_script]
 
     lines = [
         "# Bootstrap Handoff",
@@ -143,6 +172,10 @@ def build_bootstrap_handoff(
         "## Binding Execution Intent",
         f"- Objective: {spec.objective}",
         f"- Primary metric: {spec.primary_metric.name} ({spec.primary_metric.goal})",
+        f"- Source script: {metadata.get('source_script', 'not specified')}",
+        f"- Baseline function: {metadata.get('baseline_function', 'not specified')}",
+        f"- Data loading: {metadata.get('data_loading', 'not specified')}",
+        f"- Target column: {metadata.get('target_column', 'not specified')}",
         "- Treat the current repo implementation as the default starting point.",
         "- Reuse the existing script, baseline path, and framework whenever the repo context identifies them.",
         "- Do not replace the baseline with a new pipeline unless a concrete execution failure proves the existing path cannot be used.",
@@ -162,6 +195,19 @@ def build_bootstrap_handoff(
     if capability_notes:
         lines.extend(["", "## Repo Grounding"])
         lines.extend(f"- {note}" for note in capability_notes[:16])
+    if env_verification:
+        lines.extend(["", "## Environment Verification (bootstrapper ran these checks)"])
+        if env_verification.get("deps_synced"):
+            lines.append("- Dependencies: synced (uv sync succeeded)")
+        else:
+            lines.append("- Dependencies: NOT synced — use `uv sync` before running")
+        if env_verification.get("baseline_script"):
+            lines.append(f"- Baseline script: {env_verification['baseline_script']}")
+        if env_verification.get("baseline_output"):
+            output_preview = env_verification["baseline_output"].strip()[-2000:]
+            lines.extend(["", "### Baseline Script Output (last 2000 chars)", "```", output_preview, "```"])
+        for error in env_verification.get("errors", []):
+            lines.append(f"- ERROR: {error}")
     return "\n".join(lines).rstrip() + "\n"
 
 

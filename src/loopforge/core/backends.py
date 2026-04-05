@@ -18,6 +18,7 @@ from loopforge.core.types import (
     ExperimentSpecProposal,
     ExperimentOutcome,
     MemorySnapshot,
+    MetricResult,
     RoleModelConfig,
     ReflectionSummary,
     RunnerAuthoringRequest,
@@ -31,10 +32,17 @@ from loopforge.core.types import (
 from loopforge.core.runtime import is_generic_autonomous
 
 
+RECENT_RECORD_DIGEST_LIMIT = 2
+RECENT_SUMMARY_DIGEST_LIMIT = 3
+MARKDOWN_NOTE_CHAR_LIMIT = 1200
+MARKDOWN_NOTE_COUNT_LIMIT = 4
+TEXT_PREVIEW_CHAR_LIMIT = 400
+
+
 DATA_SCIENCE_METRICS_REASONING = (
     "HOW TO THINK ABOUT EXPERIMENT DESIGN:\n"
     "\n"
-    "You are a skilled data scientist. Derive answers from the objective â€” don't ask the user "
+    "You are a skilled data scientist. Derive answers from the objective  - don't ask the user "
     "to confirm what they already told you.\n"
     "\n"
     "1. PRIMARY METRIC: The user's objective directly implies it. "
@@ -45,7 +53,7 @@ DATA_SCIENCE_METRICS_REASONING = (
     "The key test: 'If I change the model to improve the primary metric, could this other metric get worse?' "
     "If yes, it's a guardrail. If no causal connection exists, ignore it.\n"
     "\n"
-    "Key pattern â€” the COMPLEMENT RULE: when optimizing for a subset (e.g. bench players), "
+    "Key pattern  - the COMPLEMENT RULE: when optimizing for a subset (e.g. bench players), "
     "the complement subset's performance (e.g. starters) is naturally a guardrail, because "
     "model changes that help one group can hurt the other. The aggregate (overall) follows from the subsets.\n"
     "\n"
@@ -59,7 +67,7 @@ DATA_SCIENCE_METRICS_REASONING = (
     "4. METRIC GOAL DIRECTION: For every metric you propose, you MUST explicitly set goal to 'minimize' or 'maximize'. "
     "Reason from what the metric actually measures: if a perfect prediction yields 0 and worse predictions yield "
     "higher values, that is minimize. If a perfect prediction yields 1.0 and worse predictions yield lower, "
-    "that is maximize. Never leave goal unspecified or assume a default â€” there is no safe default. "
+    "that is maximize. Never leave goal unspecified or assume a default  - there is no safe default. "
     "Think about the metric's semantics, not just its name.\n"
     "\n"
     "5. DON'T ASK WHAT YOU CAN DERIVE: "
@@ -76,6 +84,8 @@ EXISTING_IMPLEMENTATION_GROUNDING = (
     "\n"
     "Before you propose changes, identify the current baseline implementation from the capability context. "
     "Treat capability_context notes, environment facts, file paths, and discovered actions as the current source of truth.\n"
+    "When capability_context includes likely implementation files or baseline code paths, treat those as stronger evidence "
+    "than generic repo-wide symbol lists.\n"
     "\n"
     "If the repo context already names baseline files, model types, scorers, feature generators, or CV strategy, "
     "use that information directly in your reasoning. Do not ask the user to tell you what model currently exists "
@@ -292,7 +302,7 @@ class _LiteLLMJsonBackend:
         progress_stage: str | None = None,
         progress_label: str | None = None,
     ) -> str:
-        """Lightweight text completion â€” no JSON parsing, just a plain response."""
+        """Lightweight text completion  - no JSON parsing, just a plain response."""
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_message},
@@ -477,6 +487,226 @@ def _markdown_content_by_name(snapshot: MemorySnapshot, filename: str) -> str | 
     return None
 
 
+def _truncate_text(value: Any, *, limit: int = TEXT_PREVIEW_CHAR_LIMIT) -> str | None:
+    if not isinstance(value, str):
+        return None
+    compact = " ".join(value.split())
+    if not compact:
+        return None
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3] + "..."
+
+
+def _compact_step(step: ExecutionStep) -> dict[str, Any]:
+    payload = {
+        "kind": step.kind,
+        "command": step.command if step.kind == "shell" else None,
+        "path": step.path,
+        "cwd": step.cwd,
+        "timeout_seconds": step.timeout_seconds,
+        "allow_failure": step.allow_failure,
+        "rationale": _truncate_text(step.rationale, limit=240),
+    }
+    if step.content:
+        payload["content_preview"] = _truncate_text(step.content, limit=240)
+    return {key: value for key, value in payload.items() if value not in (None, [], {})}
+
+
+def _compact_candidate(candidate: ExperimentCandidate) -> dict[str, Any]:
+    return {
+        "hypothesis": _truncate_text(candidate.hypothesis, limit=220),
+        "action_type": candidate.action_type,
+        "change_type": candidate.change_type,
+        "instructions": _truncate_text(candidate.instructions, limit=280),
+        "execution_steps": [
+            _compact_step(step) for step in candidate.execution_steps[:3]
+        ],
+        "config_patch": candidate.config_patch,
+        "metadata": {
+            key: _truncate_text(value, limit=220) if isinstance(value, str) else value
+            for key, value in candidate.metadata.items()
+            if key
+            not in {
+                "_execution_repair_context",
+            }
+        },
+    }
+
+
+def _compact_metric_results(metric_results: dict[str, Any]) -> dict[str, Any]:
+    compact: dict[str, Any] = {}
+    for name, result in list(metric_results.items())[:8]:
+        if isinstance(result, MetricResult):
+            compact[name] = {
+                "value": result.value,
+                "passed": result.passed,
+            }
+        else:
+            compact[name] = result
+    return compact
+
+
+def _compact_step_result(step_result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in {
+            "index": step_result.get("index"),
+            "kind": step_result.get("kind"),
+            "command": step_result.get("command"),
+            "cwd": step_result.get("cwd"),
+            "returncode": step_result.get("returncode"),
+            "status": step_result.get("status"),
+            "stdout_preview": _truncate_text(step_result.get("stdout")),
+            "stderr_preview": _truncate_text(step_result.get("stderr")),
+        }.items()
+        if value not in (None, "")
+    }
+
+
+def _compact_execution_details(execution_details: dict[str, Any]) -> dict[str, Any]:
+    step_results = execution_details.get("step_results", [])
+    attempts = execution_details.get("attempts", [])
+    latest_step = step_results[-1] if isinstance(step_results, list) and step_results else {}
+    compact = {
+        "attempt_count": len(attempts) if isinstance(attempts, list) else None,
+        "step_result_count": len(step_results) if isinstance(step_results, list) else None,
+        "latest_step_result": (
+            _compact_step_result(latest_step) if isinstance(latest_step, dict) else None
+        ),
+        "latest_stdout_preview": _truncate_text(
+            execution_details.get("latest_stdout_preview")
+        ),
+        "intra_iteration_attempt_count": len(
+            execution_details.get("intra_iteration_attempts", [])
+        )
+        if isinstance(execution_details.get("intra_iteration_attempts"), list)
+        else None,
+    }
+    return {key: value for key, value in compact.items() if value not in (None, "", {})}
+
+
+def _compact_outcome(outcome: ExperimentOutcome) -> dict[str, Any]:
+    return {
+        "status": outcome.status,
+        "failure_type": outcome.failure_type,
+        "failure_summary": _truncate_text(outcome.failure_summary),
+        "recoverable": outcome.recoverable,
+        "recovery_actions": outcome.recovery_actions[:3],
+        "primary_metric_value": outcome.primary_metric_value,
+        "metric_results": _compact_metric_results(outcome.metric_results),
+        "notes": [_truncate_text(note, limit=220) for note in outcome.notes[:4] if note],
+        "next_ideas": [
+            _truncate_text(idea, limit=220) for idea in outcome.next_ideas[:3] if idea
+        ],
+        "execution_details": _compact_execution_details(outcome.execution_details),
+    }
+
+
+def _compact_iteration_record(record) -> dict[str, Any]:
+    return {
+        "iteration_id": record.iteration_id,
+        "parent_iteration_id": record.parent_iteration_id,
+        "candidate": _compact_candidate(record.candidate),
+        "outcome": _compact_outcome(record.outcome),
+        "reflection": {
+            "assessment": _truncate_text(record.reflection.assessment, limit=280),
+            "recommended_next_action": record.reflection.recommended_next_action,
+        },
+        "review": {
+            "status": record.review.status,
+            "reason": _truncate_text(record.review.reason, limit=280),
+        },
+    }
+
+
+def _compact_recent_records(snapshot: MemorySnapshot) -> list[dict[str, Any]]:
+    records = snapshot.recent_records[-RECENT_RECORD_DIGEST_LIMIT:]
+    return [_compact_iteration_record(record) for record in records]
+
+
+def _compact_recent_summaries(snapshot: MemorySnapshot) -> list[dict[str, Any]]:
+    summaries = snapshot.recent_summaries[-RECENT_SUMMARY_DIGEST_LIMIT:]
+    return [_compact_iteration_summary(summary) for summary in summaries]
+
+
+def _compact_human_interventions(snapshot: MemorySnapshot) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in snapshot.recent_human_interventions[-3:]:
+        compact.append(
+            {
+                "author": item.author,
+                "type": item.type,
+                "message": _truncate_text(item.message, limit=240),
+                "effects": item.effects,
+            }
+        )
+    return compact
+
+
+def _compact_iteration_summary(summary) -> dict[str, Any]:
+    return {
+        "iteration_id": summary.iteration_id,
+        "action_type": summary.action_type,
+        "result": summary.result,
+        "outcome_status": summary.outcome_status,
+        "primary_metric_name": summary.primary_metric_name,
+        "primary_metric_value": summary.primary_metric_value,
+        "failure_type": summary.failure_type,
+        "failure_summary": _truncate_text(summary.failure_summary),
+        "lessons": [
+            _truncate_text(item, limit=200) for item in summary.lessons[:3] if item
+        ],
+        "next_ideas": [
+            _truncate_text(item, limit=200) for item in summary.next_ideas[:2] if item
+        ],
+    }
+
+
+def _compact_markdown_text(content: str | None, *, limit: int = MARKDOWN_NOTE_CHAR_LIMIT) -> str | None:
+    if not isinstance(content, str):
+        return None
+    stripped = content.strip()
+    if not stripped:
+        return None
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: limit - 3] + "..."
+
+
+def _compact_markdown_memory(
+    snapshot: MemorySnapshot,
+    *,
+    preferred_suffixes: tuple[str, ...] | None = None,
+    limit: int = MARKDOWN_NOTE_COUNT_LIMIT,
+) -> list[dict[str, Any]]:
+    notes = list(snapshot.markdown_memory)
+    if preferred_suffixes is not None:
+        preferred = [
+            note
+            for note in notes
+            if isinstance(note.path, str) and note.path.endswith(preferred_suffixes)
+        ]
+        if preferred:
+            notes = preferred
+    compact_notes = []
+    for item in notes[:limit]:
+        compact_content = _compact_markdown_text(item.content)
+        if compact_content is None:
+            continue
+        compact_notes.append(
+            {
+                "path": item.path,
+                "content": compact_content,
+            }
+        )
+    return compact_notes
+
+
+def _compact_bootstrap_handoff(snapshot: MemorySnapshot, filename: str) -> str | None:
+    return _compact_markdown_text(_markdown_content_by_name(snapshot, filename))
+
+
 def _has_markdown_name(snapshot: MemorySnapshot, filename: str) -> bool:
     return _markdown_content_by_name(snapshot, filename) is not None
 
@@ -484,25 +714,26 @@ def _has_markdown_name(snapshot: MemorySnapshot, filename: str) -> bool:
 def _worker_markdown_handoff(
     snapshot: MemorySnapshot, *, iteration_policy: dict[str, Any]
 ) -> list[dict[str, Any]]:
-    notes = [item.to_dict() for item in snapshot.markdown_memory]
-    if not (
-        iteration_policy.get("generic_autonomous")
-        and iteration_policy.get("first_iteration")
-    ):
-        return notes
     preferred_suffixes = (
         "bootstrap_handoff.md",
         "execution_runbook.md",
         "experiment_guide.md",
         "ops_access_guide.md",
     )
-    filtered = [
-        note
-        for note in notes
-        if isinstance(note.get("path"), str)
-        and note["path"].endswith(preferred_suffixes)
-    ]
-    return filtered or notes
+    if not (
+        iteration_policy.get("generic_autonomous")
+        and iteration_policy.get("first_iteration")
+    ):
+        return _compact_markdown_memory(
+            snapshot,
+            preferred_suffixes=preferred_suffixes,
+            limit=3,
+        )
+    return _compact_markdown_memory(
+        snapshot,
+        preferred_suffixes=preferred_suffixes,
+        limit=4,
+    )
 
 
 def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
@@ -525,13 +756,15 @@ def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
         "available_bootstrap_handoff_files": sorted(
             item.path for item in snapshot.markdown_memory
         ),
-        "bootstrap_handoff": _markdown_content_by_name(
+        "bootstrap_handoff": _compact_bootstrap_handoff(
             snapshot, "bootstrap_handoff.md"
         ),
-        "execution_runbook": _markdown_content_by_name(
+        "execution_runbook": _compact_bootstrap_handoff(
             snapshot, "execution_runbook.md"
         ),
-        "experiment_guide": _markdown_content_by_name(snapshot, "experiment_guide.md"),
+        "experiment_guide": _compact_bootstrap_handoff(
+            snapshot, "experiment_guide.md"
+        ),
     }
 
 
@@ -578,7 +811,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "Combine inspection, code writing, and execution into ONE iteration's execution_steps. "
                 "For example, a good iteration might: (1) read one key file to understand the API, (2) write a script that loads data/trains/evaluates, (3) run the script. "
                 "All three happen in the same iteration. Do NOT spend an entire iteration just reading files. "
-                "The only exception is the very first iteration when the repo is completely unknown â€” one initial inspection is acceptable. "
+                "The only exception is the very first iteration when the repo is completely unknown  - one initial inspection is acceptable. "
                 "After that, every iteration must write and run code that produces measurable results. "
                 "For the first generic-autonomous iteration, prefer the smallest runnable script that tests the main path. "
                 "If one script can load the data, fit/evaluate, and print metrics, do that instead of creating helper scaffolding or multiple setup-only commands. "
@@ -611,19 +844,15 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
                 "execution_handoff": execution_handoff,
-                "best_summary": snapshot.best_summary.to_dict()
+                "best_summary": _compact_iteration_summary(snapshot.best_summary)
                 if snapshot.best_summary is not None
                 else None,
-                "recent_records": [
-                    record.to_dict() for record in snapshot.recent_records
-                ],
-                "recent_summaries": [
-                    summary.to_dict() for summary in snapshot.recent_summaries
-                ],
-                "recent_human_interventions": [
-                    item.to_dict() for item in snapshot.recent_human_interventions
-                ],
-                "lessons_learned": snapshot.lessons_learned,
+                "recent_records": _compact_recent_records(snapshot),
+                "recent_summaries": _compact_recent_summaries(snapshot),
+                "recent_human_interventions": _compact_human_interventions(snapshot),
+                "lessons_learned": _truncate_text(
+                    snapshot.lessons_learned, limit=800
+                ),
                 "markdown_memory": _worker_markdown_handoff(
                     snapshot, iteration_policy=iteration_policy
                 ),
@@ -797,219 +1026,9 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
         metadata = candidate_payload.get("metadata")
         if not isinstance(metadata, dict):
             candidate_payload["metadata"] = {}
-        # Don't silently replace action_type â€” let the executor validate and raise if invalid.
+        # Don't silently replace action_type  - let the executor validate and raise if invalid.
         # The agent's choice should be visible, even if wrong.
         return candidate_payload
-
-
-class ExecutionFixBackend(Protocol):
-    def fix_execution_plan(
-        self,
-        candidate: ExperimentCandidate,
-        failed_step_index: int,
-        failure_summary: str,
-        step_results: list[dict[str, Any]],
-    ) -> list[ExecutionStep]: ...
-
-
-class LiteLLMExecutionFixBackend(_LiteLLMJsonBackend):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.last_repair_summary: str | None = None
-
-    def fix_execution_plan(
-        self,
-        candidate: ExperimentCandidate,
-        failed_step_index: int,
-        failure_summary: str,
-        step_results: list[dict[str, Any]],
-    ) -> list[ExecutionStep]:
-        failed_step_result = step_results[-1] if step_results else {}
-        payload = self._complete_json(
-            system_prompt=(
-                "You are the execution-repair helper for a coding agent. A previous execution plan failed. "
-                "Read the exact failing command, stdout/stderr, and prior steps, then produce a materially revised "
-                "execution_steps plan that directly fixes the failure. Think like a pragmatic senior engineer: "
-                "preserve successful earlier steps when still useful, replace brittle steps when necessary, and do not "
-                "repeat the same failing command unchanged unless an earlier step now changes its preconditions. "
-                "Common fixes include: correcting cwd/import paths, creating a missing script before running it, "
-                "rewriting a fragile inline python command into write_file + shell steps, installing/importing the "
-                "right dependency, or adjusting the command for the current platform. "
-                "Fix ONE concrete blocker at a time: directly address the first failing step, keep the rest of the plan as stable as possible, "
-                "and avoid redesigning the whole iteration unless the failure proves the whole plan is wrong. "
-                "Do NOT change the experiment objective or hypothesis. Only repair the execution plan. "
-                "If the prior execution completed but did not report parseable metrics, revise the final run so it prints a machine-readable metric payload or explicit metric_name=value lines. "
-                "Return JSON with exactly these fields: repair_summary (string) and execution_steps (array of step objects)."
-            ),
-            payload={
-                "hypothesis": candidate.hypothesis,
-                "instructions": candidate.instructions,
-                "candidate_metadata": candidate.metadata,
-                "current_steps": [step.to_dict() for step in candidate.execution_steps],
-                "failed_step_index": failed_step_index,
-                "failure_summary": failure_summary,
-                "failed_step_result": failed_step_result,
-                "step_results_so_far": step_results,
-                "instructions_for_repair": {
-                    "requirements": [
-                        "Directly address the concrete failure shown in failure_summary and failed_step_result.",
-                        "Return a revised plan, not commentary alone.",
-                        "If a python -c command is failing because it is too brittle, prefer write_file plus a normal python script invocation.",
-                        "If earlier steps already succeeded and remain necessary, keep them or explain their replacement in repair_summary.",
-                    ]
-                },
-            },
-            progress_stage="execution_fix_llm",
-            progress_label="repairing the execution plan",
-        )
-        repair_summary = payload.get("repair_summary")
-        self.last_repair_summary = (
-            repair_summary.strip()
-            if isinstance(repair_summary, str) and repair_summary.strip()
-            else None
-        )
-        raw_steps = payload.get("execution_steps", [])
-        if not isinstance(raw_steps, list):
-            return []
-        steps = []
-        for item in raw_steps:
-            if not isinstance(item, dict):
-                continue
-            try:
-                steps.append(ExecutionStep.from_dict(item))
-            except Exception:
-                continue
-        return steps
-
-
-class BaselineFirstWorkerBackend:
-    def __init__(
-        self,
-        worker_backend: WorkerBackend,
-        progress_fn: ProgressFn | None = None,
-    ) -> None:
-        self.worker_backend = worker_backend
-        self.progress_fn: ProgressFn = progress_fn or _noop_progress
-
-    @property
-    def model(self) -> str | None:
-        return getattr(self.worker_backend, "model", None)
-
-    @property
-    def max_completion_tokens(self) -> int | None:
-        return getattr(self.worker_backend, "max_completion_tokens", None)
-
-    def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
-        candidate = self._build_baseline_candidate(snapshot)
-        if candidate is not None:
-            self.progress_fn(
-                "baseline_first",
-                "Using deterministic baseline-first execution plan from bootstrap contract.",
-            )
-            return candidate
-        return self.worker_backend.propose_next_experiment(snapshot)
-
-    def continue_experiment(
-        self,
-        snapshot: MemorySnapshot,
-        previous_candidate: ExperimentCandidate,
-        previous_outcome: ExperimentOutcome,
-    ) -> ExperimentCandidate:
-        return self.worker_backend.continue_experiment(
-            snapshot, previous_candidate, previous_outcome
-        )
-
-    @staticmethod
-    def _build_baseline_candidate(
-        snapshot: MemorySnapshot,
-    ) -> ExperimentCandidate | None:
-        metadata = (
-            snapshot.effective_spec.metadata
-            if isinstance(snapshot.effective_spec.metadata, dict)
-            else {}
-        )
-        contract = metadata.get("execution_contract")
-        if not isinstance(contract, dict):
-            return None
-        if not contract.get("must_reference_baseline_paths"):
-            return None
-        if snapshot.latest_summary is not None or snapshot.recent_records:
-            return None
-        baseline_paths = [
-            str(item).strip()
-            for item in contract.get("baseline_paths", [])
-            if str(item).strip()
-        ]
-        if not baseline_paths:
-            return None
-        baseline_path = baseline_paths[0]
-        env = snapshot.capability_context.environment_facts
-        python_executable = str(env.get("python_executable") or "python")
-        repo_root = str(env.get("repo_root") or ".")
-        action_type = (
-            "run_experiment"
-            if "run_experiment" in snapshot.effective_spec.allowed_actions
-            else (
-                snapshot.effective_spec.allowed_actions[0]
-                if snapshot.effective_spec.allowed_actions
-                else "run_experiment"
-            )
-        )
-        baseline_suffix = Path(baseline_path).suffix.lower()
-        if baseline_suffix == ".py":
-            execution_steps = [
-                ExecutionStep(
-                    kind="shell",
-                    command=f'"{python_executable}" "{baseline_path}"',
-                    cwd=repo_root,
-                    timeout_seconds=120,
-                    rationale=(
-                        "Baseline-first contract: run the existing baseline path before inventing variants."
-                    ),
-                )
-            ]
-            instructions = (
-                f"Run the existing baseline script at {baseline_path} exactly as the first iteration. "
-                "Do not create a new standalone pipeline before this baseline path has been exercised."
-            )
-        else:
-            safe_path = baseline_path.replace("\\", "\\\\").replace('"', '\\"')
-            execution_steps = [
-                ExecutionStep(
-                    kind="shell",
-                    command=(
-                        f'"{python_executable}" -c "from pathlib import Path; '
-                        f"p=Path(r'{safe_path}'); "
-                        "print(p.read_text(encoding='utf-8')[:2000])\""
-                    ),
-                    cwd=repo_root,
-                    timeout_seconds=30,
-                    rationale=(
-                        "Baseline-first contract: inspect the existing baseline artifact before proposing changes."
-                    ),
-                )
-            ]
-            instructions = (
-                f"Inspect the existing baseline artifact at {baseline_path} first. "
-                "Do not branch into a new implementation before grounding on that baseline path."
-            )
-        return ExperimentCandidate(
-            hypothesis=(
-                f"Reproduce or ground on the existing baseline path {baseline_path} before any new experimentation."
-            ),
-            action_type=action_type,
-            change_type="baseline_reuse",
-            instructions=instructions,
-            execution_steps=execution_steps,
-            metadata={
-                "observation_summary": f"Bootstrap identified baseline path {baseline_path}.",
-                "reasoning_summary": (
-                    "The first iteration is deterministic to enforce reuse of the existing framework."
-                ),
-                "next_step_summary": f"Exercise baseline path {baseline_path} before broader experimentation.",
-                "baseline_first_contract": True,
-            },
-        )
 
 
 class LiteLLMSpecBackend(_LiteLLMJsonBackend):
@@ -1114,11 +1133,18 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "notes",
                     ],
                     "CRITICAL_recommended_spec_rules": [
-                        "The recommended_spec JSON is what drives execution. Describing metrics in assistant_message "
-                        "is NOT enough â€” you MUST populate the actual JSON fields.",
-                        "primary_metric MUST have 'name' (string, the actual metric/scorer name) and 'goal' ('minimize' or 'maximize').",
-                        "guardrail_metrics MUST be an array of metric objects, each with 'name' and 'goal'.",
-                        "DO NOT leave primary_metric as an empty object â€” fill in the name and goal you decided on.",
+                        "The recommended_spec JSON drives execution. You MUST populate all fields.",
+                        "primary_metric MUST have 'name' and 'goal' ('minimize' or 'maximize').",
+                        "guardrail_metrics MUST be an array of objects with 'name' and 'goal'.",
+                        "EXECUTION CONTRACT - metadata MUST include these fields (the executor depends on them). "
+                        "Read the source script in the capability notes to fill them out: "
+                        "(1) metadata.source_script: file path the user referenced. "
+                        "(2) metadata.baseline_function: the function/class that trains the baseline model. "
+                        "(3) metadata.data_loading: how data is loaded (function name, file path, DB call). "
+                        "(4) metadata.target_column: what column/variable is being predicted. "
+                        "(5) metadata.baseline_metric_value: current metric value if visible in code/logs, else omit. "
+                        "If you cannot determine any of these from the source script, set the field to null "
+                        "and the system will ask the user.",
                     ],
                     "question_fields": [
                         "key",
@@ -1129,27 +1155,12 @@ class LiteLLMBootstrapBackend(_LiteLLMJsonBackend):
                         "options",
                     ],
                     "behavior": [
-                        "Think like a skilled data scientist. Derive metrics, guardrails, and experiment design "
-                        "from the objective and repo context. Don't ask the user to confirm what they already told you.",
-                        "Start by grounding on the current implementation described in capability_context. "
-                        "If the repo context already names the baseline model, scorer, feature pipeline, or code paths, "
-                        "reference that directly instead of asking the user what exists.",
-                        "Use the user's initial instruction as a binding constraint, then refine it with repo evidence. "
-                        "If the user says the model already exists in this repo and asks you to inspect it, do that mentally from the repo context before asking follow-up questions.",
-                        "Prefer a qualified guess over a clarifying question when the repo evidence points strongly in one direction. "
-                        "Reserve questions for cases where multiple materially different execution paths remain plausible.",
-                        "You have creative freedom to suggest new metrics, evaluation approaches, or analysis "
-                        "strategies based on your domain expertise â€” as long as you explain your reasoning.",
-                        "Use prior run memory (summaries, lessons, markdown memory) to avoid repeating mistakes.",
-                        "Only ask a question when there is genuine ambiguity you cannot resolve yourself. "
-                        "Keep questions minimal, concrete, and high-value.",
-                        "Be direct. If you can't find what the user asked for, say so plainly and ask. "
-                        "Don't discuss unrelated things that happen to exist in the repo.",
-                        "Don't explain obvious decisions. If you excluded an irrelevant metric, just exclude it â€” "
-                        "don't write a note saying 'I intentionally excluded X because...'. The user already knows.",
-                        "Ask at most ONE required question per turn. Don't bundle multiple questions or generate "
-                        "fallback alternatives ('do you want X instead?') alongside the primary question. "
-                        "The user's answer to the first question may make follow-ups irrelevant.",
+                        "Derive metrics, guardrails, and experiment design from the objective and repo context.",
+                        "The data source has already been traced by the bootstrap code. Use it directly.",
+                        "If the user references a specific file, use that file - do not substitute a different one.",
+                        "Be direct. If something is unclear, ask one question per turn.",
+                        "Set metadata.data_source if you know the exact file path.",
+                        "Set metadata.baseline_metric_value if you find an existing metric value.",
                     ],
                 },
             },
@@ -1236,7 +1247,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a senior data scientist writing a concise experiment guide for a worker agent "
                 "that will execute this experiment. The worker has never seen the repo or the user conversation. "
-                "Write only what the worker needs to get started. Be specific â€” include file paths, function names, "
+                "Write only what the worker needs to get started. Be specific  - include file paths, function names, "
                 "column names, and code patterns. No preamble."
             ),
             user_message=json.dumps(
@@ -1246,7 +1257,8 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                     "user_answers": answers or {},
                     "planner_notes": turn.proposal.notes,
                     "sections_to_cover": [
-                        "Data loading: exact function/file to call, what it returns",
+                        "Baseline: the current model's metric values if known (from logs, results files, model registry, or prior runs). If not known, the exact command to run to get them.",
+                        "Data loading: how to load the training data (file path, function call, what it returns)",
                         "Schema: key columns, types, what they represent",
                         "Target: column to predict, any transformations needed",
                         "Features: what feature engineering to apply, existing utilities to reuse",
@@ -1286,7 +1298,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             or not recommended_spec.get("objective", "").strip()
         ):
             recommended_spec["objective"] = proposal_payload["objective"]
-        # Normalise metrics â€” structural only, never inject domain decisions
+        # Normalise metrics  - structural only, never inject domain decisions
         recommended_spec["primary_metric"] = (
             LiteLLMBootstrapBackend._normalise_metric_payload(
                 recommended_spec.get("primary_metric"),
@@ -1300,7 +1312,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
             LiteLLMBootstrapBackend._normalise_metric_payload(metric_payload)
             for metric_payload in recommended_spec.get("guardrail_metrics", [])
         ]
-        # Normalise allowed_actions â€” keep what the agent proposed
+        # Normalise allowed_actions  - keep what the agent proposed
         allowed_actions = recommended_spec.get("allowed_actions", [])
         if not isinstance(allowed_actions, list):
             allowed_actions = [str(allowed_actions)] if allowed_actions else []
@@ -1323,7 +1335,7 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
                         merged_actions.append(action)
                 normalized_actions = merged_actions
         recommended_spec["allowed_actions"] = normalized_actions
-        # Structural defaults â€” empty containers and infrastructure safety limits
+        # Structural defaults  - empty containers and infrastructure safety limits
         recommended_spec.setdefault("constraints", {})
         recommended_spec.setdefault("search_space", {})
         recommended_spec.setdefault("stop_conditions", {})
@@ -1351,10 +1363,10 @@ class LiteLLMRunnerAuthoringBackend(_LiteLLMJsonBackend):
         if isinstance(payload, str):
             payload = {"name": payload}
         metric_payload = dict(payload or {})
-        # name and goal are required by MetricSpec â€” use visible sentinels if agent omitted them
+        # name and goal are required by MetricSpec  - use visible sentinels if agent omitted them
         metric_payload.setdefault("name", "[unspecified]")
         metric_payload.setdefault("goal", "unspecified")
-        # Structural defaults â€” empty containers
+        # Structural defaults  - empty containers
         metric_payload.setdefault("params", {})
         metric_payload.setdefault("slice_by", [])
         metric_payload.setdefault("constraints", {})
@@ -1563,20 +1575,14 @@ class LiteLLMReflectionBackend(_LiteLLMJsonBackend):
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
-                "candidate": candidate.to_dict(),
-                "outcome": outcome.to_dict(),
-                "recent_records": [
-                    record.to_dict() for record in snapshot.recent_records
-                ],
-                "best_summary": snapshot.best_summary.to_dict()
+                "candidate": _compact_candidate(candidate),
+                "outcome": _compact_outcome(outcome),
+                "recent_records": _compact_recent_records(snapshot),
+                "best_summary": _compact_iteration_summary(snapshot.best_summary)
                 if snapshot.best_summary is not None
                 else None,
-                "recent_human_interventions": [
-                    item.to_dict() for item in snapshot.recent_human_interventions
-                ],
-                "markdown_memory": [
-                    item.to_dict() for item in snapshot.markdown_memory
-                ],
+                "recent_human_interventions": _compact_human_interventions(snapshot),
+                "markdown_memory": _compact_markdown_memory(snapshot, limit=3),
                 "instructions": {
                     "return_fields": [
                         "assessment",
@@ -1622,18 +1628,27 @@ class LiteLLMReviewBackend(_LiteLLMJsonBackend):
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
                 "capability_context": snapshot.capability_context.to_dict(),
-                "candidate": candidate.to_dict(),
-                "outcome": outcome.to_dict(),
-                "reflection": reflection.to_dict(),
-                "recent_records": [
-                    record.to_dict() for record in snapshot.recent_records
-                ],
-                "best_summary": snapshot.best_summary.to_dict()
+                "candidate": _compact_candidate(candidate),
+                "outcome": _compact_outcome(outcome),
+                "reflection": {
+                    "assessment": _truncate_text(reflection.assessment, limit=280),
+                    "lessons": [
+                        _truncate_text(item, limit=200)
+                        for item in reflection.lessons[:3]
+                        if item
+                    ],
+                    "risks": [
+                        _truncate_text(item, limit=200)
+                        for item in reflection.risks[:3]
+                        if item
+                    ],
+                    "recommended_next_action": reflection.recommended_next_action,
+                },
+                "recent_records": _compact_recent_records(snapshot),
+                "best_summary": _compact_iteration_summary(snapshot.best_summary)
                 if snapshot.best_summary is not None
                 else None,
-                "markdown_memory": [
-                    item.to_dict() for item in snapshot.markdown_memory
-                ],
+                "markdown_memory": _compact_markdown_memory(snapshot, limit=3),
             },
             progress_stage="review_llm",
             progress_label="reviewing whether to accept the iteration",
@@ -1693,7 +1708,7 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                         "Write for a human following the run.",
                         "Mention blockers and next steps briefly.",
                         "Be direct and concise. Don't explain obvious decisions.",
-                        "Don't mention things you excluded or decided against â€” just focus on what matters.",
+                        "Don't mention things you excluded or decided against  - just focus on what matters.",
                         "If something wasn't found, say so plainly. Don't discuss unrelated things in the repo.",
                     ],
                 },
@@ -1724,7 +1739,7 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             system_prompt=(
                 "You are a skilled data scientist discussing an experiment plan with the user. "
                 "Answer their question directly and concisely based on the current context. "
-                "Don't repeat the full plan â€” just answer what they asked."
+                "Don't repeat the full plan  - just answer what they asked."
             ),
             user_message=f"Current context:\n{context}\n\nUser question: {question}",
             progress_stage="answer_question_llm",
@@ -1817,14 +1832,17 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
             ),
             payload={
                 "effective_spec": snapshot.effective_spec.to_dict(),
-                "markdown_memory": [
-                    item.to_dict() for item in snapshot.markdown_memory
-                ],
-                "candidate": candidate.to_dict(),
-                "outcome": outcome.to_dict(),
-                "reflection": reflection.to_dict(),
+                "markdown_memory": _compact_markdown_memory(snapshot, limit=2),
+                "candidate": _compact_candidate(candidate),
+                "outcome": _compact_outcome(outcome),
+                "reflection": {
+                    "assessment": _truncate_text(
+                        reflection.assessment, limit=280
+                    ),
+                    "recommended_next_action": reflection.recommended_next_action,
+                },
                 "review": review.to_dict(),
-                "accepted_summary": accepted_summary.to_dict()
+                "accepted_summary": _compact_iteration_summary(accepted_summary)
                 if accepted_summary is not None
                 else None,
                 "instructions": {

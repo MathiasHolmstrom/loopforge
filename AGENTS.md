@@ -43,3 +43,8 @@ If an agent gets a domain decision wrong, fix the **system prompt** (usually in 
 - Python 3.11+
 - `OPENAI_API_KEY` required for GPT models
 - `ANTHROPIC_BEDROCK_BASE_URL` enables Claude via Bedrock proxy
+
+
+## Unit test
+- Don't just write another unit-test for every change made. Reevaluate existing unit-test coverage and first condier refactoring existing tests in order not to bloat number of unit tests. Quality over quantity
+- St

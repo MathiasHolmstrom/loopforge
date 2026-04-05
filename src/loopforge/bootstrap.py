@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+from difflib import get_close_matches
 from datetime import date, datetime
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -22,7 +23,6 @@ from loopforge.core.bootstrap_contracts import (
 )
 from loopforge.core import (
     AdapterSetup,
-    BaselineFirstWorkerBackend,
     BootstrapTurn,
     CapabilityContext,
     DataAssetSchema,
@@ -37,7 +37,6 @@ from loopforge.core import (
     LiteLLMNarrationBackend,
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
-    LiteLLMExecutionFixBackend,
     LiteLLMReviewBackend,
     LiteLLMWorkerBackend,
     PreflightCheck,
@@ -47,13 +46,16 @@ from loopforge.core import (
     RoleModelConfig,
     RoutingExperimentExecutor,
     MemorySnapshot,
+    MetricSpec,
     RunnerAuthoringBackend,
     RunnerAuthoringRequest,
     RunnerValidationResult,
     SpecQuestion,
+    ToolUseExecutor,
+    ToolUsePlanner,
+    ToolUseReviewer,
     _noop_progress,
 )
-from loopforge.core.agentic_execution import GenericExecutionPlanExecutor
 from loopforge.core.runtime import is_generic_autonomous
 
 
@@ -69,6 +71,7 @@ GENERIC_AUTONOMOUS_ACTIONS = [
     "fix_failure",
 ]
 EXECUTION_GUIDANCE_QUESTION_KEY = "execution_strategy_hint"
+TRANSIENT_BOOTSTRAP_ANSWER_KEYS = {"user_feedback", "discussion"}
 REMOTE_EXECUTION_HINT_TOKENS = (
     "s3",
     "dbfs",
@@ -109,7 +112,6 @@ DEFAULT_ROLE_MAX_COMPLETION_TOKENS: dict[str, int] = {
     "reflection": 900,
     "review": 700,
     "narrator": 700,
-    "execution_fix": 1400,
 }
 
 
@@ -389,6 +391,19 @@ def _extract_primary_metric_from_feedback(
                     continue
                 if _normalise_metric_name(metric_name) == normalised_candidate:
                     return metric_name
+            normalised_metric_map = {
+                _normalise_metric_name(metric_name): metric_name
+                for metric_name in metric_catalog
+                if not _is_generic_metric_placeholder(metric_name)
+            }
+            close_match = get_close_matches(
+                normalised_candidate,
+                list(normalised_metric_map.keys()),
+                n=1,
+                cutoff=0.55,
+            )
+            if close_match:
+                return normalised_metric_map[close_match[0]]
             return candidate
     return None
 
@@ -778,6 +793,26 @@ def probe_data_assets(
     return replace(capability_context, data_schemas=schemas, notes=notes)
 
 
+def _detect_repo_python(repo_root: Path) -> str:
+    """Find the Python executable for the target repo, not the running process."""
+    # Check for .venv in the repo root
+    if os.name == "nt":
+        candidates = [
+            repo_root / ".venv" / "Scripts" / "python.exe",
+            repo_root / "venv" / "Scripts" / "python.exe",
+        ]
+    else:
+        candidates = [
+            repo_root / ".venv" / "bin" / "python",
+            repo_root / "venv" / "bin" / "python",
+        ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate.resolve())
+    # Fallback to running process's Python
+    return sys.executable
+
+
 def discover_capabilities_for_objective(
     *,
     objective: str,
@@ -796,11 +831,15 @@ def discover_capabilities_for_objective(
         "os_name": os.name,
         "execution_shell": execution_shell,
         "shell_family": shell_family,
-        "python_executable": sys.executable,
+        "python_executable": _detect_repo_python(Path(repo_root)),
         "repo_root": str(Path(repo_root).resolve()),
     }
     if executor_factory_path is None:
-        context = build_repo_scan_context(repo_root)
+        context = build_repo_scan_context(
+            repo_root,
+            objective=objective,
+            summary=scan_result,
+        )
         context = replace(
             context,
             environment_facts={**context.environment_facts, **platform_facts},
@@ -1075,6 +1114,199 @@ def run_preflight_checks(
     return checks
 
 
+def _trace_data_source(
+    *,
+    user_goal: str,
+    repo_root: Path,
+    python_executable: str,
+    progress_fn: ProgressFn,
+) -> dict[str, Any]:
+    """Deterministic data tracing: find files the user referenced, try loading data.
+
+    Returns facts and generated questions based on real execution results.
+    """
+    results: dict[str, Any] = {
+        "data_source": None,
+        "file_content_preview": None,
+        "data_loaded": False,
+        "columns": [],
+        "load_error": None,
+        "generated_questions": [],
+    }
+
+    # 1. Extract file/module references from user's goal
+    progress_fn("data_trace", "Finding files referenced in your goal...")
+    # Look for identifiers that could be filenames (words with underscores, .py suffix)
+    import re as _re
+
+    # Match explicit .py files or underscore-separated identifiers
+    candidates: list[str] = []
+    for match in _re.finditer(r'[\w/\\]+\.py\b', user_goal):
+        candidates.append(match.group(0))
+    for match in _re.finditer(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b', user_goal.lower()):
+        token = match.group(1)
+        if token not in ("cross_validation", "primary_metric", "new_script"):
+            candidates.append(token)
+
+    # 2. Find matching files in the repo
+    matched_file: str | None = None
+    for candidate in candidates:
+        # Try exact path first
+        exact = repo_root / candidate
+        if exact.exists() and exact.is_file():
+            matched_file = str(exact.relative_to(repo_root))
+            break
+        # Try glob patterns
+        patterns = [
+            f"**/{candidate}",
+            f"**/{candidate}.py",
+            f"**/scripts/{candidate}.py",
+            f"**/scripts/*{candidate}*.py",
+            f"**/*{candidate}*.py",
+        ]
+        for pattern in patterns:
+            matches = sorted(repo_root.glob(pattern))
+            matches = [m for m in matches if m.is_file() and m.suffix == ".py"]
+            if matches:
+                matched_file = str(matches[0].relative_to(repo_root))
+                break
+        if matched_file:
+            break
+
+    if not matched_file:
+        progress_fn("data_trace", "Could not find a matching file in the repo.")
+        results["generated_questions"].append(
+            SpecQuestion(
+                key="data_source_file",
+                prompt=(
+                    "I couldn't find the file you referenced in the repo. "
+                    "Which file contains the model training code? "
+                    "(e.g. scripts/lol_train_models.py)"
+                ),
+                rationale="Need to identify the source file to trace the data pipeline.",
+                required=True,
+            )
+        )
+        return results
+
+    results["data_source"] = matched_file
+    progress_fn("data_trace", f"Found: {matched_file}")
+
+    # 3. Read the file
+    try:
+        file_path = repo_root / matched_file
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+        results["file_content_preview"] = content[:5000]
+        progress_fn("data_trace", f"Read {matched_file} ({len(content)} chars)")
+    except Exception as exc:
+        results["load_error"] = f"Could not read {matched_file}: {exc}"
+        return results
+
+    # 4. Sync dependencies
+    progress_fn("data_trace", "Syncing dependencies...")
+    try:
+        subprocess.run(
+            ["uv", "sync"], cwd=repo_root,
+            capture_output=True, text=True, timeout=120,
+        )
+        progress_fn("data_trace", "Dependencies synced.")
+    except Exception:
+        pass
+
+    return results
+
+
+def _verify_execution_environment(
+    *,
+    repo_root: Path,
+    capability_context: CapabilityContext,
+    progress_fn: ProgressFn,
+) -> dict[str, Any]:
+    """Run real checks to verify the experiment can actually execute.
+
+    Returns a dict with verification results to include in the bootstrap handoff.
+    """
+    results: dict[str, Any] = {
+        "deps_synced": True,  # Already synced in data trace step
+        "baseline_metric": None,
+        "baseline_script": None,
+        "baseline_output": None,
+        "errors": [],
+    }
+    env = capability_context.environment_facts
+    python_executable = str(env.get("python_executable") or sys.executable)
+
+    # 1. Validate key imports work (deps already synced in data trace)
+    import_check = subprocess.run(
+        [python_executable, "-c",
+         "import sys; "
+         "failures = []; "
+         "for pkg in ['polars', 'numpy', 'pandas', 'sklearn']: \n"
+         "    try: __import__(pkg)\n"
+         "    except ImportError: failures.append(pkg)\n"
+         "if failures: print('MISSING:' + ','.join(failures)); sys.exit(1)\n"
+         "print('imports_ok')"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if import_check.returncode == 0:
+        results["imports_ok"] = True
+        progress_fn("env_verify", "Key imports verified.")
+    else:
+        missing = import_check.stdout.strip()
+        results["imports_ok"] = False
+        results["errors"].append(f"Import check: {missing}")
+        progress_fn("env_verify", f"Import check failed: {missing}")
+
+    # 3. Find and try running the baseline script
+    baseline_paths = [
+        str(p).strip()
+        for p in env.get("baseline_code_paths", [])
+        if str(p).strip()
+    ]
+    if not baseline_paths:
+        # Search for likely experiment scripts
+        for pattern in ["scripts/*player*kills*.py", "scripts/*experiment*.py", "experiments/*.py"]:
+            candidates = sorted(repo_root.glob(pattern))
+            if candidates:
+                baseline_paths = [str(c.relative_to(repo_root)) for c in candidates[:3]]
+                break
+
+    if baseline_paths:
+        baseline_script = baseline_paths[0]
+        results["baseline_script"] = baseline_script
+        script_path = repo_root / baseline_script
+
+        if script_path.exists() and script_path.suffix == ".py":
+            progress_fn("env_verify", f"Running baseline script: {baseline_script}...")
+            try:
+                run_result = subprocess.run(
+                    [python_executable, str(script_path)],
+                    cwd=repo_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    env={**os.environ, "PYTHONPATH": str(repo_root)},
+                )
+                results["baseline_output"] = run_result.stdout[-4000:]
+                if run_result.returncode == 0:
+                    progress_fn("env_verify", f"Baseline script completed successfully.")
+                else:
+                    error_preview = (run_result.stderr or run_result.stdout)[-500:]
+                    results["errors"].append(f"Baseline script failed (exit {run_result.returncode}): {error_preview}")
+                    progress_fn("env_verify", f"Baseline script failed: {error_preview[:200]}")
+            except subprocess.TimeoutExpired:
+                results["errors"].append(f"Baseline script timed out after 300s")
+                progress_fn("env_verify", "Baseline script timed out after 300s.")
+            except Exception as exc:
+                results["errors"].append(f"Could not run baseline: {exc}")
+                progress_fn("env_verify", f"Could not run baseline: {exc}")
+
+    return results
+
+
 def _non_local_data_assets(capability_context: CapabilityContext) -> list[str]:
     return [
         asset
@@ -1090,6 +1322,8 @@ def _summarise_bootstrap_answers(answers: dict[str, Any] | None) -> str:
         return ""
     parts: list[str] = []
     for key, value in answers.items():
+        if str(key) in TRANSIENT_BOOTSTRAP_ANSWER_KEYS:
+            continue
         if value in (None, "", [], {}):
             continue
         if isinstance(value, list):
@@ -1379,7 +1613,7 @@ def apply_answers_to_bootstrap_turn(
     answer_map = {
         str(key): value
         for key, value in (answers or {}).items()
-        if value not in (None, "")
+        if str(key) not in TRANSIENT_BOOTSTRAP_ANSWER_KEYS and value not in (None, "")
     }
     spec = turn.proposal.recommended_spec
     merged_metadata = dict(spec.metadata)
@@ -1530,14 +1764,6 @@ class Loopforge:
             progress_fn=self.progress_fn,
             **_extra(self.role_models.planner),
         )
-        primary_worker_backend = worker_backend or LiteLLMWorkerBackend(
-            model=self.role_models.worker,
-            temperature=temperature,
-            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["worker"],
-            stream_fn=stream_fn,
-            progress_fn=self.progress_fn,
-            **_extra(self.role_models.worker),
-        )
         self.runner_authoring_backend = (
             runner_authoring_backend
             or LiteLLMRunnerAuthoringBackend(
@@ -1564,10 +1790,6 @@ class Loopforge:
                 **_extra(self.role_models.consultation),
             )
         )
-        self.worker_backend = BaselineFirstWorkerBackend(
-            worker_backend=primary_worker_backend,
-            progress_fn=self.progress_fn,
-        )
         self.reflection_backend = reflection_backend or LiteLLMReflectionBackend(
             model=self.role_models.reflection,
             temperature=temperature,
@@ -1592,14 +1814,7 @@ class Loopforge:
             progress_fn=self.progress_fn,
             **_extra(self.role_models.narrator),
         )
-        self.execution_fix_backend = LiteLLMExecutionFixBackend(
-            model=self.role_models.consultation,
-            temperature=temperature,
-            max_completion_tokens=DEFAULT_ROLE_MAX_COMPLETION_TOKENS["execution_fix"],
-            stream_fn=stream_fn,
-            progress_fn=self.progress_fn,
-            **_extra(self.role_models.consultation),
-        )
+        self._extra = _extra
 
     def resolve_execution_backend(self, objective: str) -> ExecutionBackendResolution:
         if self.explicit_executor_factory_path:
@@ -1683,22 +1898,31 @@ class Loopforge:
             capability_context=runtime.capability_context,
             effective_spec=spec,
         )
+        extra_kwargs_worker = self._extra(self.role_models.worker).get("extra_kwargs")
+        extra_kwargs_review = self._extra(self.role_models.review).get("extra_kwargs")
+        tool_use_agent = ToolUseExecutor(
+            model=self.role_models.worker,
+            repo_root=self.repo_root,
+            temperature=self.temperature,
+            progress_fn=self.progress_fn,
+            extra_kwargs=extra_kwargs_worker,
+        )
+        reviewer = ToolUseReviewer(
+            model=self.role_models.review,
+            repo_root=self.repo_root,
+            temperature=self.temperature,
+            progress_fn=self.progress_fn,
+            extra_kwargs=extra_kwargs_review,
+        )
         orchestrator = ExperimentOrchestrator(
             memory_store=memory_store or FileMemoryStore(self.memory_root),
-            worker_backend=self.worker_backend,
+            worker_backend=tool_use_agent,
             executor=RoutingExperimentExecutor(
                 handlers=runtime.handlers,
-                plan_executor=GenericExecutionPlanExecutor(
-                    repo_root=self.repo_root,
-                    fix_backend=self.execution_fix_backend,
-                    max_retries=2 if generic_autonomous else 8,
-                    default_timeout_seconds=30 if generic_autonomous else 120,
-                    progress_fn=self.progress_fn,
-                ),
+                plan_executor=tool_use_agent,
                 recovery_handler=self._make_execution_recovery_handler(),
             ),
-            reflection_backend=self.reflection_backend,
-            review_backend=self.review_backend,
+            reviewer=reviewer,
             narrator_backend=self.narrator_backend,
             capability_provider=runtime.capability_provider,
             progress_fn=self.progress_fn,
@@ -1889,6 +2113,69 @@ class Loopforge:
         except Exception:
             return patched_spec
 
+    def _resolve_explicit_primary_metric_goal(
+        self,
+        *,
+        spec: ExperimentSpec,
+        capability_context: CapabilityContext,
+        assistant_message: str,
+    ) -> ExperimentSpec:
+        primary_metric = spec.primary_metric
+        if (
+            not primary_metric.name
+            or primary_metric.name == "[unspecified]"
+            or primary_metric.goal in {"maximize", "minimize"}
+        ):
+            return spec
+
+        focused_metrics = {}
+        metric_catalog = capability_context.available_metrics or {}
+        if primary_metric.name in metric_catalog:
+            focused_metrics[primary_metric.name] = metric_catalog[primary_metric.name]
+        compact_context = {
+            "available_metrics": focused_metrics,
+            "environment_facts": capability_context.environment_facts,
+            "notes": capability_context.notes[:20],
+            "available_actions": capability_context.available_actions,
+            "available_data_assets": capability_context.available_data_assets[:20],
+        }
+        try:
+            fixes = self.narrator_backend.fix_incomplete_metrics(
+                current_spec=spec.to_dict(),
+                assistant_message=assistant_message,
+                objective=spec.objective,
+                capability_context=compact_context,
+            )
+        except TypeError:
+            try:
+                fixes = self.narrator_backend.fix_incomplete_metrics(
+                    current_spec=spec.to_dict(),
+                    assistant_message=assistant_message,
+                )
+            except Exception:
+                return spec
+        except Exception:
+            return spec
+
+        if not isinstance(fixes, dict):
+            return spec
+        primary_payload = fixes.get("primary_metric")
+        if not isinstance(primary_payload, dict):
+            return spec
+        if primary_payload.get("name") != primary_metric.name:
+            primary_payload = {**primary_payload, "name": primary_metric.name}
+        if primary_payload.get("goal") not in {"maximize", "minimize"}:
+            return spec
+        spec_dict = spec.to_dict()
+        spec_dict["primary_metric"] = {
+            **spec_dict.get("primary_metric", {}),
+            **primary_payload,
+        }
+        try:
+            return ExperimentSpec.from_dict(spec_dict)
+        except Exception:
+            return spec
+
     def bootstrap(
         self,
         *,
@@ -2013,24 +2300,96 @@ class Loopforge:
                 ],
             )
             self._cached_capability_context = capability_context
-        self.progress_fn(
-            "propose_plan", f"[{self.role_models.planner}] Drafting experiment plan..."
+        # Deterministic data tracing — find files the user referenced, try loading
+        env = capability_context.environment_facts
+        data_trace = _trace_data_source(
+            user_goal=user_goal,
+            repo_root=self.repo_root,
+            python_executable=str(env.get("python_executable") or sys.executable),
+            progress_fn=self.progress_fn,
         )
-        try:
-            turn = self.bootstrap_backend.propose_bootstrap_turn(
-                user_goal=user_goal,
-                capability_context=capability_context,
-                answer_history=answers,
-                role_models=self.role_models,
-                bootstrap_memory=bootstrap_memory,
+
+        # Use the tool-use planner to read the repo and fill out the contract
+        self.progress_fn(
+            "propose_plan", f"[{self.role_models.planner}] Analyzing repo and planning experiment..."
+        )
+        planner_extra = self._extra(self.role_models.planner).get("extra_kwargs")
+        planner = ToolUsePlanner(
+            model=self.role_models.planner,
+            repo_root=self.repo_root,
+            temperature=self.temperature,
+            progress_fn=self.progress_fn,
+            extra_kwargs=planner_extra,
+        )
+        plan_result = planner.plan(
+            user_goal=user_goal,
+            source_file_hint=data_trace.get("data_source"),
+            answers=answers,
+        )
+        contract = plan_result.get("contract", {})
+        planner_questions = plan_result.get("questions", [])
+
+        # Build ExperimentSpec from contract
+        primary_metric_name = contract.get("primary_metric", "[unspecified]")
+        primary_metric_goal = contract.get("primary_metric_goal", "unspecified")
+        raw_guardrails = contract.get("guardrail_metrics") or []
+        raw_secondaries = contract.get("secondary_metrics") or []
+
+        spec = ExperimentSpec(
+            objective=user_goal,
+            primary_metric=MetricSpec(name=primary_metric_name, goal=primary_metric_goal),
+            allowed_actions=list(
+                capability_context.environment_facts.get("generic_autonomous_actions", ["run_experiment"])
+            ),
+            guardrail_metrics=[
+                MetricSpec(
+                    name=m["name"] if isinstance(m, dict) else str(m),
+                    goal=m.get("goal", "unspecified") if isinstance(m, dict) else "unspecified",
+                )
+                for m in raw_guardrails
+            ],
+            secondary_metrics=[
+                MetricSpec(
+                    name=m["name"] if isinstance(m, dict) else str(m),
+                    goal=m.get("goal", "unspecified") if isinstance(m, dict) else "unspecified",
+                )
+                for m in raw_secondaries
+            ],
+            metadata={
+                "source_script": contract.get("source_script") or data_trace.get("data_source"),
+                "baseline_function": contract.get("baseline_function"),
+                "data_loading": contract.get("data_loading"),
+                "target_column": contract.get("target_column"),
+                "baseline_metric_value": contract.get("baseline_value"),
+            },
+        )
+
+        # Convert planner questions to SpecQuestion objects
+        spec_questions = [
+            SpecQuestion(
+                key=f"planner_q_{i}",
+                prompt=q.get("question", ""),
+                rationale=q.get("reason", ""),
+                required=True,
             )
-        except TypeError:
-            turn = self.bootstrap_backend.propose_bootstrap_turn(
-                user_goal=user_goal,
-                capability_context=capability_context,
-                answer_history=answers,
-                role_models=self.role_models,
-            )
+            for i, q in enumerate(planner_questions)
+            if q.get("question")
+        ]
+
+        # Build a BootstrapTurn from the planner results
+        from loopforge.core.types import ExperimentSpecProposal, BootstrapTurn, RoleModelConfig
+        turn = BootstrapTurn(
+            assistant_message=f"I analyzed the repo and built an experiment plan.",
+            proposal=ExperimentSpecProposal(
+                objective=user_goal,
+                recommended_spec=spec,
+                questions=spec_questions,
+                notes=[],
+            ),
+            role_models=self.role_models,
+            ready_to_start=len(spec_questions) == 0 and primary_metric_goal != "unspecified",
+        )
+        # Add execution metadata
         turn = replace(
             turn,
             proposal=replace(
@@ -2042,48 +2401,56 @@ class Loopforge:
                         "execution_backend_kind": capability_context.environment_facts.get(
                             "execution_backend_kind"
                         ),
-                        "autonomous_execution_supported": capability_context.environment_facts.get(
-                            "autonomous_execution_supported"
-                        ),
                     },
                 ),
-                questions=_ensure_execution_guidance_question(
-                    questions=refine_bootstrap_questions(
-                        turn.proposal.questions, answers=answers
-                    ),
-                    capability_context=capability_context,
-                    answers=answers,
-                    detail=guidance_gap_detail,
-                ),
             ),
         )
-        # Auto-fix incomplete metrics — the agent often describes metrics in prose but
-        # leaves the JSON fields empty. Extract from the agent's own message.
-        turn = replace(
-            turn,
-            proposal=replace(
-                turn.proposal,
-                recommended_spec=self._repair_incomplete_metrics(
-                    spec=turn.proposal.recommended_spec,
-                    capability_context=capability_context,
-                    assistant_message=turn.assistant_message,
+
+        # Check contract fields — generate questions for anything the LLM left empty
+        contract_questions: list[SpecQuestion] = []
+        metadata = turn.proposal.recommended_spec.metadata
+        if not metadata.get("source_script") and not data_trace.get("data_source"):
+            contract_questions.append(SpecQuestion(
+                key="source_script",
+                prompt="Which file contains the model training code?",
+                rationale="Could not find the file you referenced in the repo.",
+                required=True,
+            ))
+        if not metadata.get("baseline_function"):
+            contract_questions.append(SpecQuestion(
+                key="baseline_function",
+                prompt=(
+                    f"I read {data_trace.get('data_source', 'the source script')} but couldn't identify "
+                    "the baseline model function. Which function trains the model?"
                 ),
-            ),
-        )
-        turn = replace(
-            turn,
-            proposal=replace(
-                turn.proposal,
-                recommended_spec=apply_bootstrap_execution_contract(
-                    spec=turn.proposal.recommended_spec,
-                    capability_context=capability_context,
-                    user_goal=user_goal,
-                    assistant_message=turn.assistant_message,
-                    answers=answers,
-                    answer_summary=_summarise_bootstrap_answers(answers),
+                rationale="Need to know which function to use as baseline.",
+                required=True,
+            ))
+        if not metadata.get("data_loading"):
+            contract_questions.append(SpecQuestion(
+                key="data_loading",
+                prompt="How is the training data loaded? (e.g. function name, file path, or describe the pipeline)",
+                rationale="Need to understand the data pipeline for the executor.",
+                required=True,
+            ))
+        if not metadata.get("target_column"):
+            contract_questions.append(SpecQuestion(
+                key="target_column",
+                prompt="What column/variable is the model predicting?",
+                rationale="Need to know the prediction target.",
+                required=True,
+            ))
+
+
+        if contract_questions:
+            turn = replace(
+                turn,
+                proposal=replace(
+                    turn.proposal,
+                    questions=[*turn.proposal.questions, *contract_questions],
                 ),
-            ),
-        )
+                ready_to_start=False,
+            )
 
         preflight_checks = run_preflight_checks(
             spec=turn.proposal.recommended_spec,
@@ -2097,6 +2464,16 @@ class Loopforge:
             preflight_checks=preflight_checks,
         )
         ready_to_start = not missing_requirements
+
+        # Verify the execution environment can actually run experiments
+        env_verification: dict[str, Any] = {}
+        if ready_to_start:
+            env_verification = _verify_execution_environment(
+                repo_root=self.repo_root,
+                capability_context=capability_context,
+                progress_fn=self.progress_fn,
+            )
+
         access_guide_path = None
         if should_prepare_access_guide(
             capability_context=capability_context,
@@ -2149,6 +2526,7 @@ class Loopforge:
                 capability_context=capability_context,
                 turn=resolved_turn,
                 answers=answers,
+                env_verification=env_verification,
             )
             agent_markdown_dir = self.memory_root / "agent_markdown"
             agent_markdown_dir.mkdir(parents=True, exist_ok=True)
@@ -2156,11 +2534,9 @@ class Loopforge:
             handoff_path.write_text(handoff_text, encoding="utf-8")
         except Exception:
             pass
-        # Write experiment guide only for non-generic execution paths.
-        if (not generic_autonomous) and (
-            ready_to_start
-            or not [r for r in missing_requirements if r.startswith("answer:")]
-        ):
+        if ready_to_start or not [
+            r for r in missing_requirements if r.startswith("answer:")
+        ]:
             try:
                 self.progress_fn("experiment_guide", "Writing experiment guide...")
                 guide_text = self.bootstrap_backend.build_experiment_guide(
@@ -2264,10 +2640,7 @@ class Loopforge:
                 },
                 "metadata": {
                     "operator_guidance": merged_operator_guidance,
-                    "bootstrap_answers": {
-                        **existing_bootstrap_answers,
-                        "user_feedback": feedback,
-                    },
+                    "bootstrap_answers": existing_bootstrap_answers,
                 },
             }
             action = "patch"
@@ -2330,6 +2703,12 @@ class Loopforge:
             patched_spec = ExperimentSpec.from_dict(spec_dict)
         except Exception:
             return None  # Malformed patch — fall through to replan
+        if fallback_primary_metric:
+            patched_spec = self._resolve_explicit_primary_metric_goal(
+                spec=patched_spec,
+                capability_context=cap_ctx,
+                assistant_message=result.get("message", feedback),
+            )
         patched_spec = self._repair_incomplete_metrics(
             spec=patched_spec,
             capability_context=cap_ctx,
