@@ -188,9 +188,18 @@ def build_bootstrap_handoff(
     if planner_notes:
         lines.extend(["", "## Planner Notes"])
         lines.extend(f"- {note}" for note in planner_notes[:16])
-    if capability_notes:
+    # Only include repo grounding notes that are directly relevant (skip symbol/column dumps)
+    relevant_notes = [
+        note
+        for note in capability_notes[:8]
+        if not any(
+            noise in note.lower()
+            for noise in ("candidate metric symbols", "candidate action symbols", "data-related files", "dataframe columns referenced")
+        )
+    ]
+    if relevant_notes:
         lines.extend(["", "## Repo Grounding"])
-        lines.extend(f"- {note}" for note in capability_notes[:16])
+        lines.extend(f"- {note}" for note in relevant_notes)
     if env_verification:
         lines.extend(
             ["", "## Environment Verification (bootstrapper ran these checks)"]

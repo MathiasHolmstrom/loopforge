@@ -1728,16 +1728,26 @@ class ToolUseReviewer:
         )
 
         # Build comprehensive context
+        metadata = spec.metadata if isinstance(spec.metadata, dict) else {}
         user_parts = [
             f"Objective: {spec.objective}",
             f"Primary metric: {spec.primary_metric.name} (goal: {spec.primary_metric.goal})",
             f"Best so far: {best_str}",
+        ]
+        # Include planner contract so reviewer's recommendations are consistent
+        if metadata.get("source_script"):
+            user_parts.append(f"Source script: {metadata['source_script']}")
+        if metadata.get("data_loading"):
+            user_parts.append(f"Data pipeline: {metadata['data_loading']}")
+        if metadata.get("baseline_function"):
+            user_parts.append(f"Baseline function: {metadata['baseline_function']}")
+        user_parts.extend([
             "",
             f"CURRENT ITERATION ({snapshot.next_iteration_id}):",
             f"  Hypothesis: {candidate.hypothesis}",
             f"  Status: {outcome.status}",
             f"  Metrics:\n{metrics_str or '  (none reported)'}",
-        ]
+        ])
         if outcome.failure_summary:
             user_parts.append(f"  Failure: {outcome.failure_summary[:500]}")
         if outcome.notes:
