@@ -844,10 +844,14 @@ def _build_system_prompt(
     parts.append("3. Run it (use timeout=300 for training)")
     parts.append("4. Fix obvious errors if needed and retry")
     parts.append("5. After getting metrics, do quick post-prediction analysis:")
-    parts.append("   - Add feature importance to your script (e.g. model.feature_importances_)")
+    parts.append(
+        "   - Add feature importance to your script (e.g. model.feature_importances_)"
+    )
     parts.append("   - Check where the model fails worst (error by segment/category)")
     parts.append("   - Note any patterns in residuals")
-    parts.append("6. Call report_metrics with numeric results AND your analysis findings in the summary")
+    parts.append(
+        "6. Call report_metrics with numeric results AND your analysis findings in the summary"
+    )
     parts.append("   The reviewer uses your findings to decide what to try next.")
 
     # Add context from bootstrap handoff / experiment guide if present
