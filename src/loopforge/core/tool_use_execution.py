@@ -502,6 +502,31 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "finish_iteration",
+            "description": (
+                "Finish this iteration. Call AFTER report_metrics and AFTER analyzing your results. "
+                "Include your analysis findings: feature importance, segmented performance, error patterns, "
+                "and what you'd recommend trying next."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": (
+                            "Your analysis of the experiment results. Include: "
+                            "top features by importance, segments where model struggles, "
+                            "error patterns, and what you'd recommend for the next iteration."
+                        ),
+                    },
+                },
+                "required": ["summary"],
+            },
+        },
+    },
 ]
 
 
@@ -676,9 +701,14 @@ def _execute_report_metrics(
         if name == spec.primary_metric.name:
             primary_value = value
 
-    response = f"Metrics recorded: {json.dumps(raw_metrics)}"
-    if summary:
-        response += f"\nSummary: {summary}"
+    response = (
+        f"Metrics recorded: {json.dumps(raw_metrics)}\n\n"
+        "Good. Now BEFORE calling finish_iteration, analyze your results:\n"
+        "- Run feature importance (e.g. model.feature_importances_)\n"
+        "- Check error by segment/category (e.g. by position, time period)\n"
+        "- Note patterns in where the model fails\n"
+        "Then call finish_iteration with your analysis summary."
+    )
     return response, metric_results, primary_value
 
 
@@ -844,16 +874,13 @@ def _build_system_prompt(
     parts.append("2. Write or adapt ONE script")
     parts.append("3. Run it (use timeout=300 for training)")
     parts.append("4. Fix obvious errors if needed and retry")
-    parts.append("5. After getting metrics, do quick post-prediction analysis:")
-    parts.append(
-        "   - Add feature importance to your script (e.g. model.feature_importances_)"
-    )
-    parts.append("   - Check where the model fails worst (error by segment/category)")
-    parts.append("   - Note any patterns in residuals")
-    parts.append(
-        "6. Call report_metrics with numeric results AND your analysis findings in the summary"
-    )
-    parts.append("   The reviewer uses your findings to decide what to try next.")
+    parts.append("5. Call report_metrics with the numeric results")
+    parts.append("6. AFTER reporting metrics, analyze your results:")
+    parts.append("   - Run feature importance code (e.g. print top features)")
+    parts.append("   - Check model errors by segment/category")
+    parts.append("   - Note where the model struggles and why")
+    parts.append("7. Call finish_iteration with your analysis summary and recommendations")
+    parts.append("   The reviewer uses your analysis to decide what to try next.")
 
     # Add context from bootstrap handoff / experiment guide if present
     for note in snapshot.markdown_memory:
@@ -1102,8 +1129,14 @@ class ToolUseExecutor:
                     reported_metrics.update(metrics)
                     if primary is not None:
                         reported_primary_value = primary
-                    reported_summary = tool_args.get("summary", "")
                     metrics_reported = True
+                elif tool_name == "finish_iteration":
+                    reported_summary = tool_args.get("summary", "")
+                    messages.append(
+                        {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                    )
+                    interrupted = True
+                    break
 
                 messages.append(
                     {
@@ -1113,8 +1146,8 @@ class ToolUseExecutor:
                     }
                 )
 
-            # If interrupted or metrics reported, stop the loop
-            if interrupted or metrics_reported:
+            # If interrupted (by user or finish_iteration), stop the loop
+            if interrupted:
                 break
 
         # Build outcome
@@ -1159,6 +1192,8 @@ class ToolUseExecutor:
         if name == "report_metrics":
             response, _, _ = _execute_report_metrics(args, spec)
             return response
+        if name == "finish_iteration":
+            return "OK"
         return f"Error: unknown tool '{name}'"
 
     def _build_outcome(
@@ -1728,13 +1763,18 @@ class ToolUseReviewer:
             "significantly by role (ADC vs Support).'\n"
             "Read the experiment script to understand what features exist, what the model does, "
             "and reason about what specific change would most likely improve the metric.\n\n"
-            "DIAGNOSTIC THINKING: Think like a domain expert reviewing this model.\n"
-            "- Where might this model struggle? (certain segments, categories, time periods, edge cases)\n"
-            "- What biases could exist in the predictions?\n"
-            "- What segmented metrics would reveal blind spots?\n"
-            "Your next_experiment can ask the executor to add DIAGNOSTIC METRICS — the primary metric "
-            "broken down by relevant categories in the data. Once you see segmented results, "
-            "you can make informed feature engineering suggestions based on actual weaknesses.\n\n"
+            "DEEP ANALYSIS OF EXPERIMENT HISTORY:\n"
+            "Before proposing next steps, think deeply about ALL past iterations:\n"
+            "- What moved the metric and by how much? What patterns emerge across iterations?\n"
+            "- Which feature changes helped vs didn't? What does that tell you about the signal?\n"
+            "- Where might the model struggle? (certain segments, categories, time periods)\n"
+            "- What biases could exist? What hasn't been tried yet?\n"
+            "Make your reasoning TRANSPARENT in think() — the user reads your thoughts.\n"
+            "Show the chain: 'iter2 added X which improved metric by Y, iter3 tried Z which didn't help, "
+            "this suggests the model needs more signal about W rather than V.'\n\n"
+            "Your next_experiment should ask the executor to add DIAGNOSTIC METRICS when you need "
+            "more visibility (e.g. primary metric broken down by category). Once you see segmented "
+            "results, propose specific feature engineering based on actual weaknesses.\n\n"
             "Call think() to reason deeply, then call report_review.\n"
         )
 
