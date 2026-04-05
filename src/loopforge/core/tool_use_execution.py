@@ -70,8 +70,8 @@ def _run_subprocess_with_progress(
 
     while True:
         elapsed = time.monotonic() - started_at
-        remaining_timeout = timeout_seconds - elapsed
-        if remaining_timeout <= 0:
+        remaining = timeout_seconds - elapsed
+        if remaining <= 0:
             process.kill()
             stdout, stderr = process.communicate()
             raise subprocess.TimeoutExpired(
@@ -80,14 +80,8 @@ def _run_subprocess_with_progress(
                 output=stdout,
                 stderr=stderr,
             )
-
-        time_until_checkpoint = max(0.0, next_target - elapsed)
-        if time_until_checkpoint > 0:
-            wait_for = min(1.0, remaining_timeout, time_until_checkpoint)
-        else:
-            wait_for = min(0.1, remaining_timeout)
         try:
-            stdout, stderr = process.communicate(timeout=wait_for)
+            stdout, stderr = process.communicate(timeout=min(2.0, remaining))
             return subprocess.CompletedProcess(
                 args=command,
                 returncode=process.returncode,
@@ -96,7 +90,7 @@ def _run_subprocess_with_progress(
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - started_at
-            if progress_fn is not None and elapsed >= 120 and int(elapsed) % 120 < 2:
+            if progress_fn is not None and elapsed >= 120 and int(elapsed) % 120 < 3:
                 progress_fn("waiting", f"Still running ({int(elapsed)}s)...")
 
 
@@ -849,7 +843,12 @@ def _build_system_prompt(
     parts.append("2. Write or adapt ONE script")
     parts.append("3. Run it (use timeout=300 for training)")
     parts.append("4. Fix obvious errors if needed and retry")
-    parts.append("5. Call report_metrics with numeric results")
+    parts.append("5. After getting metrics, do quick post-prediction analysis:")
+    parts.append("   - Add feature importance to your script (e.g. model.feature_importances_)")
+    parts.append("   - Check where the model fails worst (error by segment/category)")
+    parts.append("   - Note any patterns in residuals")
+    parts.append("6. Call report_metrics with numeric results AND your analysis findings in the summary")
+    parts.append("   The reviewer uses your findings to decide what to try next.")
 
     # Add context from bootstrap handoff / experiment guide if present
     for note in snapshot.markdown_memory:
