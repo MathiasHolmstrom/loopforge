@@ -194,7 +194,12 @@ def build_bootstrap_handoff(
         for note in capability_notes[:8]
         if not any(
             noise in note.lower()
-            for noise in ("candidate metric symbols", "candidate action symbols", "data-related files", "dataframe columns referenced")
+            for noise in (
+                "candidate metric symbols",
+                "candidate action symbols",
+                "data-related files",
+                "dataframe columns referenced",
+            )
         )
     ]
     if relevant_notes:

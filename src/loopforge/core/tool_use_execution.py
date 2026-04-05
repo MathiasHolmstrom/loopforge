@@ -1741,13 +1741,15 @@ class ToolUseReviewer:
             user_parts.append(f"Data pipeline: {metadata['data_loading']}")
         if metadata.get("baseline_function"):
             user_parts.append(f"Baseline function: {metadata['baseline_function']}")
-        user_parts.extend([
-            "",
-            f"CURRENT ITERATION ({snapshot.next_iteration_id}):",
-            f"  Hypothesis: {candidate.hypothesis}",
-            f"  Status: {outcome.status}",
-            f"  Metrics:\n{metrics_str or '  (none reported)'}",
-        ])
+        user_parts.extend(
+            [
+                "",
+                f"CURRENT ITERATION ({snapshot.next_iteration_id}):",
+                f"  Hypothesis: {candidate.hypothesis}",
+                f"  Status: {outcome.status}",
+                f"  Metrics:\n{metrics_str or '  (none reported)'}",
+            ]
+        )
         if outcome.failure_summary:
             user_parts.append(f"  Failure: {outcome.failure_summary[:500]}")
         if outcome.notes:
