@@ -1220,6 +1220,10 @@ def _brief_args(args: dict[str, Any], limit: int = 300) -> str:
 # ---------------------------------------------------------------------------
 
 
+class _StopLoop(Exception):
+    """Raised by a tool dispatcher to signal the loop should stop."""
+
+
 def _run_tool_loop(
     *,
     model: str,
@@ -1324,6 +1328,11 @@ def _run_tool_loop(
 
             try:
                 tool_result = tool_dispatcher(tool_name, tool_args, turn)
+            except _StopLoop:
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                )
+                return result
             except KeyboardInterrupt:
                 progress_fn("interrupted", "Interrupted by user.")
                 return result
@@ -1739,7 +1748,11 @@ class ToolUseReviewer:
 
         user_message = "\n".join(user_parts)
 
+        review_result: dict[str, Any] = {}
+        review_attempts = 0
+
         def dispatch(name: str, args: dict[str, Any], turn: int) -> str:
+            nonlocal review_result, review_attempts
             if name == "read_file":
                 return _execute_read_file(args, self.repo_root, 100_000)
             if name == "list_files":
@@ -1759,20 +1772,36 @@ class ToolUseReviewer:
                 )
             if name == "think":
                 return "OK"
+            if name == "report_review":
+                # Reject thin reviews — must have lessons and next_experiment
+                lessons = args.get("lessons", [])
+                next_exp = args.get("next_experiment", "")
+                if (not lessons or not next_exp) and review_attempts < 2:
+                    review_attempts += 1
+                    return (
+                        "Review incomplete. You MUST include:\n"
+                        "- lessons: what was learned (at least 1 item)\n"
+                        "- next_experiment: specific recommendation for next iteration\n"
+                        "First, load the saved predictions and run analysis code. "
+                        "Then call report_review with substantive findings."
+                    )
+                review_result.update(args)
+                raise _StopLoop()
             return f"Unknown tool: {name}"
 
-        result = _run_tool_loop(
+        _run_tool_loop(
             model=self.model,
             system_prompt=system_prompt,
             user_message=user_message,
             tools=REVIEWER_TOOLS,
             tool_dispatcher=dispatch,
-            stop_tool="report_review",
-            max_tool_calls=15,
+            stop_tool="_reviewer_done_",  # Never auto-stops — we handle report_review in dispatch
+            max_tool_calls=20,
             temperature=self.temperature,
             progress_fn=self.progress_fn,
             extra_kwargs=self.extra_kwargs,
         )
+        result = review_result
 
         # Parse result
         status = result.get(
