@@ -263,7 +263,11 @@ def _score_implementation_candidate(
 ) -> int:
     score = 0
     lower_path = path.lower()
-    searchable_tokens = set(re.findall(r"[a-zA-Z0-9_]+", " ".join([path, *top_level_defs, *metric_symbols]).lower()))
+    searchable_tokens = set(
+        re.findall(
+            r"[a-zA-Z0-9_]+", " ".join([path, *top_level_defs, *metric_symbols]).lower()
+        )
+    )
     overlap = len(objective_tokens & searchable_tokens)
     if "baseline" in lower_path:
         score += 20
@@ -318,7 +322,10 @@ def _build_implementation_grounding(
             baseline_paths.append(path)
     if candidates:
         primary_path = str(candidates[0]["path"])
-        baseline_paths = [primary_path, *[path for path in baseline_paths if path != primary_path]]
+        baseline_paths = [
+            primary_path,
+            *[path for path in baseline_paths if path != primary_path],
+        ]
     return candidates, baseline_paths
 
 

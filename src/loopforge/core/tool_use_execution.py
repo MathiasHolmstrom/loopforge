@@ -26,11 +26,9 @@ from loopforge.core.types import (
     ExperimentSpec,
     MemorySnapshot,
     MetricResult,
-    MetricSpec,
     ProgressFn,
     ReflectionSummary,
     ReviewDecision,
-    SpecQuestion,
     _noop_progress,
 )
 
@@ -513,7 +511,7 @@ TOOLS = [
                 "properties": {
                     "metrics": {
                         "type": "object",
-                        "description": "Mapping of metric name to numeric value, e.g. {\"rmse\": 0.42, \"r2\": 0.87}",
+                        "description": 'Mapping of metric name to numeric value, e.g. {"rmse": 0.42, "r2": 0.87}',
                     },
                     "summary": {
                         "type": "string",
@@ -535,9 +533,7 @@ _MAX_GLOB_RESULTS = 80
 _MAX_SEARCH_RESULTS = 60
 
 
-def _execute_read_file(
-    args: dict[str, Any], repo_root: Path, max_chars: int
-) -> str:
+def _execute_read_file(args: dict[str, Any], repo_root: Path, max_chars: int) -> str:
     path_str = args.get("path", "")
     max_lines = int(args.get("max_lines", 10000))
     try:
@@ -578,13 +574,14 @@ def _execute_list_files(args: dict[str, Any], repo_root: Path) -> str:
     if not files:
         return "No files matched the pattern."
     if len(files) > _MAX_GLOB_RESULTS:
-        return "\n".join(files[:_MAX_GLOB_RESULTS]) + f"\n... ({len(files) - _MAX_GLOB_RESULTS} more)"
+        return (
+            "\n".join(files[:_MAX_GLOB_RESULTS])
+            + f"\n... ({len(files) - _MAX_GLOB_RESULTS} more)"
+        )
     return "\n".join(files)
 
 
-def _execute_search_files(
-    args: dict[str, Any], repo_root: Path, max_chars: int
-) -> str:
+def _execute_search_files(args: dict[str, Any], repo_root: Path, max_chars: int) -> str:
     pattern_str = args.get("pattern", "")
     glob_filter = args.get("glob", "**/*")
     try:
@@ -624,9 +621,7 @@ def _execute_search_files(
     return output
 
 
-def _execute_write_file(
-    args: dict[str, Any], repo_root: Path
-) -> str:
+def _execute_write_file(args: dict[str, Any], repo_root: Path) -> str:
     path_str = args.get("path", "")
     content = args.get("content", "")
     try:
@@ -711,6 +706,7 @@ def _execute_report_metrics(
 # Experiment history formatting
 # ---------------------------------------------------------------------------
 
+
 def _format_iteration_history(
     snapshot: MemorySnapshot,
     *,
@@ -729,14 +725,18 @@ def _format_iteration_history(
     for record in records:
         metric_val = "no metrics"
         if record.outcome.primary_metric_value is not None:
-            metric_val = f"{spec.primary_metric.name}={record.outcome.primary_metric_value:.4g}"
+            metric_val = (
+                f"{spec.primary_metric.name}={record.outcome.primary_metric_value:.4g}"
+            )
         elif record.outcome.metric_results:
             primary = record.outcome.metric_results.get(spec.primary_metric.name)
             if primary and primary.value is not None:
                 metric_val = f"{spec.primary_metric.name}={primary.value:.4g}"
         status = record.review.status if record.review else record.outcome.status
         hypothesis = record.candidate.hypothesis[:80]
-        parts.append(f"  #{record.iteration_id}: {hypothesis} | {metric_val} | {status}")
+        parts.append(
+            f"  #{record.iteration_id}: {hypothesis} | {metric_val} | {status}"
+        )
 
     # Full detail on recent iterations
     recent = records[-full_detail_count:]
@@ -761,10 +761,14 @@ def _format_iteration_history(
                     parts.append(f"  Lesson: {lesson}")
             # Reviewer's recommendation
             if record.reflection and record.reflection.recommended_next_action:
-                parts.append(f"  Reviewer suggested: {record.reflection.recommended_next_action}")
+                parts.append(
+                    f"  Reviewer suggested: {record.reflection.recommended_next_action}"
+                )
             # Files changed
             if record.outcome.code_or_config_changes:
-                parts.append(f"  Files changed: {', '.join(record.outcome.code_or_config_changes[:5])}")
+                parts.append(
+                    f"  Files changed: {', '.join(record.outcome.code_or_config_changes[:5])}"
+                )
 
     parts.append("=== END HISTORY ===")
     return "\n".join(parts)
@@ -773,6 +777,7 @@ def _format_iteration_history(
 # ---------------------------------------------------------------------------
 # System prompt builder
 # ---------------------------------------------------------------------------
+
 
 def _build_system_prompt(
     candidate: ExperimentCandidate,
@@ -815,24 +820,42 @@ def _build_system_prompt(
     if snapshot.best_summary is None and not snapshot.recent_records:
         parts.append("")
         parts.append("PHASE: BASELINE (no metrics exist yet)")
-        parts.append("Your ONLY job this iteration is to get the EXISTING model's baseline metric.")
-        parts.append("Do NOT add features, change the model, or try to improve anything yet.")
+        parts.append(
+            "Your ONLY job this iteration is to get the EXISTING model's baseline metric."
+        )
+        parts.append(
+            "Do NOT add features, change the model, or try to improve anything yet."
+        )
         parts.append("")
-        parts.append("The bootstrap handoff below already contains the baseline script path and possibly its output.")
-        parts.append("READ IT FIRST. If it contains metric values, call report_metrics immediately.")
-        parts.append("If it contains a baseline script path, run that script AS-IS — do not rewrite it.")
+        parts.append(
+            "The bootstrap handoff below already contains the baseline script path and possibly its output."
+        )
+        parts.append(
+            "READ IT FIRST. If it contains metric values, call report_metrics immediately."
+        )
+        parts.append(
+            "If it contains a baseline script path, run that script AS-IS — do not rewrite it."
+        )
         parts.append("Only search the repo if the handoff doesn't answer the question.")
         parts.append("")
-        parts.append("The next iteration will focus on improvements — this one just establishes the number to beat.")
+        parts.append(
+            "The next iteration will focus on improvements — this one just establishes the number to beat."
+        )
     elif snapshot.best_summary is not None:
         parts.append("")
-        parts.append(f"PHASE: IMPROVE (baseline exists)")
-        parts.append(f"Best result so far: {spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value} (iteration {snapshot.best_summary.iteration_id})")
-        parts.append("Your job: make ONE focused change to beat that number, then report the new metric.")
+        parts.append("PHASE: IMPROVE (baseline exists)")
+        parts.append(
+            f"Best result so far: {spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value} (iteration {snapshot.best_summary.iteration_id})"
+        )
+        parts.append(
+            "Your job: make ONE focused change to beat that number, then report the new metric."
+        )
     else:
         parts.append("")
         parts.append("PHASE: RETRY (prior attempts failed to produce metrics)")
-        parts.append("Focus on getting a metric out — even the baseline. Read prior errors and fix them.")
+        parts.append(
+            "Focus on getting a metric out — even the baseline. Read prior errors and fix them."
+        )
 
     parts.append("")
     parts.append("Your workflow:")
@@ -844,11 +867,13 @@ def _build_system_prompt(
 
     # Add context from bootstrap handoff / experiment guide if present
     for note in snapshot.markdown_memory:
-        if note.path.endswith((
-            "bootstrap_handoff.md",
-            "experiment_guide.md",
-            "execution_runbook.md",
-        )):
+        if note.path.endswith(
+            (
+                "bootstrap_handoff.md",
+                "experiment_guide.md",
+                "execution_runbook.md",
+            )
+        ):
             parts.append("")
             parts.append(f"--- {note.path} ---")
             content = note.content
@@ -866,6 +891,7 @@ def _build_system_prompt(
 # ---------------------------------------------------------------------------
 # Main executor class
 # ---------------------------------------------------------------------------
+
 
 class ToolUseExecutor:
     """Executes experiments via an interactive LLM tool-use loop.
@@ -899,9 +925,7 @@ class ToolUseExecutor:
 
     # -- WorkerBackend protocol ------------------------------------------
 
-    def propose_next_experiment(
-        self, snapshot: MemorySnapshot
-    ) -> ExperimentCandidate:
+    def propose_next_experiment(self, snapshot: MemorySnapshot) -> ExperimentCandidate:
         """Return a minimal candidate — the real work happens in execute()."""
         iteration = snapshot.next_iteration_id
         if snapshot.best_summary is not None:
@@ -915,7 +939,9 @@ class ToolUseExecutor:
             action_type="run_experiment",
             change_type="interactive",
             instructions="Interactive agent will read the repo, write code, and run experiments.",
-            execution_steps=[ExecutionStep(kind="shell", command="interactive tool-use agent")],
+            execution_steps=[
+                ExecutionStep(kind="shell", command="interactive tool-use agent")
+            ],
             metadata={"interactive_agent": True},
         )
 
@@ -941,7 +967,10 @@ class ToolUseExecutor:
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Begin the experiment. Hypothesis: {candidate.hypothesis}"},
+            {
+                "role": "user",
+                "content": f"Begin the experiment. Hypothesis: {candidate.hypothesis}",
+            },
         ]
 
         # State accumulated during the loop
@@ -954,7 +983,9 @@ class ToolUseExecutor:
         error_count = 0
         turn = 0
 
-        self.progress_fn("tool_use_start", f"[{self.model}] Starting interactive execution...")
+        self.progress_fn(
+            "tool_use_start", f"[{self.model}] Starting interactive execution..."
+        )
 
         while turn < self.max_tool_calls:
             turn += 1
@@ -985,7 +1016,9 @@ class ToolUseExecutor:
                     failure_type="LLMCallFailed",
                     failure_summary=str(exc),
                     recoverable=True,
-                    recovery_actions=["Retry the iteration or check model availability."],
+                    recovery_actions=[
+                        "Retry the iteration or check model availability."
+                    ],
                     execution_details={"tool_call_log": tool_call_log, "turn": turn},
                 )
 
@@ -1039,28 +1072,35 @@ class ToolUseExecutor:
                 )
 
                 try:
-                    tool_result = self._dispatch_tool(
-                        tool_name, tool_args, spec, turn
-                    )
+                    tool_result = self._dispatch_tool(tool_name, tool_args, spec, turn)
                 except KeyboardInterrupt:
-                    self.progress_fn("interrupted", "Interrupted by user during tool execution.")
+                    self.progress_fn(
+                        "interrupted", "Interrupted by user during tool execution."
+                    )
                     interrupted = True
                     break
 
-                tool_call_log.append({
-                    "turn": turn,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result_preview": tool_result[:500],
-                })
+                tool_call_log.append(
+                    {
+                        "turn": turn,
+                        "tool": tool_name,
+                        "args": tool_args,
+                        "result_preview": tool_result[:500],
+                    }
+                )
 
                 # Track side effects
                 if tool_name == "run_command":
                     command_outputs.append(tool_result)
-                    if tool_result.startswith("exit_code=") and not tool_result.startswith("exit_code=0"):
+                    if tool_result.startswith(
+                        "exit_code="
+                    ) and not tool_result.startswith("exit_code=0"):
                         error_count += 1
                         if error_count >= self.max_errors:
-                            self.progress_fn("error_limit", f"Hit {self.max_errors} failed commands — stopping.")
+                            self.progress_fn(
+                                "error_limit",
+                                f"Hit {self.max_errors} failed commands — stopping.",
+                            )
                             interrupted = True
                             break
                 elif tool_name == "write_file":
@@ -1072,11 +1112,13 @@ class ToolUseExecutor:
                         reported_primary_value = primary
                     metrics_reported = True
 
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": tool_result,
-                })
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "content": tool_result,
+                    }
+                )
 
             # If interrupted or metrics reported, stop the loop
             if interrupted or metrics_reported:
@@ -1111,8 +1153,12 @@ class ToolUseExecutor:
             return _execute_write_file(args, self.repo_root)
         if name == "run_command":
             return _execute_run_command(
-                args, self.repo_root, self.default_timeout_seconds,
-                self.max_captured_chars, self.progress_fn, turn,
+                args,
+                self.repo_root,
+                self.default_timeout_seconds,
+                self.max_captured_chars,
+                self.progress_fn,
+                turn,
             )
         if name == "think":
             return "OK"
@@ -1151,11 +1197,13 @@ class ToolUseExecutor:
         secondary_names = {m.name for m in spec.secondary_metrics}
         guardrail_names = {m.name for m in spec.guardrail_metrics}
         secondary_metrics = {
-            name: r.value for name, r in metric_results.items()
+            name: r.value
+            for name, r in metric_results.items()
             if name in secondary_names and r.value is not None
         }
         guardrail_metrics = {
-            name: r.value for name, r in metric_results.items()
+            name: r.value
+            for name, r in metric_results.items()
             if name in guardrail_names and r.value is not None
         }
 
@@ -1224,6 +1272,7 @@ def _brief_args(args: dict[str, Any], limit: int = 300) -> str:
 # Shared tool-use loop
 # ---------------------------------------------------------------------------
 
+
 def _run_tool_loop(
     *,
     model: str,
@@ -1281,8 +1330,14 @@ def _run_tool_loop(
             assistant_msg["content"] = message.content
         if message.tool_calls:
             assistant_msg["tool_calls"] = [
-                {"id": tc.id, "type": "function",
-                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
                 for tc in message.tool_calls
             ]
         messages.append(assistant_msg)
@@ -1291,10 +1346,12 @@ def _run_tool_loop(
             # Model responded with text instead of calling a tool.
             # If we haven't got the stop_tool result yet, nudge it to call it.
             if not result and turn < max_tool_calls - 1:
-                messages.append({
-                    "role": "user",
-                    "content": f"Please call {stop_tool} now with the information you have.",
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Please call {stop_tool} now with the information you have.",
+                    }
+                )
                 continue
             break
 
@@ -1306,12 +1363,16 @@ def _run_tool_loop(
             except json.JSONDecodeError:
                 tool_args = {}
 
-            progress_fn(f"tool_{turn}", f"[{model}] {tool_name}({_brief_args(tool_args)})")
+            progress_fn(
+                f"tool_{turn}", f"[{model}] {tool_name}({_brief_args(tool_args)})"
+            )
 
             # Check if this is the stop tool
             if tool_name == stop_tool:
                 result = tool_args
-                messages.append({"role": "tool", "tool_call_id": tc.id, "content": "OK"})
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc.id, "content": "OK"}
+                )
                 return result
 
             try:
@@ -1320,13 +1381,19 @@ def _run_tool_loop(
                 progress_fn("interrupted", "Interrupted by user.")
                 return result
 
-            if tool_name == "run_command" and tool_result.startswith("exit_code=") and not tool_result.startswith("exit_code=0"):
+            if (
+                tool_name == "run_command"
+                and tool_result.startswith("exit_code=")
+                and not tool_result.startswith("exit_code=0")
+            ):
                 error_count += 1
                 if error_count >= max_errors:
                     progress_fn("error_limit", f"Hit {max_errors} failed commands.")
                     return result
 
-            messages.append({"role": "tool", "tool_call_id": tc.id, "content": tool_result})
+            messages.append(
+                {"role": "tool", "tool_call_id": tc.id, "content": tool_result}
+            )
 
     return result
 
@@ -1336,7 +1403,10 @@ def _run_tool_loop(
 # ---------------------------------------------------------------------------
 
 PLANNER_TOOLS = [
-    t for t in TOOLS if t["function"]["name"] in ("read_file", "list_files", "search_files", "think", "run_command")
+    t
+    for t in TOOLS
+    if t["function"]["name"]
+    in ("read_file", "list_files", "search_files", "think", "run_command")
 ] + [
     {
         "type": "function",
@@ -1349,19 +1419,41 @@ PLANNER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "source_script": {"type": "string", "description": "File path the user referenced"},
-                    "baseline_function": {"type": "string", "description": "Function/class that trains the baseline model"},
-                    "data_loading": {"type": "string", "description": "How training data is loaded (function, file path, pipeline description)"},
-                    "target_column": {"type": "string", "description": "Column/variable being predicted"},
-                    "primary_metric": {"type": "string", "description": "Primary metric name"},
-                    "primary_metric_goal": {"type": "string", "enum": ["minimize", "maximize"], "description": "Whether to minimize or maximize the metric"},
+                    "source_script": {
+                        "type": "string",
+                        "description": "File path the user referenced",
+                    },
+                    "baseline_function": {
+                        "type": "string",
+                        "description": "Function/class that trains the baseline model",
+                    },
+                    "data_loading": {
+                        "type": "string",
+                        "description": "How training data is loaded (function, file path, pipeline description)",
+                    },
+                    "target_column": {
+                        "type": "string",
+                        "description": "Column/variable being predicted",
+                    },
+                    "primary_metric": {
+                        "type": "string",
+                        "description": "Primary metric name",
+                    },
+                    "primary_metric_goal": {
+                        "type": "string",
+                        "enum": ["minimize", "maximize"],
+                        "description": "Whether to minimize or maximize the metric",
+                    },
                     "guardrail_metrics": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
-                                "goal": {"type": "string", "enum": ["minimize", "maximize"]},
+                                "goal": {
+                                    "type": "string",
+                                    "enum": ["minimize", "maximize"],
+                                },
                             },
                             "required": ["name", "goal"],
                         },
@@ -1373,15 +1465,28 @@ PLANNER_TOOLS = [
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
-                                "goal": {"type": "string", "enum": ["minimize", "maximize"]},
+                                "goal": {
+                                    "type": "string",
+                                    "enum": ["minimize", "maximize"],
+                                },
                             },
                             "required": ["name", "goal"],
                         },
                         "description": "Secondary metrics to track with name and goal",
                     },
-                    "baseline_value": {"type": "number", "description": "Known baseline metric value if found"},
+                    "baseline_value": {
+                        "type": "number",
+                        "description": "Known baseline metric value if found",
+                    },
                 },
-                "required": ["source_script", "baseline_function", "data_loading", "target_column", "primary_metric", "primary_metric_goal"],
+                "required": [
+                    "source_script",
+                    "baseline_function",
+                    "data_loading",
+                    "target_column",
+                    "primary_metric",
+                    "primary_metric_goal",
+                ],
             },
         },
     },
@@ -1393,8 +1498,14 @@ PLANNER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The question to ask"},
-                    "reason": {"type": "string", "description": "Why you need to ask this"},
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why you need to ask this",
+                    },
                 },
                 "required": ["question"],
             },
@@ -1456,10 +1567,16 @@ class ToolUsePlanner:
 
         user_msg_parts = [f"User goal: {user_goal}"]
         if source_file_hint:
-            user_msg_parts.append(f"\nI found this file in the repo matching your description: {source_file_hint}")
-            user_msg_parts.append("Start by reading it to understand the model training code.")
+            user_msg_parts.append(
+                f"\nI found this file in the repo matching your description: {source_file_hint}"
+            )
+            user_msg_parts.append(
+                "Start by reading it to understand the model training code."
+            )
         if answers:
-            user_msg_parts.append(f"\nUser has already answered these questions: {json.dumps(answers, indent=2)}")
+            user_msg_parts.append(
+                f"\nUser has already answered these questions: {json.dumps(answers, indent=2)}"
+            )
 
         contract: dict[str, Any] = {}
         questions: list[dict[str, str]] = []
@@ -1475,10 +1592,20 @@ class ToolUsePlanner:
                 return "OK"
             if name == "run_command":
                 return _execute_run_command(
-                    args, self.repo_root, 30, 100_000, self.progress_fn, turn,
+                    args,
+                    self.repo_root,
+                    30,
+                    100_000,
+                    self.progress_fn,
+                    turn,
                 )
             if name == "ask_user":
-                questions.append({"question": args.get("question", ""), "reason": args.get("reason", "")})
+                questions.append(
+                    {
+                        "question": args.get("question", ""),
+                        "reason": args.get("reason", ""),
+                    }
+                )
                 return "Question recorded. Continue analyzing or call fill_contract."
             return f"Unknown tool: {name}"
 
@@ -1519,10 +1646,21 @@ REVIEWER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "status": {"type": "string", "enum": ["accepted", "rejected"], "description": "Accept into memory or reject"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["accepted", "rejected"],
+                        "description": "Accept into memory or reject",
+                    },
                     "reason": {"type": "string", "description": "Why this decision"},
-                    "lessons": {"type": "array", "items": {"type": "string"}, "description": "What was learned from this iteration"},
-                    "next_experiment": {"type": "string", "description": "What to try in the next iteration"},
+                    "lessons": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "What was learned from this iteration",
+                    },
+                    "next_experiment": {
+                        "type": "string",
+                        "description": "What to try in the next iteration",
+                    },
                 },
                 "required": ["status", "reason", "lessons", "next_experiment"],
             },
@@ -1565,10 +1703,15 @@ class ToolUseReviewer:
             if result.value is not None:
                 metrics_str += f"  {name} = {result.value:.4g}\n"
         if not metrics_str and outcome.primary_metric_value is not None:
-            metrics_str = f"  {spec.primary_metric.name} = {outcome.primary_metric_value:.4g}\n"
+            metrics_str = (
+                f"  {spec.primary_metric.name} = {outcome.primary_metric_value:.4g}\n"
+            )
 
         best_str = "None yet"
-        if snapshot.best_summary is not None and snapshot.best_summary.primary_metric_value is not None:
+        if (
+            snapshot.best_summary is not None
+            and snapshot.best_summary.primary_metric_value is not None
+        ):
             best_str = f"{spec.primary_metric.name} = {snapshot.best_summary.primary_metric_value:.4g}"
 
         system_prompt = (
@@ -1600,7 +1743,9 @@ class ToolUseReviewer:
         if outcome.notes:
             user_parts.append(f"  Notes: {'; '.join(outcome.notes[:3])}")
         if outcome.code_or_config_changes:
-            user_parts.append(f"  Files changed: {', '.join(outcome.code_or_config_changes[:5])}")
+            user_parts.append(
+                f"  Files changed: {', '.join(outcome.code_or_config_changes[:5])}"
+            )
 
         # Add full experiment history
         history = _format_iteration_history(snapshot)
@@ -1633,7 +1778,9 @@ class ToolUseReviewer:
         )
 
         # Parse result
-        status = result.get("status", "accepted" if outcome.status == "success" else "rejected")
+        status = result.get(
+            "status", "accepted" if outcome.status == "success" else "rejected"
+        )
         reason = result.get("reason", "Review completed.")
         lessons = result.get("lessons", [])
         next_experiment = result.get("next_experiment")

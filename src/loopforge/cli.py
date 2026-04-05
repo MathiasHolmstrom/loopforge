@@ -4,23 +4,6 @@ import argparse
 import json
 import sys
 from datetime import datetime, timezone
-
-
-def _flush_stdin() -> None:
-    """Drain any buffered stdin so the next input() waits for fresh keystrokes.
-
-    This prevents multi-line pastes from leaking into later prompts.
-    """
-    try:
-        import msvcrt
-
-        while msvcrt.kbhit():
-            msvcrt.getwch()
-    except ImportError:
-        import select
-
-        while select.select([sys.stdin], [], [], 0.0)[0]:
-            sys.stdin.readline()
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +27,20 @@ from loopforge.core import (
     HumanIntervention,
     LiteLLMSpecBackend,
 )
+
+
+def _flush_stdin() -> None:
+    """Drain any buffered stdin so the next input() waits for fresh keystrokes."""
+    try:
+        import msvcrt
+
+        while msvcrt.kbhit():
+            msvcrt.getwch()
+    except ImportError:
+        import select
+
+        while select.select([sys.stdin], [], [], 0.0)[0]:
+            sys.stdin.readline()
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -735,7 +732,9 @@ def run_interactive_start(
         # Always prompt the user — whether ready, blocked, or anything else
         if not response:
             if turn.ready_to_start:
-                print_fn("Start experiment? [Y = run / type feedback to revise / quit = exit]")
+                print_fn(
+                    "Start experiment? [Y = run / type feedback to revise / quit = exit]"
+                )
                 prompt_text = "> "
             else:
                 prompt_text = "> "

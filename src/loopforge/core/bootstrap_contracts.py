@@ -83,11 +83,7 @@ def _should_enforce_baseline_reuse(*parts: str) -> bool:
         return False
     if any(token in combined for token in EXISTING_FRAMEWORK_HINT_TOKENS):
         return True
-    words = {
-        token
-        for token in re.findall(r"[a-z0-9_]+", combined)
-        if token
-    }
+    words = {token for token in re.findall(r"[a-z0-9_]+", combined) if token}
     mentions_existing_artifact = "existing" in words and bool(
         words & {"script", "framework", "pipeline", "model", "baseline"}
     )
@@ -196,7 +192,9 @@ def build_bootstrap_handoff(
         lines.extend(["", "## Repo Grounding"])
         lines.extend(f"- {note}" for note in capability_notes[:16])
     if env_verification:
-        lines.extend(["", "## Environment Verification (bootstrapper ran these checks)"])
+        lines.extend(
+            ["", "## Environment Verification (bootstrapper ran these checks)"]
+        )
         if env_verification.get("deps_synced"):
             lines.append("- Dependencies: synced (uv sync succeeded)")
         else:
@@ -205,7 +203,15 @@ def build_bootstrap_handoff(
             lines.append(f"- Baseline script: {env_verification['baseline_script']}")
         if env_verification.get("baseline_output"):
             output_preview = env_verification["baseline_output"].strip()[-2000:]
-            lines.extend(["", "### Baseline Script Output (last 2000 chars)", "```", output_preview, "```"])
+            lines.extend(
+                [
+                    "",
+                    "### Baseline Script Output (last 2000 chars)",
+                    "```",
+                    output_preview,
+                    "```",
+                ]
+            )
         for error in env_verification.get("errors", []):
             lines.append(f"- ERROR: {error}")
     return "\n".join(lines).rstrip() + "\n"

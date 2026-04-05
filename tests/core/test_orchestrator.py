@@ -174,7 +174,9 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
                 action_type="run_experiment",
                 change_type="repair",
                 instructions="Retry with fixes.",
-                execution_steps=[ExecutionStep(kind="shell", command="python src/train.py")],
+                execution_steps=[
+                    ExecutionStep(kind="shell", command="python src/train.py")
+                ],
             )
 
         def continue_experiment(self, snapshot, previous_candidate, previous_outcome):
@@ -209,4 +211,6 @@ def test_orchestrator_run_continues_after_recoverable_failure_exhaustion(
     results = orchestrator.run(iterations=3)
 
     assert len(results) == 3
-    assert all(result.record.outcome.status == "recoverable_failure" for result in results)
+    assert all(
+        result.record.outcome.status == "recoverable_failure" for result in results
+    )

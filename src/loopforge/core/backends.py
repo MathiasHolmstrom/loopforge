@@ -5,7 +5,6 @@ import threading
 import time
 from collections.abc import Mapping
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any, Protocol
 
 from loopforge.core.types import (
@@ -567,10 +566,14 @@ def _compact_step_result(step_result: dict[str, Any]) -> dict[str, Any]:
 def _compact_execution_details(execution_details: dict[str, Any]) -> dict[str, Any]:
     step_results = execution_details.get("step_results", [])
     attempts = execution_details.get("attempts", [])
-    latest_step = step_results[-1] if isinstance(step_results, list) and step_results else {}
+    latest_step = (
+        step_results[-1] if isinstance(step_results, list) and step_results else {}
+    )
     compact = {
         "attempt_count": len(attempts) if isinstance(attempts, list) else None,
-        "step_result_count": len(step_results) if isinstance(step_results, list) else None,
+        "step_result_count": len(step_results)
+        if isinstance(step_results, list)
+        else None,
         "latest_step_result": (
             _compact_step_result(latest_step) if isinstance(latest_step, dict) else None
         ),
@@ -595,7 +598,9 @@ def _compact_outcome(outcome: ExperimentOutcome) -> dict[str, Any]:
         "recovery_actions": outcome.recovery_actions[:3],
         "primary_metric_value": outcome.primary_metric_value,
         "metric_results": _compact_metric_results(outcome.metric_results),
-        "notes": [_truncate_text(note, limit=220) for note in outcome.notes[:4] if note],
+        "notes": [
+            _truncate_text(note, limit=220) for note in outcome.notes[:4] if note
+        ],
         "next_ideas": [
             _truncate_text(idea, limit=220) for idea in outcome.next_ideas[:3] if idea
         ],
@@ -663,7 +668,9 @@ def _compact_iteration_summary(summary) -> dict[str, Any]:
     }
 
 
-def _compact_markdown_text(content: str | None, *, limit: int = MARKDOWN_NOTE_CHAR_LIMIT) -> str | None:
+def _compact_markdown_text(
+    content: str | None, *, limit: int = MARKDOWN_NOTE_CHAR_LIMIT
+) -> str | None:
     if not isinstance(content, str):
         return None
     stripped = content.strip()
@@ -762,9 +769,7 @@ def build_execution_handoff(snapshot: MemorySnapshot) -> dict[str, Any]:
         "execution_runbook": _compact_bootstrap_handoff(
             snapshot, "execution_runbook.md"
         ),
-        "experiment_guide": _compact_bootstrap_handoff(
-            snapshot, "experiment_guide.md"
-        ),
+        "experiment_guide": _compact_bootstrap_handoff(snapshot, "experiment_guide.md"),
     }
 
 
@@ -850,9 +855,7 @@ class LiteLLMWorkerBackend(_LiteLLMJsonBackend):
                 "recent_records": _compact_recent_records(snapshot),
                 "recent_summaries": _compact_recent_summaries(snapshot),
                 "recent_human_interventions": _compact_human_interventions(snapshot),
-                "lessons_learned": _truncate_text(
-                    snapshot.lessons_learned, limit=800
-                ),
+                "lessons_learned": _truncate_text(snapshot.lessons_learned, limit=800),
                 "markdown_memory": _worker_markdown_handoff(
                     snapshot, iteration_policy=iteration_policy
                 ),
@@ -1836,9 +1839,7 @@ class LiteLLMNarrationBackend(_LiteLLMJsonBackend):
                 "candidate": _compact_candidate(candidate),
                 "outcome": _compact_outcome(outcome),
                 "reflection": {
-                    "assessment": _truncate_text(
-                        reflection.assessment, limit=280
-                    ),
+                    "assessment": _truncate_text(reflection.assessment, limit=280),
                     "recommended_next_action": reflection.recommended_next_action,
                 },
                 "review": review.to_dict(),

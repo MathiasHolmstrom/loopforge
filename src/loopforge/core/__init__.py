@@ -1,4 +1,8 @@
-from loopforge.core.tool_use_execution import ToolUseExecutor, ToolUsePlanner, ToolUseReviewer
+from loopforge.core.tool_use_execution import (
+    ToolUseExecutor,
+    ToolUsePlanner,
+    ToolUseReviewer,
+)
 from loopforge.core.backends import (
     AccessAdvisorBackend,
     BootstrapBackend,
@@ -114,5 +118,7 @@ __all__ = [
     "SpecBackend",
     "SpecQuestion",
     "ToolUseExecutor",
+    "ToolUsePlanner",
+    "ToolUseReviewer",
     "WorkerBackend",
 ]

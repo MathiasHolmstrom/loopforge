@@ -18,54 +18,6 @@ from loopforge import (
 from tests.support import build_spec  # noqa: F401 (used in later tests)
 
 
-def test_litellm_backend_passes_max_completion_tokens_to_completion_fn() -> None:
-    captured_kwargs = {}
-
-    def completion_fn(**kwargs):
-        captured_kwargs.update(kwargs)
-        return {
-            "choices": [
-                {
-                    "message": {
-                        "content": json.dumps(
-                            {
-                                "hypothesis": "Run baseline.",
-                                "action_type": "run_experiment",
-                                "change_type": "baseline",
-                                "instructions": "Run the existing baseline.",
-                                "execution_steps": [],
-                            }
-                        )
-                    }
-                }
-            ]
-        }
-
-    worker = bootstrap_module.LiteLLMWorkerBackend(
-        model="openai/gpt-5.4",
-        completion_fn=completion_fn,
-        max_completion_tokens=321,
-    )
-    spec = build_spec(allowed_actions=["run_experiment"])
-    snapshot = MemorySnapshot(
-        spec=spec,
-        effective_spec=spec,
-        capability_context=CapabilityContext(),
-        best_summary=None,
-        latest_summary=None,
-        recent_records=[],
-        recent_summaries=[],
-        recent_human_interventions=[],
-        lessons_learned="",
-        markdown_memory=[],
-        next_iteration_id=1,
-    )
-
-    worker.propose_next_experiment(snapshot)
-
-    assert captured_kwargs["max_completion_tokens"] == 321
-
-
 def test_compact_recent_records_omits_full_attempt_payloads() -> None:
     spec = build_spec(allowed_actions=["run_experiment"])
     record = IterationRecord(

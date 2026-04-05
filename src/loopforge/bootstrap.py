@@ -15,7 +15,6 @@ from typing import Any, Literal
 
 from loopforge.auto_adapter import build_repo_scan_context
 from loopforge.core.bootstrap_contracts import (
-    apply_bootstrap_execution_contract,
     build_bootstrap_handoff,
     build_execution_runbook,
     resolve_repo_root_from_objective,
@@ -38,7 +37,6 @@ from loopforge.core import (
     LiteLLMRunnerAuthoringBackend,
     LiteLLMReflectionBackend,
     LiteLLMReviewBackend,
-    LiteLLMWorkerBackend,
     PreflightCheck,
     ProgressFn,
     StreamFn,
@@ -1141,9 +1139,11 @@ def _trace_data_source(
 
     # Match explicit .py files or underscore-separated identifiers
     candidates: list[str] = []
-    for match in _re.finditer(r'[\w/\\]+\.py\b', user_goal):
+    for match in _re.finditer(r"[\w/\\]+\.py\b", user_goal):
         candidates.append(match.group(0))
-    for match in _re.finditer(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b', user_goal.lower()):
+    for match in _re.finditer(
+        r"\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b", user_goal.lower()
+    ):
         token = match.group(1)
         if token not in ("cross_validation", "primary_metric", "new_script"):
             candidates.append(token)
@@ -1206,8 +1206,11 @@ def _trace_data_source(
     progress_fn("data_trace", "Syncing dependencies...")
     try:
         subprocess.run(
-            ["uv", "sync"], cwd=repo_root,
-            capture_output=True, text=True, timeout=120,
+            ["uv", "sync"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
         progress_fn("data_trace", "Dependencies synced.")
     except Exception:
@@ -1238,14 +1241,17 @@ def _verify_execution_environment(
 
     # 1. Validate key imports work (deps already synced in data trace)
     import_check = subprocess.run(
-        [python_executable, "-c",
-         "import sys; "
-         "failures = []; "
-         "for pkg in ['polars', 'numpy', 'pandas', 'sklearn']: \n"
-         "    try: __import__(pkg)\n"
-         "    except ImportError: failures.append(pkg)\n"
-         "if failures: print('MISSING:' + ','.join(failures)); sys.exit(1)\n"
-         "print('imports_ok')"],
+        [
+            python_executable,
+            "-c",
+            "import sys; "
+            "failures = []; "
+            "for pkg in ['polars', 'numpy', 'pandas', 'sklearn']: \n"
+            "    try: __import__(pkg)\n"
+            "    except ImportError: failures.append(pkg)\n"
+            "if failures: print('MISSING:' + ','.join(failures)); sys.exit(1)\n"
+            "print('imports_ok')",
+        ],
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -1262,13 +1268,15 @@ def _verify_execution_environment(
 
     # 3. Find and try running the baseline script
     baseline_paths = [
-        str(p).strip()
-        for p in env.get("baseline_code_paths", [])
-        if str(p).strip()
+        str(p).strip() for p in env.get("baseline_code_paths", []) if str(p).strip()
     ]
     if not baseline_paths:
         # Search for likely experiment scripts
-        for pattern in ["scripts/*player*kills*.py", "scripts/*experiment*.py", "experiments/*.py"]:
+        for pattern in [
+            "scripts/*player*kills*.py",
+            "scripts/*experiment*.py",
+            "experiments/*.py",
+        ]:
             candidates = sorted(repo_root.glob(pattern))
             if candidates:
                 baseline_paths = [str(c.relative_to(repo_root)) for c in candidates[:3]]
@@ -1292,13 +1300,17 @@ def _verify_execution_environment(
                 )
                 results["baseline_output"] = run_result.stdout[-4000:]
                 if run_result.returncode == 0:
-                    progress_fn("env_verify", f"Baseline script completed successfully.")
+                    progress_fn("env_verify", "Baseline script completed successfully.")
                 else:
                     error_preview = (run_result.stderr or run_result.stdout)[-500:]
-                    results["errors"].append(f"Baseline script failed (exit {run_result.returncode}): {error_preview}")
-                    progress_fn("env_verify", f"Baseline script failed: {error_preview[:200]}")
+                    results["errors"].append(
+                        f"Baseline script failed (exit {run_result.returncode}): {error_preview}"
+                    )
+                    progress_fn(
+                        "env_verify", f"Baseline script failed: {error_preview[:200]}"
+                    )
             except subprocess.TimeoutExpired:
-                results["errors"].append(f"Baseline script timed out after 300s")
+                results["errors"].append("Baseline script timed out after 300s")
                 progress_fn("env_verify", "Baseline script timed out after 300s.")
             except Exception as exc:
                 results["errors"].append(f"Could not run baseline: {exc}")
@@ -1894,10 +1906,6 @@ class Loopforge:
             objective=objective,
             executor_factory_path=executor_factory_path,
         )
-        generic_autonomous = is_generic_autonomous(
-            capability_context=runtime.capability_context,
-            effective_spec=spec,
-        )
         extra_kwargs_worker = self._extra(self.role_models.worker).get("extra_kwargs")
         extra_kwargs_review = self._extra(self.role_models.review).get("extra_kwargs")
         tool_use_agent = ToolUseExecutor(
@@ -2194,9 +2202,6 @@ class Loopforge:
         self.progress_fn("resolve_backend", "Detecting execution environment...")
         resolution = self.resolve_execution_backend(user_goal)
         executor_factory_path = resolution.factory_path
-        # Don't load prior session memory during bootstrap — it pollutes new objectives
-        # with irrelevant context from previous runs. Memory is only used during iterations.
-        bootstrap_memory = {}
         capability_key = (
             str(self.repo_root.resolve()),
             executor_factory_path,
@@ -2311,7 +2316,8 @@ class Loopforge:
 
         # Use the tool-use planner to read the repo and fill out the contract
         self.progress_fn(
-            "propose_plan", f"[{self.role_models.planner}] Analyzing repo and planning experiment..."
+            "propose_plan",
+            f"[{self.role_models.planner}] Analyzing repo and planning experiment...",
         )
         planner_extra = self._extra(self.role_models.planner).get("extra_kwargs")
         planner = ToolUsePlanner(
@@ -2337,26 +2343,35 @@ class Loopforge:
 
         spec = ExperimentSpec(
             objective=user_goal,
-            primary_metric=MetricSpec(name=primary_metric_name, goal=primary_metric_goal),
+            primary_metric=MetricSpec(
+                name=primary_metric_name, goal=primary_metric_goal
+            ),
             allowed_actions=list(
-                capability_context.environment_facts.get("generic_autonomous_actions", ["run_experiment"])
+                capability_context.environment_facts.get(
+                    "generic_autonomous_actions", ["run_experiment"]
+                )
             ),
             guardrail_metrics=[
                 MetricSpec(
                     name=m["name"] if isinstance(m, dict) else str(m),
-                    goal=m.get("goal", "unspecified") if isinstance(m, dict) else "unspecified",
+                    goal=m.get("goal", "unspecified")
+                    if isinstance(m, dict)
+                    else "unspecified",
                 )
                 for m in raw_guardrails
             ],
             secondary_metrics=[
                 MetricSpec(
                     name=m["name"] if isinstance(m, dict) else str(m),
-                    goal=m.get("goal", "unspecified") if isinstance(m, dict) else "unspecified",
+                    goal=m.get("goal", "unspecified")
+                    if isinstance(m, dict)
+                    else "unspecified",
                 )
                 for m in raw_secondaries
             ],
             metadata={
-                "source_script": contract.get("source_script") or data_trace.get("data_source"),
+                "source_script": contract.get("source_script")
+                or data_trace.get("data_source"),
                 "baseline_function": contract.get("baseline_function"),
                 "data_loading": contract.get("data_loading"),
                 "target_column": contract.get("target_column"),
@@ -2377,9 +2392,10 @@ class Loopforge:
         ]
 
         # Build a BootstrapTurn from the planner results
-        from loopforge.core.types import ExperimentSpecProposal, BootstrapTurn, RoleModelConfig
+        from loopforge.core.types import ExperimentSpecProposal, BootstrapTurn
+
         turn = BootstrapTurn(
-            assistant_message=f"I analyzed the repo and built an experiment plan.",
+            assistant_message="I analyzed the repo and built an experiment plan.",
             proposal=ExperimentSpecProposal(
                 objective=user_goal,
                 recommended_spec=spec,
@@ -2387,7 +2403,8 @@ class Loopforge:
                 notes=[],
             ),
             role_models=self.role_models,
-            ready_to_start=len(spec_questions) == 0 and primary_metric_goal != "unspecified",
+            ready_to_start=len(spec_questions) == 0
+            and primary_metric_goal != "unspecified",
         )
         # Add execution metadata
         turn = replace(
@@ -2410,37 +2427,44 @@ class Loopforge:
         contract_questions: list[SpecQuestion] = []
         metadata = turn.proposal.recommended_spec.metadata
         if not metadata.get("source_script") and not data_trace.get("data_source"):
-            contract_questions.append(SpecQuestion(
-                key="source_script",
-                prompt="Which file contains the model training code?",
-                rationale="Could not find the file you referenced in the repo.",
-                required=True,
-            ))
+            contract_questions.append(
+                SpecQuestion(
+                    key="source_script",
+                    prompt="Which file contains the model training code?",
+                    rationale="Could not find the file you referenced in the repo.",
+                    required=True,
+                )
+            )
         if not metadata.get("baseline_function"):
-            contract_questions.append(SpecQuestion(
-                key="baseline_function",
-                prompt=(
-                    f"I read {data_trace.get('data_source', 'the source script')} but couldn't identify "
-                    "the baseline model function. Which function trains the model?"
-                ),
-                rationale="Need to know which function to use as baseline.",
-                required=True,
-            ))
+            contract_questions.append(
+                SpecQuestion(
+                    key="baseline_function",
+                    prompt=(
+                        f"I read {data_trace.get('data_source', 'the source script')} but couldn't identify "
+                        "the baseline model function. Which function trains the model?"
+                    ),
+                    rationale="Need to know which function to use as baseline.",
+                    required=True,
+                )
+            )
         if not metadata.get("data_loading"):
-            contract_questions.append(SpecQuestion(
-                key="data_loading",
-                prompt="How is the training data loaded? (e.g. function name, file path, or describe the pipeline)",
-                rationale="Need to understand the data pipeline for the executor.",
-                required=True,
-            ))
+            contract_questions.append(
+                SpecQuestion(
+                    key="data_loading",
+                    prompt="How is the training data loaded? (e.g. function name, file path, or describe the pipeline)",
+                    rationale="Need to understand the data pipeline for the executor.",
+                    required=True,
+                )
+            )
         if not metadata.get("target_column"):
-            contract_questions.append(SpecQuestion(
-                key="target_column",
-                prompt="What column/variable is the model predicting?",
-                rationale="Need to know the prediction target.",
-                required=True,
-            ))
-
+            contract_questions.append(
+                SpecQuestion(
+                    key="target_column",
+                    prompt="What column/variable is the model predicting?",
+                    rationale="Need to know the prediction target.",
+                    required=True,
+                )
+            )
 
         if contract_questions:
             turn = replace(

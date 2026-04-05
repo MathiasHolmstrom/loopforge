@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
-import pytest
 
 from loopforge.core.tool_use_execution import (
     ToolUseExecutor,
@@ -128,7 +125,9 @@ class TestReadFile:
 
     def test_truncates_long_files(self, tmp_path):
         (tmp_path / "big.txt").write_text("\n".join(f"line {i}" for i in range(1000)))
-        result = _execute_read_file({"path": "big.txt", "max_lines": 10}, tmp_path, 8000)
+        result = _execute_read_file(
+            {"path": "big.txt", "max_lines": 10}, tmp_path, 8000
+        )
         assert "more lines" in result
 
     def test_rejects_path_outside_repo(self, tmp_path):
@@ -210,10 +209,14 @@ class TestToolUseExecutor:
             _mock_response(
                 content=None,
                 tool_calls=[
-                    _mock_tool_call("tc1", "report_metrics", {
-                        "metrics": {"rmse": 0.42},
-                        "summary": "Trained a baseline model.",
-                    })
+                    _mock_tool_call(
+                        "tc1",
+                        "report_metrics",
+                        {
+                            "metrics": {"rmse": 0.42},
+                            "summary": "Trained a baseline model.",
+                        },
+                    )
                 ],
                 finish_reason="tool_calls",
             ),
@@ -233,10 +236,12 @@ class TestToolUseExecutor:
         )
         # Patch the import inside execute()
         import loopforge.core.tool_use_execution as mod
+
         monkeypatch.setattr(mod, "litellm_completion", mock_completion, raising=False)
 
         # We need to patch the dynamic import inside execute()
         import unittest.mock
+
         with unittest.mock.patch("litellm.completion", mock_completion):
             outcome = executor.execute(candidate, snapshot)
 
@@ -256,9 +261,12 @@ class TestToolUseExecutor:
 
         # Model just sends text, no tool calls
         import unittest.mock
+
         with unittest.mock.patch(
             "litellm.completion",
-            return_value=_mock_response(content="I couldn't figure it out.", tool_calls=None),
+            return_value=_mock_response(
+                content="I couldn't figure it out.", tool_calls=None
+            ),
         ):
             outcome = executor.execute(candidate, snapshot)
 
@@ -280,17 +288,19 @@ class TestToolUseExecutor:
         responses = [
             # Turn 1: read a file
             _mock_response(
-                tool_calls=[
-                    _mock_tool_call("tc1", "read_file", {"path": "data.csv"})
-                ],
+                tool_calls=[_mock_tool_call("tc1", "read_file", {"path": "data.csv"})],
                 finish_reason="tool_calls",
             ),
             # Turn 2: report metrics
             _mock_response(
                 tool_calls=[
-                    _mock_tool_call("tc2", "report_metrics", {
-                        "metrics": {"rmse": 0.35},
-                    })
+                    _mock_tool_call(
+                        "tc2",
+                        "report_metrics",
+                        {
+                            "metrics": {"rmse": 0.35},
+                        },
+                    )
                 ],
                 finish_reason="tool_calls",
             ),
@@ -304,6 +314,7 @@ class TestToolUseExecutor:
             return resp
 
         import unittest.mock
+
         with unittest.mock.patch("litellm.completion", mock_completion):
             outcome = executor.execute(candidate, snapshot)
 
@@ -330,7 +341,6 @@ class TestToolUseExecutor:
                 finish_reason="tool_calls",
             )
 
-        import subprocess
         import unittest.mock
 
         mock_proc = MagicMock()
@@ -338,11 +348,13 @@ class TestToolUseExecutor:
         mock_proc.stdout = ""
         mock_proc.stderr = "error"
 
-        with unittest.mock.patch("litellm.completion", mock_completion), \
-             unittest.mock.patch(
-                 "loopforge.core.tool_use_execution._run_subprocess_with_progress",
-                 return_value=mock_proc,
-             ):
+        with (
+            unittest.mock.patch("litellm.completion", mock_completion),
+            unittest.mock.patch(
+                "loopforge.core.tool_use_execution._run_subprocess_with_progress",
+                return_value=mock_proc,
+            ),
+        ):
             outcome = executor.execute(candidate, snapshot)
 
         assert outcome.status == "recoverable_failure"
@@ -358,13 +370,17 @@ class TestToolUseExecutor:
         candidate = _make_candidate()
 
         # Write a script that prints metrics
-        (tmp_path / "train.py").write_text('print(\'{"metric_results": {"rmse": 0.5}}\')')
+        (tmp_path / "train.py").write_text(
+            'print(\'{"metric_results": {"rmse": 0.5}}\')'
+        )
 
         responses = [
             # Turn 1: run command that prints metrics
             _mock_response(
                 tool_calls=[
-                    _mock_tool_call("tc1", "run_command", {"command": "python train.py"})
+                    _mock_tool_call(
+                        "tc1", "run_command", {"command": "python train.py"}
+                    )
                 ],
                 finish_reason="tool_calls",
             ),
@@ -379,7 +395,6 @@ class TestToolUseExecutor:
             call_idx += 1
             return resp
 
-        import subprocess
         import unittest.mock
 
         # Mock subprocess to return metric output
@@ -388,11 +403,13 @@ class TestToolUseExecutor:
         mock_proc.stdout = '{"metric_results": {"rmse": 0.5}}'
         mock_proc.stderr = ""
 
-        with unittest.mock.patch("litellm.completion", mock_completion), \
-             unittest.mock.patch(
-                 "loopforge.core.tool_use_execution._run_subprocess_with_progress",
-                 return_value=mock_proc,
-             ):
+        with (
+            unittest.mock.patch("litellm.completion", mock_completion),
+            unittest.mock.patch(
+                "loopforge.core.tool_use_execution._run_subprocess_with_progress",
+                return_value=mock_proc,
+            ),
+        ):
             outcome = executor.execute(candidate, snapshot)
 
         assert outcome.status == "success"
@@ -448,22 +465,34 @@ class TestToolUsePlanner:
         # Mock: turn 1 = read_file, turn 2 = think, turn 3 = fill_contract
         responses = [
             _mock_response(
-                tool_calls=[_mock_tool_call("tc1", "read_file", {"path": "scripts/train.py"})],
+                tool_calls=[
+                    _mock_tool_call("tc1", "read_file", {"path": "scripts/train.py"})
+                ],
                 finish_reason="tool_calls",
             ),
             _mock_response(
-                tool_calls=[_mock_tool_call("tc2", "think", {"reasoning": "I see train_model function"})],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc2", "think", {"reasoning": "I see train_model function"}
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
             _mock_response(
-                tool_calls=[_mock_tool_call("tc3", "fill_contract", {
-                    "source_script": "scripts/train.py",
-                    "baseline_function": "train_model",
-                    "data_loading": "DataFrame passed as argument",
-                    "target_column": "target_kills",
-                    "primary_metric": "rmse",
-                    "primary_metric_goal": "minimize",
-                })],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc3",
+                        "fill_contract",
+                        {
+                            "source_script": "scripts/train.py",
+                            "baseline_function": "train_model",
+                            "data_loading": "DataFrame passed as argument",
+                            "target_column": "target_kills",
+                            "primary_metric": "rmse",
+                            "primary_metric_goal": "minimize",
+                        },
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
         ]
@@ -476,6 +505,7 @@ class TestToolUsePlanner:
             return resp
 
         import unittest.mock
+
         with unittest.mock.patch("litellm.completion", mock_completion):
             result = planner.plan(
                 user_goal="improve model in train.py",
@@ -497,21 +527,33 @@ class TestToolUsePlanner:
 
         responses = [
             _mock_response(
-                tool_calls=[_mock_tool_call("tc1", "ask_user", {
-                    "question": "Which function trains the model?",
-                    "reason": "Multiple candidates found",
-                })],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1",
+                        "ask_user",
+                        {
+                            "question": "Which function trains the model?",
+                            "reason": "Multiple candidates found",
+                        },
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
             _mock_response(
-                tool_calls=[_mock_tool_call("tc2", "fill_contract", {
-                    "source_script": "train.py",
-                    "baseline_function": "unknown",
-                    "data_loading": "unknown",
-                    "target_column": "unknown",
-                    "primary_metric": "rmse",
-                    "primary_metric_goal": "minimize",
-                })],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc2",
+                        "fill_contract",
+                        {
+                            "source_script": "train.py",
+                            "baseline_function": "unknown",
+                            "data_loading": "unknown",
+                            "target_column": "unknown",
+                            "primary_metric": "rmse",
+                            "primary_metric_goal": "minimize",
+                        },
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
         ]
@@ -524,6 +566,7 @@ class TestToolUsePlanner:
             return resp
 
         import unittest.mock
+
         with unittest.mock.patch("litellm.completion", mock_completion):
             result = planner.plan(user_goal="improve model")
 
@@ -554,16 +597,26 @@ class TestToolUseReviewer:
 
         responses = [
             _mock_response(
-                tool_calls=[_mock_tool_call("tc1", "think", {"reasoning": "RMSE 0.42 is a good baseline"})],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1", "think", {"reasoning": "RMSE 0.42 is a good baseline"}
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
             _mock_response(
-                tool_calls=[_mock_tool_call("tc2", "report_review", {
-                    "status": "accepted",
-                    "reason": "Good baseline established",
-                    "lessons": ["Baseline RMSE is 0.42"],
-                    "next_experiment": "Try adding rolling averages as features",
-                })],
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc2",
+                        "report_review",
+                        {
+                            "status": "accepted",
+                            "reason": "Good baseline established",
+                            "lessons": ["Baseline RMSE is 0.42"],
+                            "next_experiment": "Try adding rolling averages as features",
+                        },
+                    )
+                ],
                 finish_reason="tool_calls",
             ),
         ]
@@ -576,6 +629,7 @@ class TestToolUseReviewer:
             return resp
 
         import unittest.mock
+
         with unittest.mock.patch("litellm.completion", mock_completion):
             reflection, review = reviewer.review(snapshot, candidate, outcome)
 
@@ -600,15 +654,25 @@ class TestToolUseReviewer:
         )
 
         import unittest.mock
-        with unittest.mock.patch("litellm.completion", return_value=_mock_response(
-            tool_calls=[_mock_tool_call("tc1", "report_review", {
-                "status": "rejected",
-                "reason": "Script failed due to missing dependency",
-                "lessons": ["Need to install lightgbm"],
-                "next_experiment": "Install lightgbm then rerun baseline",
-            })],
-            finish_reason="tool_calls",
-        )):
+
+        with unittest.mock.patch(
+            "litellm.completion",
+            return_value=_mock_response(
+                tool_calls=[
+                    _mock_tool_call(
+                        "tc1",
+                        "report_review",
+                        {
+                            "status": "rejected",
+                            "reason": "Script failed due to missing dependency",
+                            "lessons": ["Need to install lightgbm"],
+                            "next_experiment": "Install lightgbm then rerun baseline",
+                        },
+                    )
+                ],
+                finish_reason="tool_calls",
+            ),
+        ):
             reflection, review = reviewer.review(snapshot, candidate, outcome)
 
         assert review.status == "rejected"

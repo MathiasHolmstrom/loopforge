@@ -7,8 +7,6 @@ from typing import Protocol
 
 from loopforge.core.backends import (
     NarrationBackend,
-    ReflectionBackend,
-    ReviewBackend,
     WorkerBackend,
 )
 from loopforge.core.memory import FileMemoryStore
@@ -190,9 +188,7 @@ class ExperimentOrchestrator:
         repair_round = 0
         while True:
             if candidate.metadata.get("interactive_agent"):
-                self.progress_fn(
-                    "executor_run", "Launching interactive agent..."
-                )
+                self.progress_fn("executor_run", "Launching interactive agent...")
             elif candidate.execution_steps:
                 step_preview = self._candidate_step_preview(candidate)
                 detail = f" Executing: {step_preview}" if step_preview else ""
@@ -328,12 +324,22 @@ class ExperimentOrchestrator:
         try:
             if self.reviewer is not None:
                 reflection, review = self.reviewer.review(snapshot, candidate, outcome)
-            elif self.reflection_backend is not None and self.review_backend is not None:
-                reflection = self.reflection_backend.reflect(snapshot, candidate, outcome)
-                review = self.review_backend.review(snapshot, candidate, outcome, reflection)
+            elif (
+                self.reflection_backend is not None and self.review_backend is not None
+            ):
+                reflection = self.reflection_backend.reflect(
+                    snapshot, candidate, outcome
+                )
+                review = self.review_backend.review(
+                    snapshot, candidate, outcome, reflection
+                )
             else:
-                reflection = self._fallback_reflection(outcome, RuntimeError("No reviewer configured"))
-                review = self._fallback_review(outcome, RuntimeError("No reviewer configured"))
+                reflection = self._fallback_reflection(
+                    outcome, RuntimeError("No reviewer configured")
+                )
+                review = self._fallback_review(
+                    outcome, RuntimeError("No reviewer configured")
+                )
         except Exception as exc:
             reflection = self._fallback_reflection(outcome, exc)
             review = self._fallback_review(outcome, exc)

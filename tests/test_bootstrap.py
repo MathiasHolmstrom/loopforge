@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 import loopforge.bootstrap as bootstrap_module
-from loopforge import BootstrapTurn, CapabilityContext, ExperimentSpecProposal, Loopforge
+from loopforge import (
+    BootstrapTurn,
+    CapabilityContext,
+    ExperimentSpecProposal,
+    Loopforge,
+)
 from loopforge.auto_adapter import build_repo_scan_context
 from tests.support import build_spec
 
@@ -128,9 +133,10 @@ def test_repo_scan_context_surfaces_likely_baseline_files_and_metric_symbols(
         objective="improve existing lol kills baseline and keep the current framework",
     )
 
-    assert "experiments/lol_kills_autonomous_baseline.py" in context.environment_facts[
-        "baseline_code_paths"
-    ]
+    assert (
+        "experiments/lol_kills_autonomous_baseline.py"
+        in context.environment_facts["baseline_code_paths"]
+    )
     assert any(
         "OrdinalLossScorer" in note and "lol_kills_autonomous_baseline.py" in note
         for note in context.notes
@@ -191,7 +197,9 @@ def test_apply_feedback_resolves_goal_for_explicit_primary_metric(tmp_path) -> N
     assert updated.proposal.recommended_spec.primary_metric.goal == "minimize"
 
 
-def test_apply_feedback_does_not_persist_free_text_as_bootstrap_answer(tmp_path) -> None:
+def test_apply_feedback_does_not_persist_free_text_as_bootstrap_answer(
+    tmp_path,
+) -> None:
     app = Loopforge(memory_root=tmp_path / "memory")
     app._cached_capability_context = CapabilityContext(
         available_metrics={"OrdinalLossScorer": {"path": "experiments/lol.py"}}
