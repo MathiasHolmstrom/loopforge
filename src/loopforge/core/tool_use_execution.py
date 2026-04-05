@@ -1776,6 +1776,14 @@ class ToolUseReviewer:
             "Your next_experiment should ask the executor to add DIAGNOSTIC METRICS when you need "
             "more visibility (e.g. primary metric broken down by category). Once you see segmented "
             "results, propose specific feature engineering based on actual weaknesses.\n\n"
+            "LONG-TERM EFFICIENCY: You're managing a multi-iteration experiment campaign.\n"
+            "Think about what the executor should BUILD ONCE to make future iterations fast:\n"
+            "- Save cross-validation predictions to a file so future analysis doesn't retrain\n"
+            "- Create reusable analysis scripts that load saved predictions and compute any metric\n"
+            "- Separate 'train + predict' from 'analyze predictions' so analysis is instant\n"
+            "Early iterations should set up this infrastructure. Later iterations reuse it.\n"
+            "If the executor is retraining just to compute a new diagnostic metric, that's wrong — "
+            "the predictions should already be saved from the training step.\n\n"
             "Call think() to reason deeply, then call report_review.\n"
         )
 
