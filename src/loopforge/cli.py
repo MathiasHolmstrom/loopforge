@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -514,16 +515,29 @@ def _extract_start_with_context(text: str) -> str | None:
     normalized = " ".join(text.strip().split())
     lower = normalized.lower()
     prefixes = (
-        "y but ", "y, but ", "y but also ", "y, but also ",
-        "yes but ", "yes, but ", "yes but also ", "yes, but also ",
-        "yes, also ", "y, also ", "yes also ",
-        "go but ", "go, but ", "go but also ",
-        "start but ", "start, but ", "y, ",
-        "yes, ", "go, ",
+        "y but ",
+        "y, but ",
+        "y but also ",
+        "y, but also ",
+        "yes but ",
+        "yes, but ",
+        "yes but also ",
+        "yes, but also ",
+        "yes, also ",
+        "y, also ",
+        "yes also ",
+        "go but ",
+        "go, but ",
+        "go but also ",
+        "start but ",
+        "start, but ",
+        "y, ",
+        "yes, ",
+        "go, ",
     )
     for prefix in prefixes:
         if lower.startswith(prefix):
-            extra = normalized[len(prefix):].strip()
+            extra = normalized[len(prefix) :].strip()
             if extra:
                 return extra
     return None
@@ -772,9 +786,7 @@ def run_interactive_start(
                 print_fn(f"\n  Extra context noted: {extra_context}")
                 # Store in spec metadata so it flows to the executor
                 current_guidance = list(
-                    turn.proposal.recommended_spec.metadata.get(
-                        "operator_guidance", []
-                    )
+                    turn.proposal.recommended_spec.metadata.get("operator_guidance", [])
                 )
                 current_guidance.append(extra_context)
                 turn = replace(
