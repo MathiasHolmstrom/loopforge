@@ -1667,7 +1667,9 @@ class ToolUseReviewer:
         system_prompt = (
             "You are an expert data scientist reviewing ML experiments.\n\n"
             "You have access to the experimenter's saved outputs (predictions, metrics, scripts).\n"
-            "You can RUN CODE on the saved predictions to do your own analysis.\n\n"
+            "You can RUN CODE on the saved predictions to do your own analysis.\n"
+            "Your commands have a 30-second timeout — only do fast analysis (load parquet, compute aggregations).\n"
+            "Do NOT retrain models or run long computations. Work with saved predictions only.\n\n"
             "Your job:\n"
             "1. Read the experiment script and metrics\n"
             "2. Load the saved predictions and run diagnostic analysis:\n"
@@ -1750,7 +1752,7 @@ class ToolUseReviewer:
                 return _execute_run_command(
                     args,
                     self.repo_root,
-                    120,
+                    30,  # 30s max — reviewer only does light analysis, no training
                     100_000,
                     self.progress_fn,
                     turn,
