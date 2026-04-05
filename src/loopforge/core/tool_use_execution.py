@@ -1214,7 +1214,11 @@ class ToolUseExecutor:
                     f"Interactive execution completed in {turns_used} turns.",
                     f"Metrics reported via {'report_metrics tool' if metrics_reported else 'stdout parsing'}.",
                 ]
-                + ([f"Executor analysis: {reported_summary}"] if reported_summary else []),
+                + (
+                    [f"Executor analysis: {reported_summary}"]
+                    if reported_summary
+                    else []
+                ),
                 code_or_config_changes=files_written,
                 execution_details={
                     "tool_call_log": tool_call_log,
