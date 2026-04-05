@@ -677,7 +677,6 @@ def _execute_report_metrics(
     args: dict[str, Any], spec: ExperimentSpec
 ) -> tuple[str, dict[str, MetricResult], float | None]:
     raw_metrics = args.get("metrics", {})
-    summary = args.get("summary", "")
     metric_results: dict[str, MetricResult] = {}
     primary_value: float | None = None
 
@@ -879,7 +878,9 @@ def _build_system_prompt(
     parts.append("   - Run feature importance code (e.g. print top features)")
     parts.append("   - Check model errors by segment/category")
     parts.append("   - Note where the model struggles and why")
-    parts.append("7. Call finish_iteration with your analysis summary and recommendations")
+    parts.append(
+        "7. Call finish_iteration with your analysis summary and recommendations"
+    )
     parts.append("   The reviewer uses your analysis to decide what to try next.")
 
     # Add context from bootstrap handoff / experiment guide if present
