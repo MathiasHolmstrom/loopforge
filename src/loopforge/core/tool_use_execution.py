@@ -101,17 +101,8 @@ def _run_subprocess_with_progress(
             )
         except subprocess.TimeoutExpired:
             elapsed = time.monotonic() - started_at
-            if progress_fn is not None and elapsed >= next_target:
-                tick += 1
-                progress_fn(
-                    f"step_{step_index}_wait_{tick}",
-                    f"Still running ({int(elapsed)}s)...",
-                )
-                checkpoint_index += 1
-                if checkpoint_index < len(checkpoints):
-                    next_target = checkpoints[checkpoint_index]
-                else:
-                    next_target += repeat_interval
+            if progress_fn is not None and elapsed >= 120 and int(elapsed) % 120 < 2:
+                progress_fn("waiting", f"Still running ({int(elapsed)}s)...")
 
 
 def _coerce_float(value: Any) -> float | None:
