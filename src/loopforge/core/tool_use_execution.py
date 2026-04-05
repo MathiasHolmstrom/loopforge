@@ -1716,9 +1716,15 @@ class ToolUseReviewer:
             "because the current model treats all positions equally but kills distribution varies "
             "significantly by role (ADC vs Support).'\n"
             "Read the experiment script to understand what features exist, what the model does, "
-            "and reason about what specific change would most likely improve the metric.\n"
-            "Think about: feature importance, missing signals, model architecture, hyperparameters, "
-            "data preprocessing, training strategy.\n\n"
+            "and reason about what specific change would most likely improve the metric.\n\n"
+            "DIAGNOSTIC THINKING: Think like a domain expert. Ask yourself:\n"
+            "- Where might this model struggle? (certain player types, game phases, match conditions)\n"
+            "- What biases could exist in the predictions?\n"
+            "- What segmented metrics would reveal blind spots?\n"
+            "Your next_experiment can propose DIAGNOSTIC METRICS for the executor to add, e.g.:\n"
+            "'Add OrdinalLossScorer broken down by player position (ADC/Support/Mid/etc) to see "
+            "if the model performs differently across roles.'\n"
+            "Once you see the segmented results, you can make informed feature suggestions.\n\n"
             "Call think() to reason deeply, then call report_review.\n"
         )
 
